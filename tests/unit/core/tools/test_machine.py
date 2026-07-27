@@ -961,6 +961,10 @@ class TestCliMain:
         assert "machine tool" in captured.out.lower() or "usage" in captured.out.lower()
 
     def test_run_success_text_output(self, tmp_path, capsys):
+        # engine=claude を明示: default engine (cursor-agent) では shallow-
+        # completion heuristic (2026-07-27 追加) が短い mock 出力を空振り扱い
+        # し success=False にするため、engine 非依存な CLI success 検証には
+        # cursor-agent 以外を指定する必要がある。
         from core.tools.machine import cli_main
 
         with patch("core.tools.machine.shutil.which", return_value="/usr/bin/claude"):
@@ -971,11 +975,12 @@ class TestCliMain:
             mock_proc.pid = 99999
             mock_proc.wait = MagicMock(return_value=None)
             with patch("core.tools.machine.subprocess.Popen", return_value=mock_proc):
-                cli_main(["run", "test instruction", "-d", str(tmp_path)])
+                cli_main(["run", "--engine", "claude", "test instruction", "-d", str(tmp_path)])
                 captured = capsys.readouterr()
                 assert "Hello from CLI" in captured.out
 
     def test_run_success_json_output(self, tmp_path, capsys):
+        # engine=claude を明示（理由は test_run_success_text_output と同じ）。
         from core.tools.machine import cli_main
 
         with patch("core.tools.machine.shutil.which", return_value="/usr/bin/claude"):
@@ -986,7 +991,7 @@ class TestCliMain:
             mock_proc.pid = 99999
             mock_proc.wait = MagicMock(return_value=None)
             with patch("core.tools.machine.subprocess.Popen", return_value=mock_proc):
-                cli_main(["run", "test", "-d", str(tmp_path), "-j"])
+                cli_main(["run", "--engine", "claude", "test", "-d", str(tmp_path), "-j"])
                 captured = capsys.readouterr()
                 data = json.loads(captured.out)
                 assert data["success"] is True
@@ -1028,6 +1033,62 @@ class TestCliMain:
             cli_main(["run", "--help"])
         captured = capsys.readouterr()
         assert "--background" in captured.out
+
+    def test_run_cursor_agent_shallow_completion_rejected(self, tmp_path, capsys):
+        """cursor-agent shallow-completion heuristic 回帰 (2026-07-27):
+
+        cursor-agent は exit==0 を返しつつ実質的な仕事をしていない
+        「空振り成功」ケースが実測されているため、elapsed<3s または
+        output<500B を空振りと判定して success=False にする。
+        """
+        from core.tools.machine import cli_main
+
+        with patch("core.tools.machine.shutil.which", return_value="/usr/bin/cursor-agent"):
+            mock_proc = MagicMock()
+            _set_pipe_output(mock_proc, "quick\n")  # 6B, well below 500B
+            mock_proc.stdin = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.pid = 99999
+            mock_proc.wait = MagicMock(return_value=None)
+            with patch("core.tools.machine.subprocess.Popen", return_value=mock_proc):
+                cli_main(["run", "--engine", "cursor-agent", "test", "-d", str(tmp_path), "-j"])
+                captured = capsys.readouterr()
+                data = json.loads(captured.out)
+                assert data["success"] is False
+                assert "cursor-agent" in data.get("error", "")
+                # heuristic 由来の error 文言を厳密チェック
+                assert "空振り" in data.get("error", "") or "shallow" in data.get("reason", "")
+
+    def test_run_cursor_agent_sufficient_output_success(self, tmp_path, capsys):
+        """cursor-agent でも十分な elapsed (>=3s) と出力量 (>=500B) が
+        あれば success=True。heuristic が正常出力を誤検知しないことを保証。
+        """
+        from core.tools.machine import cli_main
+
+        long_output = "x" * 600 + "\n"  # 601B, above 500B
+        # _stream_to_file 内は start / end の 2 回 time.monotonic() を呼ぶ。
+        # 尽きたら 1005.0 を返し続けて他所からの呼出でも耐える。
+        monotonic_seq = iter([1000.0] + [1005.0] * 100)
+
+        with patch("core.tools.machine.shutil.which", return_value="/usr/bin/cursor-agent"):
+            mock_proc = MagicMock()
+            _set_pipe_output(mock_proc, long_output)
+            mock_proc.stdin = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.pid = 99999
+            mock_proc.wait = MagicMock(return_value=None)
+            with (
+                patch("core.tools.machine.subprocess.Popen", return_value=mock_proc),
+                patch(
+                    "core.tools.machine.time.monotonic",
+                    side_effect=lambda: next(monotonic_seq, 1005.0),
+                ),
+            ):
+                cli_main(["run", "--engine", "cursor-agent", "test", "-d", str(tmp_path), "-j"])
+                captured = capsys.readouterr()
+                data = json.loads(captured.out)
+                assert data["success"] is True
+                assert "x" * 100 in data["output"]
 
 
 # ── Auto-Discovery Test ───────────────────────────────────

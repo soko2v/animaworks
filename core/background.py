@@ -16,6 +16,7 @@ asynchronously and notifies upon completion.  Results are persisted to
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import time
@@ -137,11 +138,37 @@ class BackgroundTaskManager:
             max_completed_tasks_in_memory,
         )
         self._tasks: dict[str, BackgroundTask] = {}
-        self._async_tasks: dict[str, asyncio.Task[None]] = {}
+        # Handles are either asyncio.Task (submitted from the main loop thread)
+        # or concurrent.futures.Future (submitted from a worker thread via
+        # asyncio.run_coroutine_threadsafe). Both expose .cancel() and are only
+        # popped by task_id, so a Union-typed dict is sufficient.
+        self._async_tasks: dict[
+            str, asyncio.Task[None] | concurrent.futures.Future[None]
+        ] = {}
+        # Event loop used to schedule background coroutines when submit() is
+        # called from a worker thread (e.g. via asyncio.to_thread from the MCP
+        # server). Set by set_event_loop() during server/agent startup.
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.on_complete: OnTaskCompleteFn | None = None
 
         # Ensure storage directory exists
         self._storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Register the event loop for worker-thread submissions.
+
+        The MCP server dispatches tool calls through ``asyncio.to_thread``
+        which detaches the call from any running event loop. When such a
+        detached call reaches :meth:`submit` (via ToolHandler), calling
+        ``asyncio.create_task`` raises RuntimeError because there is no
+        running loop in the worker thread. This method registers the main
+        event loop up-front so :meth:`submit` can fall back to
+        ``asyncio.run_coroutine_threadsafe(_, loop)``.
+
+        Called once during server/agent startup. Safe to call again to
+        replace the loop (e.g. during test teardown).
+        """
+        self._loop = loop
 
     @property
     def _storage_dir(self) -> Path:
@@ -219,11 +246,39 @@ class BackgroundTaskManager:
             self._anima_name,
         )
 
-        # Schedule the async wrapper
-        async_task = asyncio.create_task(
-            self._run_task(task, execute_fn),
-            name=f"bg-{task_id}",
-        )
+        # Schedule the async wrapper. When called from the main loop thread
+        # (Mode A / AgentCore path), asyncio.create_task suffices. When called
+        # from a worker thread (MCP path: to_thread -> handler.handle -> here),
+        # get_running_loop() raises RuntimeError; fall back to the registered
+        # loop via run_coroutine_threadsafe.
+        try:
+            asyncio.get_running_loop()
+            async_task: asyncio.Task[None] | concurrent.futures.Future[None] = (
+                asyncio.create_task(
+                    self._run_task(task, execute_fn),
+                    name=f"bg-{task_id}",
+                )
+            )
+        except RuntimeError:
+            if self._loop is None or not self._loop.is_running():
+                task.status = TaskStatus.FAILED
+                task.error = (
+                    "BackgroundTaskManager: no event loop registered for "
+                    "worker-thread submit (call set_event_loop() during startup)"
+                )
+                task.completed_at = time.time()
+                self._save_task(task)
+                logger.error(
+                    "Background task cannot be scheduled from worker thread: "
+                    "id=%s tool=%s (no registered loop)",
+                    task_id,
+                    tool_name,
+                )
+                raise RuntimeError(task.error)
+            async_task = asyncio.run_coroutine_threadsafe(
+                self._run_task(task, execute_fn),
+                self._loop,
+            )
         self._async_tasks[task_id] = async_task
         return task_id
 
@@ -256,10 +311,35 @@ class BackgroundTaskManager:
             self._anima_name,
         )
 
-        async_task = asyncio.create_task(
-            self._run_task_async(task, execute_fn),
-            name=f"bg-{task_id}",
-        )
+        # Same worker-thread fallback logic as submit(); see comment there.
+        try:
+            asyncio.get_running_loop()
+            async_task: asyncio.Task[None] | concurrent.futures.Future[None] = (
+                asyncio.create_task(
+                    self._run_task_async(task, execute_fn),
+                    name=f"bg-{task_id}",
+                )
+            )
+        except RuntimeError:
+            if self._loop is None or not self._loop.is_running():
+                task.status = TaskStatus.FAILED
+                task.error = (
+                    "BackgroundTaskManager: no event loop registered for "
+                    "worker-thread submit_async (call set_event_loop() during startup)"
+                )
+                task.completed_at = time.time()
+                self._save_task(task)
+                logger.error(
+                    "Background async task cannot be scheduled from worker thread: "
+                    "id=%s tool=%s (no registered loop)",
+                    task_id,
+                    tool_name,
+                )
+                raise RuntimeError(task.error)
+            async_task = asyncio.run_coroutine_threadsafe(
+                self._run_task_async(task, execute_fn),
+                self._loop,
+            )
         self._async_tasks[task_id] = async_task
         return task_id
 

@@ -721,6 +721,34 @@ def _execute(
             )
 
         if exit_code == 0:
+            # cursor-agent 空振り成功対策 (2026-07-27):
+            # cursor-agent は指示を実行しないまま exit==0 を返すことが実測
+            # されている (elapsed<1s / output<500B が典型)。既定除外運用に
+            # 合わせ、exit==0 だけでは不十分と判断し、追加ヒューリスティクス
+            # (最低所要時間・最低出力サイズ) を満たすときのみ success=True。
+            if engine == "cursor-agent":
+                _min_elapsed = 3.0
+                _min_output_bytes = 500
+                _raw_bytes = len(raw_output.encode("utf-8", errors="replace"))
+                if elapsed < _min_elapsed or _raw_bytes < _min_output_bytes:
+                    return ToolResult(
+                        success=False,
+                        text=raw_output,
+                        error=(
+                            f"cursor-agent exit=0 だが空振り成功と判定: "
+                            f"elapsed={elapsed:.2f}s (min={_min_elapsed}s) / "
+                            f"output={_raw_bytes}B (min={_min_output_bytes}B). "
+                            f"cursor-agent は既定除外運用中 (codex 使用推奨)"
+                        ),
+                        data={
+                            "engine": engine,
+                            "exit_code": 0,
+                            "elapsed_seconds": round(elapsed, 1),
+                            "output_bytes": _raw_bytes,
+                            "output_file": output_file,
+                            "reason": "cursor-agent shallow-completion heuristic",
+                        },
+                    )
             return ToolResult(
                 success=True,
                 text=raw_output,
