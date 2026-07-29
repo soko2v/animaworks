@@ -868,6 +868,13 @@ class SchedulerManager:
         if not self._anima:
             return
 
+        # Poll schedule freshness every minute so long-interval Animas (Mode S
+        # daily HB) do not have to wait up to 24h for the next cron/heartbeat
+        # tick to detect an edited cron.md/heartbeat.md.  This closes the
+        # forward-variant blind window documented in the yutaka-oneshot RCA.
+        # Cost: two stat() calls per minute per anima — negligible.
+        self._check_schedule_freshness()
+
         now = now_local()
 
         if not self._in_active_hours(now):
@@ -1148,8 +1155,17 @@ class SchedulerManager:
     def _check_schedule_freshness(self) -> bool:
         """Check if cron.md or heartbeat.md changed since last setup.
 
-        If a change is detected, reloads the schedule and returns True.
-        Returns False when no change is detected.
+        If either file changed, reload the schedule so subsequent ticks see the
+        latest state.  However, the return value flags "the currently firing
+        cron task is stale and should be skipped".  We only claim staleness
+        when ``cron.md`` itself changed — heartbeat.md updates never invalidate
+        cron tasks, so a heartbeat.md-only edit must not cause the running
+        cron to be dropped.
+
+        This is the fix for the reverse-variant regression documented in
+        ``sofia/knowledge/yutaka-oneshot-cron-misfire-rca-20260721.md`` where a
+        heartbeat.md edit made hours earlier caused the next cron_tick to
+        silently drop a due (potentially one-shot) job.
         """
         cron_path = self._anima_dir / "cron.md"
         hb_path = self._anima_dir / "heartbeat.md"
@@ -1162,18 +1178,23 @@ class SchedulerManager:
         except OSError:
             hb_mtime = 0.0
 
-        if cron_mtime != self._cron_md_mtime or hb_mtime != self._heartbeat_md_mtime:
-            logger.info(
-                "Schedule file changed for %s (cron mtime %.0f->%.0f, hb mtime %.0f->%.0f), reloading",
-                self._anima_name,
-                self._cron_md_mtime,
-                cron_mtime,
-                self._heartbeat_md_mtime,
-                hb_mtime,
-            )
-            self.reload_schedule(self._anima_name)
-            return True
-        return False
+        cron_changed = cron_mtime != self._cron_md_mtime
+        hb_changed = hb_mtime != self._heartbeat_md_mtime
+        if not (cron_changed or hb_changed):
+            return False
+
+        logger.info(
+            "Schedule file changed for %s (cron mtime %.0f->%.0f, hb mtime %.0f->%.0f), reloading",
+            self._anima_name,
+            self._cron_md_mtime,
+            cron_mtime,
+            self._heartbeat_md_mtime,
+            hb_mtime,
+        )
+        self.reload_schedule(self._anima_name)
+        # Only cron.md changes can invalidate the currently firing cron task.
+        # A heartbeat.md-only edit must not cause due cron jobs to be skipped.
+        return cron_changed
 
     # ── Cleanup ──────────────────────────────────────────────────
 

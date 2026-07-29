@@ -44,7 +44,17 @@ class SchedulerMixin:
     def _check_schedule_freshness(self, name: str) -> bool:
         """Check if cron.md or heartbeat.md changed since last setup.
 
-        If a change is detected, reloads the schedule and returns True.
+        If either file changed, reload the schedule so subsequent ticks see
+        the latest state.  However, the return value flags "the currently
+        firing cron task is stale and should be skipped".  We only claim
+        staleness when ``cron.md`` itself changed — heartbeat.md updates
+        never invalidate cron tasks, so a heartbeat.md-only edit must not
+        cause the running cron to be dropped.
+
+        This is the symmetric fix to the supervisor-side change (see
+        ``core/supervisor/scheduler_manager.py::_check_schedule_freshness``)
+        for the reverse-variant regression documented in
+        ``sofia/knowledge/yutaka-oneshot-cron-misfire-rca-20260721.md``.
         Returns False when no change is detected or the anima is unknown.
         """
         anima = self.animas.get(name)
@@ -66,18 +76,24 @@ class SchedulerMixin:
         except OSError:
             hb_mt = 0.0
 
-        if (cron_mt, hb_mt) != prev:
-            logger.info(
-                "Schedule file changed for '%s' — reloading (cron: %.0f->%.0f, hb: %.0f->%.0f)",
-                name,
-                prev[0],
-                cron_mt,
-                prev[1],
-                hb_mt,
-            )
-            self.reload_anima_schedule(name)
-            return True
-        return False
+        prev_cron, prev_hb = prev
+        cron_changed = cron_mt != prev_cron
+        hb_changed = hb_mt != prev_hb
+        if not (cron_changed or hb_changed):
+            return False
+
+        logger.info(
+            "Schedule file changed for '%s' — reloading (cron: %.0f->%.0f, hb: %.0f->%.0f)",
+            name,
+            prev_cron,
+            cron_mt,
+            prev_hb,
+            hb_mt,
+        )
+        self.reload_anima_schedule(name)
+        # Only cron.md changes can invalidate the currently firing cron task.
+        # A heartbeat.md-only edit must not cause due cron jobs to be skipped.
+        return cron_changed
 
     def _setup_heartbeat(self, anima: DigitalAnima) -> None:
         job_id = f"{anima.name}_heartbeat"
