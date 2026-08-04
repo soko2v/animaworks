@@ -163,6 +163,30 @@ class TestAgentSDKExecutor:
             env = executor._build_env()
             assert env["ANTHROPIC_API_KEY"] == ""
 
+    def test_build_env_max_plan_uses_configured_shared_claude_home(self, anima_dir):
+        config = ModelConfig(
+            model="claude-sonnet-4-6",
+            mode_s_auth="max",
+            extra_keys={"claude_home": "/tmp/animaworks-shared-claude"},
+        )
+        with patch_agent_sdk():
+            from core.execution.agent_sdk import AgentSDKExecutor
+
+            env = AgentSDKExecutor(model_config=config, anima_dir=anima_dir)._build_env()
+        assert env["CLAUDE_HOME"] == "/tmp/animaworks-shared-claude"
+
+    def test_build_env_ignores_relative_shared_claude_home(self, anima_dir):
+        config = ModelConfig(
+            model="claude-sonnet-4-6",
+            mode_s_auth="max",
+            extra_keys={"claude_home": "relative-profile"},
+        )
+        with patch_agent_sdk():
+            from core.execution.agent_sdk import AgentSDKExecutor
+
+            env = AgentSDKExecutor(model_config=config, anima_dir=anima_dir)._build_env()
+        assert "CLAUDE_HOME" not in env
+
     def test_build_env_bedrock(self, anima_dir):
         """mode_s_auth=bedrock → Bedrock mode."""
         config = ModelConfig(
@@ -256,24 +280,19 @@ class TestAgentSDKExecutor:
             # Actually empty string joined would be "", then or "(no response)"
             assert result.text == "(no response)" or result.text == ""
 
-    async def test_execute_retries_max_auth_failure_once(self, model_config, anima_dir):
+    async def test_execute_does_not_retry_max_auth_failure(self, model_config, anima_dir):
         auth_text = 'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}'
         first_messages = [
             MockAssistantMessage([MockTextBlock(auth_text)]),
             MockResultMessage(usage={"input_tokens": 10, "output_tokens": 5}),
         ]
-        second_messages = [
-            MockAssistantMessage([MockTextBlock("Recovered response")]),
-            MockResultMessage(usage={"input_tokens": 12, "output_tokens": 6}),
-        ]
-
-        with _patch_agent_sdk_sequences([first_messages, second_messages]):
+        with _patch_agent_sdk_sequences([first_messages]):
             from core.execution.agent_sdk import AgentSDKExecutor
 
             executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
             result = await executor.execute("test", system_prompt="sys")
 
-        assert result.text == "Recovered response"
+        assert auth_text in result.text
 
     async def test_execute_does_not_retry_api_auth_failure(self, anima_dir):
         auth_text = 'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}'
@@ -572,7 +591,7 @@ class TestAgentSDKExecutorStreaming:
         assert len(done_events) == 1
         assert done_events[0]["full_text"] == "reply from completed message"
 
-    async def test_streaming_retries_max_auth_failure_without_text_deltas(
+    async def test_streaming_does_not_retry_max_auth_failure_without_text_deltas(
         self,
         model_config,
         anima_dir,
@@ -584,21 +603,9 @@ class TestAgentSDKExecutorStreaming:
             MockAssistantMessage([MockTextBlock(auth_text)]),
             MockResultMessage(usage={"input_tokens": 10, "output_tokens": 5}),
         ]
-        second_messages = [
-            MockStreamEvent(
-                {
-                    "type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": "Recovered"},
-                    "index": 0,
-                }
-            ),
-            MockAssistantMessage([MockTextBlock("Recovered")]),
-            MockResultMessage(usage={"input_tokens": 12, "output_tokens": 6}),
-        ]
-
         tracker = ContextTracker(model="claude-sonnet-4-6")
 
-        with _patch_agent_sdk_sequences([first_messages, second_messages]):
+        with _patch_agent_sdk_sequences([first_messages]):
             from core.execution.agent_sdk import AgentSDKExecutor
 
             executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
@@ -612,7 +619,7 @@ class TestAgentSDKExecutorStreaming:
 
         done_events = [e for e in events if e["type"] == "done"]
         assert len(done_events) == 1
-        assert done_events[0]["full_text"] == "Recovered"
+        assert auth_text in done_events[0]["full_text"]
 
 
 # ── Image input (multimodal) ──────────────────────────────────

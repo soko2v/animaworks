@@ -17,6 +17,7 @@ Leaf module in the dependency graph — no internal framework imports
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sys
 from collections.abc import AsyncGenerator
@@ -294,30 +295,44 @@ async def compact_sdk_session(
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+        from core.config import load_config
+        from core.execution._claude_auth_lock import claude_execution_lock
         from core.execution._sdk_options import _resolve_sdk_cli_path
 
         _cli = _resolve_sdk_cli_path()
+        env = os.environ.copy()
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        credential = load_config().credentials.get("anthropic")
+        claude_home = (credential.keys or {}).get("claude_home") if credential else None
+        if claude_home:
+            profile = Path(claude_home).expanduser()
+            if profile.is_absolute():
+                env["CLAUDE_HOME"] = str(profile)
+
         options = ClaudeAgentOptions(
             system_prompt=f"{anima_dir.name} session compaction",
             **{"max_turns": None},
             resume=session_id,
+            env=env,
             **({"cli_path": _cli} if _cli else {}),
         )
 
         found_session_id = False
         async with asyncio.timeout(COMPACT_TIMEOUT_SEC):
-            async with ClaudeSDKClient(options=options) as client:
-                await client.query("/compact")
-                async for message in client.receive_messages():
-                    if hasattr(message, "session_id") and message.session_id:
-                        _save_session_id(anima_dir, message.session_id, session_type, thread_id)
-                        logger.info(
-                            "Idle compaction completed (session=%s, type=%s, thread=%s)",
-                            message.session_id,
-                            session_type,
-                            thread_id,
-                        )
-                        found_session_id = True
+            async with claude_execution_lock(env):
+                async with ClaudeSDKClient(options=options) as client:
+                    await client.query("/compact")
+                    async for message in client.receive_messages():
+                        if hasattr(message, "session_id") and message.session_id:
+                            _save_session_id(anima_dir, message.session_id, session_type, thread_id)
+                            logger.info(
+                                "Idle compaction completed (session=%s, type=%s, thread=%s)",
+                                message.session_id,
+                                session_type,
+                                thread_id,
+                            )
+                            found_session_id = True
 
         if not found_session_id:
             logger.warning(

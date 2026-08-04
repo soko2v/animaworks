@@ -296,6 +296,11 @@ def cli_main() -> None:
 
     register_company_command(sub)
 
+    # ── Centralized provider authentication ─────────────────
+    from cli.commands.auth_cmd import register_auth_command
+
+    register_auth_command(sub)
+
     # ── Config ────────────────────────────────────────────
     from core.config.cli import (
         cmd_config_dispatch,

@@ -200,6 +200,19 @@ class SDKOptionsMixin:
             logger.info("Mode S auth: Vertex AI (mode_s_auth=vertex)")
         else:
             env["ANTHROPIC_API_KEY"] = ""
+            # All subscription-authenticated Animas must use one explicitly
+            # configured Claude Code profile.  Without this, subprocesses
+            # inherit whichever CLAUDE_HOME happened to be present in their
+            # parent environment, allowing parallel, independent logins to
+            # replace one another's OAuth refresh token.
+            claude_home = extra.get("claude_home")
+            if claude_home:
+                home_path = Path(claude_home).expanduser()
+                if home_path.is_absolute():
+                    env["CLAUDE_HOME"] = str(home_path)
+                    logger.info("Mode S auth: using configured shared Claude Code profile")
+                else:
+                    logger.warning("Ignoring non-absolute credentials.anthropic.keys.claude_home")
             logger.info("Mode S auth: Max plan (mode_s_auth=%s)", auth)
 
         if self._model_config.api_base_url:

@@ -43,6 +43,7 @@ from pathlib import Path
 
 from core.exceptions import ExecutionError, LLMAPIError, MemoryWriteError  # noqa: F401
 from core.execution import _sdk_session
+from core.execution._claude_auth_lock import claude_execution_lock
 from core.execution._sdk_patch import apply_sdk_transport_patch
 
 apply_sdk_transport_patch()
@@ -313,8 +314,8 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
         }
 
     def _should_retry_sdk_auth_failure(self) -> bool:
-        """Return True when auth failures should trigger a fresh-session retry."""
-        return (self._model_config.mode_s_auth or "max") == "max"
+        """Do not multiply SDK processes after a shared-OAuth auth failure."""
+        return False
 
     def _rate_guard_preflight(self) -> None:
         """Log when this model's realm is rate-guarded (start-time suppression only).
@@ -479,7 +480,10 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
         async def _run_blocking_client(run_options, *, log_label: str) -> ResultMessage | None:
             nonlocal sdk_pid, sdk_pid_create_time
             logger.info("ClaudeSDKClient connecting (%s, resume=%s)", log_label, getattr(run_options, "resume", None))
-            async with ClaudeSDKClient(options=run_options) as client:
+            async with (
+                claude_execution_lock(getattr(run_options, "env", None)),
+                ClaudeSDKClient(options=run_options) as client,
+            ):
                 logger.info("ClaudeSDKClient connected")
                 sdk_pid = _extract_sdk_pid(client)
                 sdk_pid_create_time = None
@@ -633,7 +637,10 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             )
             _prompt_files.extend(tfs)
             try:
-                async with ClaudeSDKClient(options=fresh_opts) as fc:
+                async with (
+                    claude_execution_lock(getattr(fresh_opts, "env", None)),
+                    ClaudeSDKClient(options=fresh_opts) as fc,
+                ):
                     logger.info("ClaudeSDKClient connected (fresh session retry)")
                     self._active_client = fc
                     sdk_pid = _extract_sdk_pid(fc)
@@ -664,7 +671,10 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
 
         async def _run_stream_options(run_options, *, resume_guard: bool) -> AsyncGenerator[dict[str, Any], None]:
             nonlocal emitted_text_delta, sdk_pid, sdk_pid_create_time
-            async with ClaudeSDKClient(options=run_options) as client:
+            async with (
+                claude_execution_lock(getattr(run_options, "env", None)),
+                ClaudeSDKClient(options=run_options) as client,
+            ):
                 logger.info("ClaudeSDKClient connected")
                 self._active_client = client
                 sdk_pid = _extract_sdk_pid(client)

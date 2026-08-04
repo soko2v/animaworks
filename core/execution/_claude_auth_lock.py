@@ -1,0 +1,80 @@
+"""Cross-process serialization for shared Claude.ai OAuth credentials."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
+from typing import TextIO
+
+
+def claude_lock_path(profile: Path) -> Path:
+    """Return the shared lock path for a configured Claude Code profile."""
+    return profile.parent / ".animaworks-auth-locks" / "claude.lock"
+
+
+def _acquire(profile: Path, *, nonblocking: bool) -> TextIO:
+    import fcntl
+
+    lock_path = claude_lock_path(profile)
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+    try:
+        fcntl.flock(lock_file.fileno(), operation)
+    except BaseException:
+        lock_file.close()
+        raise
+    return lock_file
+
+
+def _release(lock_file: TextIO) -> None:
+    import fcntl
+
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+@contextmanager
+def claude_auth_lock(profile: Path, *, nonblocking: bool = False) -> Iterator[None]:
+    """Serialize a synchronous Claude login or credential-using operation."""
+    lock_file = _acquire(profile, nonblocking=nonblocking)
+    try:
+        yield
+    finally:
+        _release(lock_file)
+
+
+@asynccontextmanager
+async def claude_execution_lock(env: dict[str, str] | None) -> AsyncIterator[None]:
+    """Serialize SDK processes that share a Claude Code OAuth profile.
+
+    API, Bedrock, and Vertex executions do not set ``CLAUDE_HOME`` and are
+    intentionally left unconstrained.  ``flock`` makes this effective across
+    all AnimaWorks worker processes on the host, not merely one event loop.
+    """
+    raw_profile = (env or {}).get("CLAUDE_HOME")
+    if not raw_profile:
+        yield
+        return
+
+    profile = Path(raw_profile).expanduser()
+    if not profile.is_absolute():
+        raise ValueError("CLAUDE_HOME must be absolute before acquiring the Claude execution lock")
+
+    acquire_task = asyncio.create_task(asyncio.to_thread(_acquire, profile, nonblocking=False))
+    try:
+        lock_file = await asyncio.shield(acquire_task)
+    except asyncio.CancelledError:
+        # ``flock`` is blocking in a worker thread and cannot be cancelled.
+        # Wait for it to acquire, then release it rather than leaking the lock.
+        lock_file = await acquire_task
+        await asyncio.to_thread(_release, lock_file)
+        raise
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(_release, lock_file)
