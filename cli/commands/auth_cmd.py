@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from core.execution._claude_auth_lock import claude_auth_lock
+from core.execution._claude_auth_lock import claude_auth_lock, clear_claude_oauth_circuit
 
 
 def _configured_claude_home() -> Path:
@@ -61,6 +61,7 @@ def cmd_auth_claude_login(_args) -> None:
 
     if result.returncode:
         raise SystemExit(result.returncode)
+    clear_claude_oauth_circuit(profile)
 
 
 def cmd_auth_claude_status(_args) -> None:

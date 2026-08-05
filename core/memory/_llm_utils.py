@@ -374,6 +374,12 @@ def _build_sdk_env() -> dict[str, str]:
         # max: サブスクリプションログインを使う。ANTHROPIC_API_KEYは「空でも設定されている」と
         # CLIがログインより優先して invalid key になるため、キー自体を渡さない（2026-07-03）。
         env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        claude_home = extra.get("claude_home")
+        if claude_home:
+            profile = Path(claude_home).expanduser()
+            if profile.is_absolute():
+                env["CLAUDE_HOME"] = str(profile)
 
     if cred and cred.base_url:
         env["ANTHROPIC_BASE_URL"] = cred.base_url
@@ -450,15 +456,19 @@ async def _try_agent_sdk(
         options = ClaudeAgentOptions(**options_kwargs)
 
     chunks: list[str] = []
+    from core.execution._claude_auth_lock import claude_execution_lock, trip_claude_oauth_circuit
+
     try:
-        async with ClaudeSDKClient(options=options) as client:
+        async with claude_execution_lock(env), ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for message in client.receive_response():
                 if hasattr(message, "content"):
                     for block in message.content:
                         if hasattr(block, "text"):
                             chunks.append(block.text)
+            trip_claude_oauth_circuit(env, "\n".join(chunks))
     except Exception as e:
+        trip_claude_oauth_circuit(env, str(e))
         logger.warning("Agent SDK one-shot failed: %s", e)
         return None
 

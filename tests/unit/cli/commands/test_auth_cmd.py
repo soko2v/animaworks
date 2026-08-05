@@ -47,6 +47,7 @@ def test_login_uses_central_profile_and_removes_inherited_api_credentials(tmp_pa
         patch("core.platform.claude_code.get_claude_executable", return_value="/usr/bin/claude"),
         patch.dict("os.environ", {"ANTHROPIC_API_KEY": "inherited", "ANTHROPIC_AUTH_TOKEN": "inherited"}),
         patch("cli.commands.auth_cmd.subprocess.run", return_value=completed) as run,
+        patch("cli.commands.auth_cmd.clear_claude_oauth_circuit") as clear_circuit,
     ):
         cmd_auth_claude_login(SimpleNamespace())
 
@@ -55,3 +56,4 @@ def test_login_uses_central_profile_and_removes_inherited_api_credentials(tmp_pa
     assert env["CLAUDE_HOME"] == str(profile)
     assert "ANTHROPIC_API_KEY" not in env
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+    clear_circuit.assert_called_once_with(profile)

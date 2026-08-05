@@ -4,7 +4,13 @@ import asyncio
 
 import pytest
 
-from core.execution._claude_auth_lock import claude_auth_lock, claude_execution_lock
+from core.execution._claude_auth_lock import (
+    ClaudeOAuthCircuitOpen,
+    claude_auth_lock,
+    claude_circuit_path,
+    claude_execution_lock,
+    trip_claude_oauth_circuit,
+)
 
 
 @pytest.mark.asyncio
@@ -39,6 +45,55 @@ async def test_execution_lock_serializes_same_profile(tmp_path) -> None:
 async def test_execution_lock_skips_non_oauth_env() -> None:
     async with claude_execution_lock({"ANTHROPIC_API_KEY": "not-a-real-key"}):
         pass
+
+
+@pytest.mark.asyncio
+async def test_execution_lock_releases_after_exception_and_timeout(tmp_path) -> None:
+    env = {"CLAUDE_HOME": str(tmp_path / "claude-profile")}
+    with pytest.raises(RuntimeError):
+        async with claude_execution_lock(env):
+            raise RuntimeError("mock failure")
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.01):
+            async with claude_execution_lock(env):
+                await asyncio.sleep(1)
+    async with claude_execution_lock(env):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_execution_lock_releases_after_waiter_cancel(tmp_path) -> None:
+    env = {"CLAUDE_HOME": str(tmp_path / "claude-profile")}
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder() -> None:
+        async with claude_execution_lock(env):
+            entered.set()
+            await release.wait()
+
+    holder_task = asyncio.create_task(holder())
+    await entered.wait()
+    waiter = asyncio.create_task(claude_execution_lock(env).__aenter__())
+    await asyncio.sleep(0.01)
+    waiter.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await holder_task
+    async with claude_execution_lock(env):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_revoked_401_opens_fleet_circuit_before_next_spawn(tmp_path) -> None:
+    profile = tmp_path / "claude-profile"
+    env = {"CLAUDE_HOME": str(profile)}
+    assert trip_claude_oauth_circuit(env, "API Error: 401 OAuth access token has been revoked")
+    assert claude_circuit_path(profile).exists()
+    with pytest.raises(ClaudeOAuthCircuitOpen):
+        async with claude_execution_lock(env):
+            pytest.fail("circuit must fail before SDK construction")
 
 
 def test_login_lock_is_nonblocking_while_profile_is_in_use(tmp_path) -> None:
