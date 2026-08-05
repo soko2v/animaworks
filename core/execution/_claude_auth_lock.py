@@ -9,9 +9,43 @@ from pathlib import Path
 from typing import TextIO
 
 
+class ClaudeOAuthCircuitOpen(RuntimeError):
+    """Raised before spawning Claude when shared OAuth was revoked."""
+
+
 def claude_lock_path(profile: Path) -> Path:
     """Return the shared lock path for a configured Claude Code profile."""
     return profile.parent / ".animaworks-auth-locks" / "claude.lock"
+
+
+def claude_circuit_path(profile: Path) -> Path:
+    """Return the fleet-wide revoked-OAuth circuit marker path."""
+    return claude_lock_path(profile).with_name("claude.revoked")
+
+
+def is_revoked_oauth_error(text: str) -> bool:
+    """Return whether *text* identifies the shared OAuth revoked 401."""
+    folded = (text or "").casefold()
+    return "401" in folded and "oauth access token has been revoked" in folded
+
+
+def trip_claude_oauth_circuit(env: dict[str, str] | None, error_text: str) -> bool:
+    """Atomically stop later shared-profile SDK starts after a revoked 401."""
+    raw_profile = (env or {}).get("CLAUDE_HOME")
+    if not raw_profile or not is_revoked_oauth_error(error_text):
+        return False
+    profile = Path(raw_profile).expanduser()
+    if not profile.is_absolute():
+        return False
+    marker = claude_circuit_path(profile)
+    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker.touch(mode=0o600, exist_ok=True)
+    return True
+
+
+def clear_claude_oauth_circuit(profile: Path) -> None:
+    """Reset the circuit after a successful centralized re-login."""
+    claude_circuit_path(profile).unlink(missing_ok=True)
 
 
 def _acquire(profile: Path, *, nonblocking: bool) -> TextIO:
@@ -75,6 +109,16 @@ async def claude_execution_lock(env: dict[str, str] | None) -> AsyncIterator[Non
         await asyncio.to_thread(_release, lock_file)
         raise
     try:
-        yield
+        if claude_circuit_path(profile).exists():
+            raise ClaudeOAuthCircuitOpen(
+                "Claude OAuth circuit is open after a revoked 401; centralized re-login is required"
+            )
+        try:
+            yield
+        except BaseException as exc:
+            # Trip before releasing the mutex so a queued process cannot start
+            # in the gap between observing the revoked 401 and writing marker.
+            trip_claude_oauth_circuit(env, str(exc))
+            raise
     finally:
         await asyncio.to_thread(_release, lock_file)
