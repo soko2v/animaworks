@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -63,6 +64,18 @@ def _acquire(profile: Path, *, nonblocking: bool) -> TextIO:
     return lock_file
 
 
+def _acquire_with_timeout(profile: Path, timeout: float) -> TextIO:
+    """Acquire the shared lock before *timeout* seconds elapse."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            return _acquire(profile, nonblocking=True)
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for the centralized Claude execution gateway") from None
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
 def _release(lock_file: TextIO) -> None:
     import fcntl
 
@@ -78,6 +91,39 @@ def claude_auth_lock(profile: Path, *, nonblocking: bool = False) -> Iterator[No
     lock_file = _acquire(profile, nonblocking=nonblocking)
     try:
         yield
+    finally:
+        _release(lock_file)
+
+
+@contextmanager
+def claude_sync_execution_lock(env: dict[str, str] | None, *, timeout: float | None = None) -> Iterator[None]:
+    """Serialize a synchronous Claude CLI using the shared OAuth profile.
+
+    This is the synchronous gateway used by non-SDK execution paths such as
+    ``machine/claude``.  Keeping those callers in the same lock namespace as
+    Agent SDK sessions prevents an otherwise-safe SDK fleet from racing a raw
+    ``claude -p`` process during token rotation.
+    """
+    raw_profile = (env or {}).get("CLAUDE_HOME")
+    if not raw_profile:
+        yield
+        return
+
+    profile = Path(raw_profile).expanduser()
+    if not profile.is_absolute():
+        raise ValueError("CLAUDE_HOME must be absolute before acquiring the Claude execution lock")
+
+    lock_file = _acquire(profile, nonblocking=False) if timeout is None else _acquire_with_timeout(profile, timeout)
+    try:
+        if claude_circuit_path(profile).exists():
+            raise ClaudeOAuthCircuitOpen(
+                "Claude OAuth circuit is open after a revoked 401; centralized re-login is required"
+            )
+        try:
+            yield
+        except BaseException as exc:
+            trip_claude_oauth_circuit(env, str(exc))
+            raise
     finally:
         _release(lock_file)
 

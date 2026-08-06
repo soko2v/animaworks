@@ -9,6 +9,7 @@ from core.execution._claude_auth_lock import (
     claude_auth_lock,
     claude_circuit_path,
     claude_execution_lock,
+    claude_sync_execution_lock,
     trip_claude_oauth_circuit,
 )
 
@@ -103,4 +104,30 @@ def test_login_lock_is_nonblocking_while_profile_is_in_use(tmp_path) -> None:
         pytest.raises(BlockingIOError),
         claude_auth_lock(profile, nonblocking=True),
     ):
+        pass
+
+
+def test_sync_execution_lock_serializes_with_login_lock(tmp_path) -> None:
+    profile = tmp_path / "claude-profile"
+    env = {"CLAUDE_HOME": str(profile)}
+    with (
+        claude_sync_execution_lock(env),
+        pytest.raises(BlockingIOError),
+        claude_auth_lock(profile, nonblocking=True),
+    ):
+        pass
+
+
+def test_sync_execution_lock_honors_revoked_circuit(tmp_path) -> None:
+    profile = tmp_path / "claude-profile"
+    env = {"CLAUDE_HOME": str(profile)}
+    assert trip_claude_oauth_circuit(env, "API Error: 401 OAuth access token has been revoked")
+    with pytest.raises(ClaudeOAuthCircuitOpen), claude_sync_execution_lock(env):
+        pytest.fail("circuit must fail before raw Claude CLI construction")
+
+
+def test_sync_execution_lock_times_out_while_profile_is_in_use(tmp_path) -> None:
+    profile = tmp_path / "claude-profile"
+    env = {"CLAUDE_HOME": str(profile)}
+    with claude_auth_lock(profile), pytest.raises(TimeoutError), claude_sync_execution_lock(env, timeout=0.01):
         pass

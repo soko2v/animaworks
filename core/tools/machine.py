@@ -43,6 +43,7 @@ import subprocess
 import tempfile
 import threading as _threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -321,12 +322,14 @@ def _resolve_engine_credentials(engine: str) -> dict[str, str]:
 
             cred = load_config().credentials.get("anthropic")
             cred_type = str(getattr(cred, "type", "") or "")
+            claude_home = (getattr(cred, "keys", None) or {}).get("claude_home") if cred else None
         except Exception as exc:
             logger.debug("machine/claude: credential type check failed: %s", exc)
             cred_type = ""
-        if cred_type != "api_key":
+            claude_home = None
+        if claude_home or cred_type != "api_key":
             logger.debug(
-                "machine/claude: credential type %r is proxy-based; "
+                "machine/claude: central profile configured or credential type %r is proxy-based; "
                 "using CLI subscription login instead of key injection",
                 cred_type,
             )
@@ -374,6 +377,19 @@ def _build_env(engine: str) -> dict[str, str]:
     if engine == "claude" and not creds:
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("ANTHROPIC_BASE_URL", None)
+        try:
+            from core.config.models import load_config
+
+            credential = load_config().credentials.get("anthropic")
+            claude_home = (credential.keys or {}).get("claude_home") if credential else None
+            if claude_home:
+                profile = Path(claude_home).expanduser()
+                if profile.is_absolute():
+                    env["CLAUDE_HOME"] = str(profile)
+                else:
+                    logger.warning("machine/claude: ignoring non-absolute configured CLAUDE_HOME")
+        except Exception as exc:
+            logger.debug("machine/claude: failed to resolve central Claude profile: %s", exc)
 
     # Ensure ~/.local/bin is on PATH so engine binaries (claude/codex/
     # cursor-agent/gemini) installed there are discoverable in the
@@ -659,7 +675,13 @@ def _execute(
     effective_timeout = timeout or _DEFAULT_TIMEOUT_SYNC
 
     proc = None
+    execution_stack = ExitStack()
     try:
+        if engine == "claude" and env.get("CLAUDE_HOME"):
+            from core.execution._claude_auth_lock import claude_sync_execution_lock
+
+            execution_stack.enter_context(claude_sync_execution_lock(env, timeout=effective_timeout))
+
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -703,6 +725,11 @@ def _execute(
             raw_output = output_path.read_text(encoding="utf-8")
         except OSError:
             raw_output = ""
+
+        if engine == "claude" and env.get("CLAUDE_HOME"):
+            from core.execution._claude_auth_lock import trip_claude_oauth_circuit
+
+            trip_claude_oauth_circuit(env, raw_output)
 
         if len(raw_output) > _MAX_OUTPUT_CHARS:
             raw_output = raw_output[:_MAX_OUTPUT_CHARS] + f"\n\n... (truncated at {_MAX_OUTPUT_CHARS} chars)"
@@ -777,6 +804,13 @@ def _execute(
             error=t("machine.unexpected_error", engine=engine, error=str(exc)),
         )
     finally:
+        if proc is not None and proc.poll() is None:
+            terminate_subprocess(proc, force=True)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                logger.error("machine/%s subprocess did not exit during exception cleanup", engine)
+        execution_stack.close()
         if codex_home_override:
             shutil.rmtree(codex_home_override, ignore_errors=True)
 

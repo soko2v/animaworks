@@ -296,6 +296,31 @@ class TestCheckA1BashCommand:
         result = _check_a1_bash_command("python3 script.py", anima_dir)
         assert result is None
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "claude -p 'test'",
+            "/opt/homebrew/bin/claude auth status",
+            "env CLAUDE_HOME=/tmp/profile claude -p test",
+            "echo ready && claude -p test",
+            "command claude -p test",
+            "nohup claude -p test",
+            "bash -c 'claude -p test'",
+            "printf test | xargs claude -p",
+        ],
+    )
+    def test_direct_claude_cli_blocked(self, anima_dir: Path, command: str):
+        result = _check_a1_bash_command(command, anima_dir, superuser=True)
+        assert result is not None
+        assert "centralized" in result
+
+    def test_machine_claude_gateway_allowed(self, anima_dir: Path):
+        result = _check_a1_bash_command(
+            "animaworks-tool machine run --engine claude -d /tmp test",
+            anima_dir,
+        )
+        assert result is None
+
     def test_cp_within_own_dir_allowed(self, anima_dir: Path):
         cmd = f"cp {anima_dir}/file1.md {anima_dir}/file2.md"
         result = _check_a1_bash_command(cmd, anima_dir)
