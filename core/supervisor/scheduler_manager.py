@@ -954,8 +954,11 @@ class SchedulerManager:
         if not self._anima:
             return
 
-        # Detect schedule file changes and skip stale tasks
-        if self._check_schedule_freshness():
+        # Detect schedule file changes and skip stale tasks.
+        # Pass the fired job so freshness can compare (name, schedule, type)
+        # against the reloaded cron.md and only skip when the job is gone
+        # or has been mutated (see _check_schedule_freshness docstring).
+        if self._check_schedule_freshness(task):
             self._log_cron_event(task, "skipped", "schedule reloaded")
             logger.info(
                 "Skipping stale cron '%s' for %s (schedule reloaded)",
@@ -1152,20 +1155,27 @@ class SchedulerManager:
         except OSError:
             self._heartbeat_md_mtime = 0.0
 
-    def _check_schedule_freshness(self) -> bool:
+    def _check_schedule_freshness(self, fired_job: CronTask | None = None) -> bool:
         """Check if cron.md or heartbeat.md changed since last setup.
 
         If either file changed, reload the schedule so subsequent ticks see the
-        latest state.  However, the return value flags "the currently firing
-        cron task is stale and should be skipped".  We only claim staleness
-        when ``cron.md`` itself changed — heartbeat.md updates never invalidate
-        cron tasks, so a heartbeat.md-only edit must not cause the running
-        cron to be dropped.
+        latest state.  The return value flags "the currently firing cron task
+        is stale and should be skipped".  Staleness is claimed only when the
+        currently firing job's identity — the tuple ``(name, schedule, type)``
+        — is *no longer present* in the reloaded ``cron.md``.  A cron.md edit
+        that leaves the fired job unchanged (e.g. adding an unrelated task or
+        editing a comment) must NOT skip the running job.
 
-        This is the fix for the reverse-variant regression documented in
-        ``sofia/knowledge/yutaka-oneshot-cron-misfire-rca-20260721.md`` where a
-        heartbeat.md edit made hours earlier caused the next cron_tick to
-        silently drop a due (potentially one-shot) job.
+        Invariants:
+          (1) cron.md change + same ``(name, schedule, type)`` present → False (run)
+          (2) job removed or ``name``/``schedule``/``type`` mutated       → True (skip)
+          (3) heartbeat.md-only change                                    → False (run)
+          (4) ``fired_job=None`` (heartbeat call-site, no job context)    → False
+
+        This tightens the earlier ``cron_changed`` guard (commit ``412521d5``)
+        which over-skipped whenever cron.md was touched.  Rationale in
+        ``sofia/knowledge/yutaka-oneshot-cron-misfire-rca-20260721.md`` and
+        the alex 2026-07-29 22:44 review.
         """
         cron_path = self._anima_dir / "cron.md"
         hb_path = self._anima_dir / "heartbeat.md"
@@ -1192,9 +1202,59 @@ class SchedulerManager:
             hb_mtime,
         )
         self.reload_schedule(self._anima_name)
-        # Only cron.md changes can invalidate the currently firing cron task.
-        # A heartbeat.md-only edit must not cause due cron jobs to be skipped.
-        return cron_changed
+
+        # heartbeat.md-only change cannot invalidate any cron job.
+        if not cron_changed:
+            return False
+
+        # No job context (heartbeat call path): nothing to invalidate.
+        if fired_job is None:
+            return False
+
+        # cron.md changed AND we have the fired job identity.  Re-parse the
+        # (post-reload) cron.md and mark stale ONLY if the fired job's
+        # (name, schedule, type) tuple no longer appears.
+        try:
+            new_config = self._anima.memory.read_cron_config() if self._anima else ""
+        except Exception:
+            logger.warning(
+                "Freshness re-parse failed for %s -> %s; treating as stale",
+                self._anima_name,
+                fired_job.name,
+                exc_info=True,
+            )
+            return True
+
+        try:
+            new_tasks = parse_cron_md(new_config) if new_config else []
+        except Exception:
+            logger.warning(
+                "Freshness re-parse of cron.md failed for %s -> %s; treating as stale",
+                self._anima_name,
+                fired_job.name,
+                exc_info=True,
+            )
+            return True
+
+        for t in new_tasks:
+            if (
+                t.name == fired_job.name
+                and t.schedule == fired_job.schedule
+                and t.type == fired_job.type
+            ):
+                logger.debug(
+                    "Freshness: fired job '%s' still present after cron.md reload for %s — running",
+                    fired_job.name,
+                    self._anima_name,
+                )
+                return False
+
+        logger.info(
+            "Freshness: fired job '%s' removed or mutated in cron.md for %s — skipping",
+            fired_job.name,
+            self._anima_name,
+        )
+        return True
 
     # ── Cleanup ──────────────────────────────────────────────────
 

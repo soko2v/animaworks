@@ -1,22 +1,30 @@
-"""Tests for stale schedule detection via mtime reconciliation.
+"""Tests for stale schedule detection via mtime reconciliation + identity check.
 
 Covers the symmetric fix applied to
 ``core/supervisor/scheduler_manager.py::_check_schedule_freshness``
 and
-``core/lifecycle/scheduler.py::_check_schedule_freshness``
-for the reverse-variant regression documented in
-``sofia/knowledge/yutaka-oneshot-cron-misfire-rca-20260721.md``.
+``core/lifecycle/scheduler.py::_check_schedule_freshness``.
 
-Key invariants under test:
+Two-stage evolution:
 
-1. A change to ``heartbeat.md`` alone still triggers a schedule reload but
-   does NOT flag the currently firing cron as stale (so due one-shots are
-   not silently dropped when a heartbeat edit happens hours earlier).
-2. A change to ``cron.md`` still flags the currently firing cron as stale
-   (the original protection against firing a removed/edited task).
-3. ``_heartbeat_check`` polls freshness every minute (closes the forward-
-   variant blind window for long-interval Animas).
-4. The supervisor and lifecycle paths are behaviourally symmetric.
+1. First fix (commit ``412521d5``, sofia 2026-07-29):
+   heartbeat.md-only edits no longer skip due cron tasks.  See
+   ``sofia/knowledge/yutaka-oneshot-cron-misfire-rca-20260721.md`` for the
+   reverse-variant regression.
+2. Second fix (this suite, alex 2026-07-29 22:44 review):
+   cron.md edits that leave the currently firing job's
+   ``(name, schedule, type)`` unchanged must also NOT skip.  Staleness is
+   now claimed only when the fired job is *removed* or its
+   ``name`` / ``schedule`` / ``type`` is *mutated*.
+
+Key invariants under test (all four call-paths must honour them):
+
+  (1) cron.md change + same ``(name, schedule, type)`` still present    → False (run)
+  (2) job removed OR ``name`` / ``schedule`` / ``type`` mutated         → True  (skip)
+  (3) heartbeat.md-only change                                          → False (run)
+  (4) ``fired_job=None`` (heartbeat call-site, no job context)          → False
+  (5) ``_heartbeat_check`` polls freshness every minute (forward-variant fix)
+  (6) supervisor and lifecycle paths are behaviourally symmetric.
 """
 
 from __future__ import annotations
@@ -28,7 +36,33 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.schemas import CronTask
 from core.supervisor.scheduler_manager import SchedulerManager
+
+
+# ── Cron.md fixture helpers ──────────────────────────────────────────────
+
+
+def _cron_md(*jobs: tuple[str, str, str]) -> str:
+    """Build a cron.md document from (name, schedule, type) tuples.
+
+    Each tuple emits a ``## name\\nschedule: ...\\ntype: ...`` section that
+    ``core.schedule_parser.parse_cron_md`` accepts.  Description is a fixed
+    stub because it is not part of the identity we compare.
+    """
+    parts: list[str] = []
+    for name, schedule, task_type in jobs:
+        parts.append(
+            f"## {name}\n"
+            f"schedule: {schedule}\n"
+            f"type: {task_type}\n"
+            "Description stub.\n"
+        )
+    return "\n".join(parts)
+
+
+def _job(name: str, schedule: str, task_type: str) -> CronTask:
+    return CronTask(name=name, schedule=schedule, type=task_type)
 
 
 # ── Supervisor-side fixtures ─────────────────────────────────────────────
@@ -71,36 +105,19 @@ class TestRecordScheduleMtimes:
 
 class TestCheckScheduleFreshness:
     def test_no_change_returns_false(self, scheduler_mgr: SchedulerManager, tmp_path: Path) -> None:
-        (tmp_path / "cron.md").write_text("# v1")
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
         scheduler_mgr._record_schedule_mtimes()
         assert scheduler_mgr._check_schedule_freshness() is False
-
-    def test_cron_change_reloads_and_marks_stale(
-        self, scheduler_mgr: SchedulerManager, tmp_path: Path
-    ) -> None:
-        """cron.md change -> reload + True (skip current cron tick)."""
-        (tmp_path / "cron.md").write_text("# v1")
-        scheduler_mgr._record_schedule_mtimes()
-
-        # Simulate file modification (ensure mtime changes)
-        time.sleep(0.05)
-        (tmp_path / "cron.md").write_text("# v2")
-
-        with patch.object(scheduler_mgr, "reload_schedule") as mock_reload:
-            result = scheduler_mgr._check_schedule_freshness()
-        assert result is True, "cron.md change must mark the current tick as stale"
-        mock_reload.assert_called_once_with("test")
 
     def test_heartbeat_only_change_reloads_but_returns_false(
         self, scheduler_mgr: SchedulerManager, tmp_path: Path
     ) -> None:
         """heartbeat.md-only change -> reload happens but current cron is NOT stale.
 
-        This is the regression fix for the reverse variant: a heartbeat.md
-        edit hours earlier must not cause the next due cron (potentially a
-        one-shot) to be silently dropped.
+        Regression fix (a): a heartbeat.md edit hours earlier must not cause
+        the next due cron (potentially a one-shot) to be silently dropped.
         """
-        (tmp_path / "cron.md").write_text("# cron v1")
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
         (tmp_path / "heartbeat.md").write_text("# hb v1")
         scheduler_mgr._record_schedule_mtimes()
 
@@ -108,39 +125,181 @@ class TestCheckScheduleFreshness:
         (tmp_path / "heartbeat.md").write_text("# hb v2")
 
         with patch.object(scheduler_mgr, "reload_schedule") as mock_reload:
-            result = scheduler_mgr._check_schedule_freshness()
+            result = scheduler_mgr._check_schedule_freshness(
+                _job("alpha", "0 9 * * *", "llm")
+            )
         assert result is False, "heartbeat-only change must NOT skip due cron tasks"
         mock_reload.assert_called_once_with("test"), "reload must still occur to pick up hb change"
 
-    def test_both_changes_marks_stale(
+    def test_cron_change_same_definition_returns_false(
         self, scheduler_mgr: SchedulerManager, tmp_path: Path
     ) -> None:
-        """When both files change, cron.md change dominates and marks stale."""
-        (tmp_path / "cron.md").write_text("# cron v1")
-        (tmp_path / "heartbeat.md").write_text("# hb v1")
+        """cron.md edited but fired job (name, schedule, type) unchanged -> RUN.
+
+        Regression fix (b, alex 07-29 22:44 review): touching cron.md (e.g.
+        adding an unrelated task or editing a comment) must not skip a due
+        job whose identity is preserved.
+        """
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        scheduler_mgr._record_schedule_mtimes()
+        # Wire mock to return the *new* cron.md content when reload_schedule fires.
+        scheduler_mgr._anima.memory.read_cron_config.return_value = _cron_md(
+            ("alpha", "0 9 * * *", "llm"),
+            ("beta", "*/15 * * * *", "command"),
+        )
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(
+            ("alpha", "0 9 * * *", "llm"),
+            ("beta", "*/15 * * * *", "command"),
+        ))
+
+        with patch.object(scheduler_mgr, "reload_schedule") as mock_reload:
+            result = scheduler_mgr._check_schedule_freshness(
+                _job("alpha", "0 9 * * *", "llm")
+            )
+        assert result is False, (
+            "cron.md edit that preserves the fired job's identity must NOT skip"
+        )
+        mock_reload.assert_called_once_with("test")
+
+    def test_cron_change_fired_job_removed_marks_stale(
+        self, scheduler_mgr: SchedulerManager, tmp_path: Path
+    ) -> None:
+        """Fired job removed from cron.md -> SKIP (safety)."""
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        scheduler_mgr._record_schedule_mtimes()
+        scheduler_mgr._anima.memory.read_cron_config.return_value = _cron_md(
+            ("beta", "*/15 * * * *", "llm"),
+        )
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("beta", "*/15 * * * *", "llm")))
+
+        with patch.object(scheduler_mgr, "reload_schedule"):
+            result = scheduler_mgr._check_schedule_freshness(
+                _job("alpha", "0 9 * * *", "llm")
+            )
+        assert result is True
+
+    def test_cron_change_schedule_mutated_marks_stale(
+        self, scheduler_mgr: SchedulerManager, tmp_path: Path
+    ) -> None:
+        """Fired job's schedule mutated -> SKIP."""
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        scheduler_mgr._record_schedule_mtimes()
+        scheduler_mgr._anima.memory.read_cron_config.return_value = _cron_md(
+            ("alpha", "0 10 * * *", "llm"),
+        )
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 10 * * *", "llm")))
+
+        with patch.object(scheduler_mgr, "reload_schedule"):
+            result = scheduler_mgr._check_schedule_freshness(
+                _job("alpha", "0 9 * * *", "llm")
+            )
+        assert result is True
+
+    def test_cron_change_type_mutated_marks_stale(
+        self, scheduler_mgr: SchedulerManager, tmp_path: Path
+    ) -> None:
+        """Fired job's type mutated (llm <-> command) -> SKIP."""
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        scheduler_mgr._record_schedule_mtimes()
+        scheduler_mgr._anima.memory.read_cron_config.return_value = _cron_md(
+            ("alpha", "0 9 * * *", "command"),
+        )
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "command")))
+
+        with patch.object(scheduler_mgr, "reload_schedule"):
+            result = scheduler_mgr._check_schedule_freshness(
+                _job("alpha", "0 9 * * *", "llm")
+            )
+        assert result is True
+
+    def test_cron_change_name_mutated_marks_stale(
+        self, scheduler_mgr: SchedulerManager, tmp_path: Path
+    ) -> None:
+        """Fired job's name changed (rename) -> SKIP.  Rename is 'delete + add'."""
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        scheduler_mgr._record_schedule_mtimes()
+        scheduler_mgr._anima.memory.read_cron_config.return_value = _cron_md(
+            ("alpha-renamed", "0 9 * * *", "llm"),
+        )
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha-renamed", "0 9 * * *", "llm")))
+
+        with patch.object(scheduler_mgr, "reload_schedule"):
+            result = scheduler_mgr._check_schedule_freshness(
+                _job("alpha", "0 9 * * *", "llm")
+            )
+        assert result is True
+
+    def test_cron_change_without_fired_job_returns_false(
+        self, scheduler_mgr: SchedulerManager, tmp_path: Path
+    ) -> None:
+        """cron.md changed but no fired_job context (heartbeat call path) -> reload only, no skip signal."""
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
         scheduler_mgr._record_schedule_mtimes()
 
         time.sleep(0.05)
-        (tmp_path / "cron.md").write_text("# cron v2")
-        (tmp_path / "heartbeat.md").write_text("# hb v2")
+        (tmp_path / "cron.md").write_text(_cron_md(("beta", "*/15 * * * *", "llm")))
 
         with patch.object(scheduler_mgr, "reload_schedule") as mock_reload:
             result = scheduler_mgr._check_schedule_freshness()
-        assert result is True
-        mock_reload.assert_called_once()
+        assert result is False, (
+            "heartbeat call-path (fired_job=None) must never return stale=True"
+        )
+        mock_reload.assert_called_once_with("test")
 
     def test_deleted_cron_marks_stale(
         self, scheduler_mgr: SchedulerManager, tmp_path: Path
     ) -> None:
-        (tmp_path / "cron.md").write_text("# v1")
+        """cron.md file removed entirely -> fired job cannot be found -> SKIP."""
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
         scheduler_mgr._record_schedule_mtimes()
+        scheduler_mgr._anima.memory.read_cron_config.return_value = ""
 
         (tmp_path / "cron.md").unlink()
 
-        with patch.object(scheduler_mgr, "reload_schedule") as mock_reload:
-            result = scheduler_mgr._check_schedule_freshness()
+        with patch.object(scheduler_mgr, "reload_schedule"):
+            result = scheduler_mgr._check_schedule_freshness(
+                _job("alpha", "0 9 * * *", "llm")
+            )
         assert result is True
-        mock_reload.assert_called_once()
+
+    def test_both_changes_with_same_definition_returns_false(
+        self, scheduler_mgr: SchedulerManager, tmp_path: Path
+    ) -> None:
+        """When both files change but fired job identity is preserved -> RUN.
+
+        Composite of invariants (1) + (3): cron.md and heartbeat.md both
+        touched, but the fired job's (name, schedule, type) is untouched.
+        """
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        (tmp_path / "heartbeat.md").write_text("# hb v1")
+        scheduler_mgr._record_schedule_mtimes()
+        scheduler_mgr._anima.memory.read_cron_config.return_value = _cron_md(
+            ("alpha", "0 9 * * *", "llm"),
+            ("gamma", "0 12 * * *", "command"),
+        )
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(
+            ("alpha", "0 9 * * *", "llm"),
+            ("gamma", "0 12 * * *", "command"),
+        ))
+        (tmp_path / "heartbeat.md").write_text("# hb v2")
+
+        with patch.object(scheduler_mgr, "reload_schedule"):
+            result = scheduler_mgr._check_schedule_freshness(
+                _job("alpha", "0 9 * * *", "llm")
+            )
+        assert result is False
 
     def test_missing_files_initially_no_reload(self, scheduler_mgr: SchedulerManager) -> None:
         """When files never existed, no reload needed."""
@@ -167,7 +326,8 @@ class TestHeartbeatCheckPollsFreshness:
         scheduler_mgr._record_schedule_mtimes()
 
         # Force _in_active_hours to False so the check exits early after
-        # freshness — we only care that freshness was consulted.
+        # freshness — we only care that freshness was consulted with no
+        # job context (heartbeat call-site).
         with patch.object(scheduler_mgr, "_in_active_hours", return_value=False), patch.object(
             scheduler_mgr, "_check_schedule_freshness"
         ) as mock_freshness, patch.object(scheduler_mgr, "heartbeat_tick") as mock_tick:
@@ -186,7 +346,7 @@ class TestHeartbeatCheckPollsFreshness:
 
         call_order: list[str] = []
 
-        def rec_freshness() -> bool:
+        def rec_freshness(*_args: object, **_kwargs: object) -> bool:
             call_order.append("freshness")
             return False
 
@@ -206,31 +366,29 @@ class TestHeartbeatCheckPollsFreshness:
 
 
 class TestScheduleFreshnessRegression:
-    """P0 regression: heartbeat edit must not silently drop a due one-shot cron.
+    """P0 regression: schedule edits must not silently drop a due one-shot cron.
 
-    Simulates the yutaka 2026-07-27 10:10 scenario where a heartbeat.md
-    edit earlier the same day caused the next cron_tick to skip a due
-    one-shot task.
+    Simulates two scenarios:
+      (a) yutaka 2026-07-27 10:10: a heartbeat.md edit hours earlier caused
+          the next cron_tick to skip a due one-shot task.
+      (b) alex 2026-07-29 22:44 review: a cron.md edit that leaves the fired
+          job's identity intact must not skip either.
     """
 
     def test_heartbeat_edit_then_due_one_shot_fires(
         self, scheduler_mgr: SchedulerManager, tmp_path: Path
     ) -> None:
-        # Initial snapshot with both files present.
-        (tmp_path / "cron.md").write_text("# cron v1 (contains the due one-shot)")
+        (tmp_path / "cron.md").write_text(_cron_md(("one_shot", "10 10 27 7 *", "llm")))
         (tmp_path / "heartbeat.md").write_text("# hb v1")
         scheduler_mgr._record_schedule_mtimes()
 
-        # Someone edits heartbeat.md (e.g. daily HB overwrite) hours before
-        # the one-shot cron is scheduled to fire.
         time.sleep(0.05)
         (tmp_path / "heartbeat.md").write_text("# hb v2 — edited mid-day")
 
-        # Now the due one-shot fires: cron_tick calls _check_schedule_freshness.
-        # Under the fix, freshness reloads (hb changed) but returns False, so
-        # the task is NOT marked stale and would run.
         with patch.object(scheduler_mgr, "reload_schedule") as mock_reload:
-            is_stale = scheduler_mgr._check_schedule_freshness()
+            is_stale = scheduler_mgr._check_schedule_freshness(
+                _job("one_shot", "10 10 27 7 *", "llm")
+            )
 
         assert is_stale is False, (
             "REGRESSION: heartbeat-only edit caused due cron to be flagged as stale. "
@@ -238,18 +396,56 @@ class TestScheduleFreshnessRegression:
         )
         mock_reload.assert_called_once_with("test")
 
-    def test_cron_md_edit_causes_stale_skip(
+    def test_cron_edit_comment_only_does_not_skip_due_job(
         self, scheduler_mgr: SchedulerManager, tmp_path: Path
     ) -> None:
-        """Complement: cron.md edits still cause stale skip (removed/edited task safety)."""
-        (tmp_path / "cron.md").write_text("# cron v1")
+        """alex 07-29 22:44: cron.md touched with unrelated changes must not skip.
+
+        Simulates a maintainer adding an unrelated task or comment to
+        cron.md while a due one-shot is about to fire.  The fired job's
+        identity is preserved, so it MUST run.
+        """
+        (tmp_path / "cron.md").write_text(_cron_md(("critical", "30 9 * * *", "llm")))
         scheduler_mgr._record_schedule_mtimes()
+        scheduler_mgr._anima.memory.read_cron_config.return_value = _cron_md(
+            ("critical", "30 9 * * *", "llm"),
+            ("noise", "0 3 * * *", "command"),
+        )
 
         time.sleep(0.05)
-        (tmp_path / "cron.md").write_text("# cron v2 — task removed")
+        (tmp_path / "cron.md").write_text(_cron_md(
+            ("critical", "30 9 * * *", "llm"),
+            ("noise", "0 3 * * *", "command"),
+        ))
 
         with patch.object(scheduler_mgr, "reload_schedule"):
-            assert scheduler_mgr._check_schedule_freshness() is True
+            is_stale = scheduler_mgr._check_schedule_freshness(
+                _job("critical", "30 9 * * *", "llm")
+            )
+
+        assert is_stale is False, (
+            "REGRESSION: unrelated cron.md edit skipped a due job whose "
+            "(name, schedule, type) identity was preserved."
+        )
+
+    def test_cron_edit_that_removes_fired_job_skips(
+        self, scheduler_mgr: SchedulerManager, tmp_path: Path
+    ) -> None:
+        """Complement: if the fired job is *actually* removed from cron.md, SKIP."""
+        (tmp_path / "cron.md").write_text(_cron_md(("critical", "30 9 * * *", "llm")))
+        scheduler_mgr._record_schedule_mtimes()
+        scheduler_mgr._anima.memory.read_cron_config.return_value = _cron_md(
+            ("noise", "0 3 * * *", "command"),
+        )
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("noise", "0 3 * * *", "command")))
+
+        with patch.object(scheduler_mgr, "reload_schedule"):
+            is_stale = scheduler_mgr._check_schedule_freshness(
+                _job("critical", "30 9 * * *", "llm")
+            )
+        assert is_stale is True
 
 
 # ── Lifecycle-side symmetry ──────────────────────────────────────────────
@@ -259,12 +455,14 @@ class _StubLifecycleScheduler:
     """Minimal harness for the lifecycle SchedulerMixin freshness predicate.
 
     We don't need a full ``LifecycleManager`` — the predicate only touches
-    ``self.animas``, ``self._schedule_mtimes`` and ``self.reload_anima_schedule``.
+    ``self.animas``, ``self._schedule_mtimes`` and
+    ``self.reload_anima_schedule``.
     """
 
     def __init__(self, name: str, anima_dir: Path) -> None:
         anima = MagicMock()
         anima.memory.anima_dir = anima_dir
+        anima.memory.read_cron_config.return_value = ""
         self.animas = {name: anima}
         self._schedule_mtimes: dict[str, tuple[float, float]] = {}
         self.reload_calls: list[str] = []
@@ -291,12 +489,12 @@ def _bind_freshness_to_stub(stub: _StubLifecycleScheduler):
 class TestLifecycleSchedulerFreshnessSymmetry:
     """The lifecycle path must behave symmetrically with the supervisor path.
 
-    Both share the same invariant: heartbeat.md-only edits reload the
-    schedule but must NOT flag the current cron tick as stale.
+    All six invariants ((1)–(4), plus the composite scenarios) must hold on
+    both call sites.
     """
 
     def test_heartbeat_only_change_reloads_but_returns_false(self, tmp_path: Path) -> None:
-        (tmp_path / "cron.md").write_text("# cron v1")
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
         (tmp_path / "heartbeat.md").write_text("# hb v1")
         stub = _StubLifecycleScheduler("test", tmp_path)
         stub.snapshot("test")
@@ -305,44 +503,126 @@ class TestLifecycleSchedulerFreshnessSymmetry:
         time.sleep(0.05)
         (tmp_path / "heartbeat.md").write_text("# hb v2")
 
+        assert check("test", _job("alpha", "0 9 * * *", "llm")) is False
+        assert stub.reload_calls == ["test"]
+
+    def test_cron_change_same_definition_returns_false(self, tmp_path: Path) -> None:
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        stub = _StubLifecycleScheduler("test", tmp_path)
+        stub.snapshot("test")
+        stub.animas["test"].memory.read_cron_config.return_value = _cron_md(
+            ("alpha", "0 9 * * *", "llm"),
+            ("beta", "*/15 * * * *", "command"),
+        )
+        check = _bind_freshness_to_stub(stub)
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(
+            ("alpha", "0 9 * * *", "llm"),
+            ("beta", "*/15 * * * *", "command"),
+        ))
+
+        assert check("test", _job("alpha", "0 9 * * *", "llm")) is False
+        assert stub.reload_calls == ["test"]
+
+    def test_cron_change_fired_job_removed_marks_stale(self, tmp_path: Path) -> None:
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        stub = _StubLifecycleScheduler("test", tmp_path)
+        stub.snapshot("test")
+        stub.animas["test"].memory.read_cron_config.return_value = _cron_md(
+            ("beta", "*/15 * * * *", "llm"),
+        )
+        check = _bind_freshness_to_stub(stub)
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("beta", "*/15 * * * *", "llm")))
+
+        assert check("test", _job("alpha", "0 9 * * *", "llm")) is True
+        assert stub.reload_calls == ["test"]
+
+    def test_cron_change_schedule_mutated_marks_stale(self, tmp_path: Path) -> None:
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        stub = _StubLifecycleScheduler("test", tmp_path)
+        stub.snapshot("test")
+        stub.animas["test"].memory.read_cron_config.return_value = _cron_md(
+            ("alpha", "0 10 * * *", "llm"),
+        )
+        check = _bind_freshness_to_stub(stub)
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 10 * * *", "llm")))
+
+        assert check("test", _job("alpha", "0 9 * * *", "llm")) is True
+
+    def test_cron_change_type_mutated_marks_stale(self, tmp_path: Path) -> None:
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        stub = _StubLifecycleScheduler("test", tmp_path)
+        stub.snapshot("test")
+        stub.animas["test"].memory.read_cron_config.return_value = _cron_md(
+            ("alpha", "0 9 * * *", "command"),
+        )
+        check = _bind_freshness_to_stub(stub)
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "command")))
+
+        assert check("test", _job("alpha", "0 9 * * *", "llm")) is True
+
+    def test_cron_change_name_mutated_marks_stale(self, tmp_path: Path) -> None:
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        stub = _StubLifecycleScheduler("test", tmp_path)
+        stub.snapshot("test")
+        stub.animas["test"].memory.read_cron_config.return_value = _cron_md(
+            ("alpha-renamed", "0 9 * * *", "llm"),
+        )
+        check = _bind_freshness_to_stub(stub)
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha-renamed", "0 9 * * *", "llm")))
+
+        assert check("test", _job("alpha", "0 9 * * *", "llm")) is True
+
+    def test_cron_change_without_fired_job_returns_false(self, tmp_path: Path) -> None:
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
+        stub = _StubLifecycleScheduler("test", tmp_path)
+        stub.snapshot("test")
+        check = _bind_freshness_to_stub(stub)
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(("beta", "*/15 * * * *", "llm")))
+
+        # No fired_job (heartbeat call-path).  Must reload but not signal stale.
         assert check("test") is False
         assert stub.reload_calls == ["test"]
 
-    def test_cron_change_reloads_and_marks_stale(self, tmp_path: Path) -> None:
-        (tmp_path / "cron.md").write_text("# cron v1")
+    def test_both_changes_with_same_definition_returns_false(self, tmp_path: Path) -> None:
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
         (tmp_path / "heartbeat.md").write_text("# hb v1")
         stub = _StubLifecycleScheduler("test", tmp_path)
         stub.snapshot("test")
+        stub.animas["test"].memory.read_cron_config.return_value = _cron_md(
+            ("alpha", "0 9 * * *", "llm"),
+            ("gamma", "0 12 * * *", "command"),
+        )
         check = _bind_freshness_to_stub(stub)
 
         time.sleep(0.05)
-        (tmp_path / "cron.md").write_text("# cron v2")
-
-        assert check("test") is True
-        assert stub.reload_calls == ["test"]
-
-    def test_both_changes_marks_stale(self, tmp_path: Path) -> None:
-        (tmp_path / "cron.md").write_text("# cron v1")
-        (tmp_path / "heartbeat.md").write_text("# hb v1")
-        stub = _StubLifecycleScheduler("test", tmp_path)
-        stub.snapshot("test")
-        check = _bind_freshness_to_stub(stub)
-
-        time.sleep(0.05)
-        (tmp_path / "cron.md").write_text("# cron v2")
+        (tmp_path / "cron.md").write_text(_cron_md(
+            ("alpha", "0 9 * * *", "llm"),
+            ("gamma", "0 12 * * *", "command"),
+        ))
         (tmp_path / "heartbeat.md").write_text("# hb v2")
 
-        assert check("test") is True
-        assert stub.reload_calls == ["test"]
+        assert check("test", _job("alpha", "0 9 * * *", "llm")) is False
 
     def test_no_change_returns_false(self, tmp_path: Path) -> None:
-        (tmp_path / "cron.md").write_text("# cron v1")
+        (tmp_path / "cron.md").write_text(_cron_md(("alpha", "0 9 * * *", "llm")))
         (tmp_path / "heartbeat.md").write_text("# hb v1")
         stub = _StubLifecycleScheduler("test", tmp_path)
         stub.snapshot("test")
         check = _bind_freshness_to_stub(stub)
 
-        assert check("test") is False
+        assert check("test", _job("alpha", "0 9 * * *", "llm")) is False
         assert stub.reload_calls == []
 
     def test_unknown_anima_returns_false(self, tmp_path: Path) -> None:
@@ -352,7 +632,7 @@ class TestLifecycleSchedulerFreshnessSymmetry:
 
     def test_heartbeat_edit_then_due_one_shot_fires_lifecycle(self, tmp_path: Path) -> None:
         """Symmetric regression: yutaka 07-27 10:10 scenario, lifecycle path."""
-        (tmp_path / "cron.md").write_text("# cron v1")
+        (tmp_path / "cron.md").write_text(_cron_md(("one_shot", "10 10 27 7 *", "llm")))
         (tmp_path / "heartbeat.md").write_text("# hb v1")
         stub = _StubLifecycleScheduler("test", tmp_path)
         stub.snapshot("test")
@@ -361,8 +641,29 @@ class TestLifecycleSchedulerFreshnessSymmetry:
         time.sleep(0.05)
         (tmp_path / "heartbeat.md").write_text("# hb v2 — mid-day edit")
 
-        # Due one-shot fires — must NOT be flagged stale.
-        assert check("test") is False, (
+        assert check("test", _job("one_shot", "10 10 27 7 *", "llm")) is False, (
             "REGRESSION (lifecycle): heartbeat-only edit skipped a due cron"
         )
         assert stub.reload_calls == ["test"]
+
+    def test_cron_edit_comment_only_does_not_skip_due_job_lifecycle(self, tmp_path: Path) -> None:
+        """Symmetric regression: alex 07-29 22:44, lifecycle path."""
+        (tmp_path / "cron.md").write_text(_cron_md(("critical", "30 9 * * *", "llm")))
+        stub = _StubLifecycleScheduler("test", tmp_path)
+        stub.snapshot("test")
+        stub.animas["test"].memory.read_cron_config.return_value = _cron_md(
+            ("critical", "30 9 * * *", "llm"),
+            ("noise", "0 3 * * *", "command"),
+        )
+        check = _bind_freshness_to_stub(stub)
+
+        time.sleep(0.05)
+        (tmp_path / "cron.md").write_text(_cron_md(
+            ("critical", "30 9 * * *", "llm"),
+            ("noise", "0 3 * * *", "command"),
+        ))
+
+        assert check("test", _job("critical", "30 9 * * *", "llm")) is False, (
+            "REGRESSION (lifecycle): unrelated cron.md edit skipped a due job "
+            "whose (name, schedule, type) identity was preserved."
+        )
