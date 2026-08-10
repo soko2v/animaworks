@@ -471,6 +471,7 @@
   "meeting.start": "Start Meeting",
   "meeting.toggle": "Meeting",
   "meeting.toggle_active": "Meeting",
+  "meeting.recent": "Active meetings",
   "memory.calendar_next": "Next month",
   "memory.calendar_open": "Open episode for {date}",
   "memory.calendar_previous": "Previous month",
