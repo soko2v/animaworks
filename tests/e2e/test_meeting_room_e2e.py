@@ -224,6 +224,24 @@ class TestRoomCRUD:
         assert data["conversation"] == []
 
     @pytest.mark.asyncio
+    async def test_update_room_title(self, tmp_path: Path) -> None:
+        """PATCH /api/rooms/{room_id} persists a normalized title."""
+        app = _create_app(tmp_path, anima_names=["sakura", "rin"])
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post(
+                "/api/rooms",
+                json={"participants": ["sakura", "rin"], "chair": "sakura", "title": "Old"},
+            )
+            room_id = created.json()["room_id"]
+            updated = await client.patch(f"/api/rooms/{room_id}", json={"title": "  New title  "})
+            fetched = await client.get(f"/api/rooms/{room_id}")
+
+        assert updated.status_code == 200
+        assert updated.json()["title"] == "New title"
+        assert fetched.json()["title"] == "New title"
+
+    @pytest.mark.asyncio
     async def test_get_room_not_found(self, tmp_path: Path) -> None:
         """404 for unknown room_id."""
         app = _create_app(tmp_path)

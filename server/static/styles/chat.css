@@ -3465,6 +3465,33 @@
   max-height: 50vh;
 }
 
+.meeting-room-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  font-weight: 600;
+}
+.meeting-room-title > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.meeting-title-edit-btn {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--aw-color-text-secondary, #666);
+  background: transparent;
+  cursor: pointer;
+}
+.meeting-title-edit-btn:hover,
+.meeting-title-edit-btn:focus-visible {
+  color: var(--aw-color-accent);
+  background: var(--aw-color-bg-tertiary, #e9ecef);
+}
+
 .meeting-participant-chip {
   display: inline-flex;
   align-items: center;
