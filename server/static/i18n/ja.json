@@ -470,6 +470,7 @@
   "meeting.start": "ミーティング開始",
   "meeting.toggle": "ミーティング",
   "meeting.toggle_active": "ミーティング",
+  "meeting.recent": "進行中のミーティング",
   "memory.calendar_next": "翌月",
   "memory.calendar_open": "{date}のエピソードを開く",
   "memory.calendar_previous": "前月",

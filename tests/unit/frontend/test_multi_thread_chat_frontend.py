@@ -26,6 +26,9 @@ WORKSPACE_CHAT_STREAMING_JS = PROJECT_ROOT / "server" / "static" / "workspace" /
 SESSION_MANAGER_JS = PROJECT_ROOT / "server" / "static" / "shared" / "chat" / "session-manager.js"
 WORKSPACE_STATE_JS = PROJECT_ROOT / "server" / "static" / "workspace" / "modules" / "state.js"
 CHAT_CSS = PROJECT_ROOT / "server" / "static" / "styles" / "chat.css"
+CHAT_EVENTS_JS = PROJECT_ROOT / "server" / "static" / "pages" / "chat" / "events-controller.js"
+CHAT_THREAD_JS = PROJECT_ROOT / "server" / "static" / "pages" / "chat" / "thread-controller.js"
+MEETING_CONTROLLER_JS = PROJECT_ROOT / "server" / "static" / "pages" / "chat" / "meeting-controller.js"
 WORKSPACE_STYLE = PROJECT_ROOT / "server" / "static" / "workspace" / "style.css"
 
 
@@ -63,6 +66,29 @@ class TestChatJsThreadTabs:
         """threads is initialized as empty object {} in chat context."""
         js = _read(CHAT_CTX_JS)
         assert "threads: {}" in js
+
+    def test_new_thread_button_has_one_binding_owner(self) -> None:
+        """Dynamic thread rendering owns the + button listener exactly once."""
+        events_js = _read(CHAT_EVENTS_JS)
+        thread_js = _read(CHAT_THREAD_JS)
+        assert 'addListener("chatNewThreadBtn"' not in events_js
+        assert thread_js.count('const newBtn = $("chatNewThreadBtn")') == 1
+
+
+@pytest.mark.unit
+class TestMeetingRoomReentry:
+    """Verify active meeting rooms can be listed and reopened."""
+
+    def test_meeting_controller_lists_and_reopens_rooms(self) -> None:
+        js = _read(MEETING_CONTROLLER_JS)
+        assert 'api("/api/rooms")' in js
+        assert "meeting-room-reopen" in js
+        assert "openRoom(btn.dataset.roomId)" in js
+
+    def test_meeting_creation_has_duplicate_submit_guard(self) -> None:
+        js = _read(MEETING_CONTROLLER_JS)
+        assert "state.meetingRoomCreating" in js
+        assert "finally" in js
 
 
 # ── TestChatJsThreadIdInSendChat ─────────────────────────────

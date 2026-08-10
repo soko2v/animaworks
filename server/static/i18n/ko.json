@@ -422,6 +422,7 @@
   "meeting.start": "미팅 시작",
   "meeting.toggle": "미팅",
   "meeting.toggle_active": "미팅",
+  "meeting.recent": "진행 중인 미팅",
   "memory.calendar_next": "다음 달",
   "memory.calendar_open": "{date} 에피소드 열기",
   "memory.calendar_previous": "이전 달",
