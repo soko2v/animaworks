@@ -41,21 +41,26 @@ class SchedulerMixin:
             hb_mt = 0.0
         self._schedule_mtimes[name] = (cron_mt, hb_mt)
 
-    def _check_schedule_freshness(self, name: str) -> bool:
+    def _check_schedule_freshness(
+        self, name: str, fired_job: CronTask | None = None
+    ) -> bool:
         """Check if cron.md or heartbeat.md changed since last setup.
 
-        If either file changed, reload the schedule so subsequent ticks see
-        the latest state.  However, the return value flags "the currently
-        firing cron task is stale and should be skipped".  We only claim
-        staleness when ``cron.md`` itself changed — heartbeat.md updates
-        never invalidate cron tasks, so a heartbeat.md-only edit must not
-        cause the running cron to be dropped.
+        Symmetric with
+        ``core/supervisor/scheduler_manager.py::_check_schedule_freshness``.
+        Staleness is claimed only when the currently firing job's
+        ``(name, schedule, type)`` tuple is no longer present in the
+        reloaded ``cron.md``.
 
-        This is the symmetric fix to the supervisor-side change (see
-        ``core/supervisor/scheduler_manager.py::_check_schedule_freshness``)
-        for the reverse-variant regression documented in
-        ``sofia/knowledge/yutaka-oneshot-cron-misfire-rca-20260721.md``.
+        Invariants:
+          (1) cron.md change + same ``(name, schedule, type)`` present → False (run)
+          (2) job removed or ``name``/``schedule``/``type`` mutated       → True (skip)
+          (3) heartbeat.md-only change                                    → False (run)
+          (4) ``fired_job=None`` (heartbeat call-site, no job context)    → False
+
         Returns False when no change is detected or the anima is unknown.
+        See the supervisor twin's docstring and
+        ``sofia/knowledge/yutaka-oneshot-cron-misfire-rca-20260721.md``.
         """
         anima = self.animas.get(name)
         if not anima:
@@ -91,9 +96,59 @@ class SchedulerMixin:
             hb_mt,
         )
         self.reload_anima_schedule(name)
-        # Only cron.md changes can invalidate the currently firing cron task.
-        # A heartbeat.md-only edit must not cause due cron jobs to be skipped.
-        return cron_changed
+
+        # heartbeat.md-only change cannot invalidate any cron job.
+        if not cron_changed:
+            return False
+
+        # No job context (heartbeat call path): nothing to invalidate.
+        if fired_job is None:
+            return False
+
+        # cron.md changed AND we have the fired job identity.  Re-parse the
+        # (post-reload) cron.md and mark stale ONLY if the fired job's
+        # (name, schedule, type) tuple no longer appears.
+        try:
+            new_config = anima.memory.read_cron_config()
+        except Exception:
+            logger.warning(
+                "Freshness re-parse failed for '%s' -> '%s'; treating as stale",
+                name,
+                fired_job.name,
+                exc_info=True,
+            )
+            return True
+
+        try:
+            new_tasks = _parse_cron_md(new_config) if new_config else []
+        except Exception:
+            logger.warning(
+                "Freshness re-parse of cron.md failed for '%s' -> '%s'; treating as stale",
+                name,
+                fired_job.name,
+                exc_info=True,
+            )
+            return True
+
+        for t in new_tasks:
+            if (
+                t.name == fired_job.name
+                and t.schedule == fired_job.schedule
+                and t.type == fired_job.type
+            ):
+                logger.debug(
+                    "Freshness: fired job '%s' still present after cron.md reload for '%s' — running",
+                    fired_job.name,
+                    name,
+                )
+                return False
+
+        logger.info(
+            "Freshness: fired job '%s' removed or mutated in cron.md for '%s' — skipping",
+            fired_job.name,
+            name,
+        )
+        return True
 
     def _setup_heartbeat(self, anima: DigitalAnima) -> None:
         job_id = f"{anima.name}_heartbeat"
@@ -241,8 +296,11 @@ class SchedulerMixin:
         if not anima:
             return
 
-        # Detect schedule file changes and skip stale tasks
-        if self._check_schedule_freshness(name):
+        # Detect schedule file changes and skip stale tasks.
+        # Pass the fired job so freshness can compare (name, schedule, type)
+        # against the reloaded cron.md and only skip when the job is gone
+        # or has been mutated (see _check_schedule_freshness docstring).
+        if self._check_schedule_freshness(name, task):
             logger.info(
                 "Skipping stale cron '%s' for '%s' (schedule reloaded)",
                 task.name,
