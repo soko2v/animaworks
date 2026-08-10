@@ -414,6 +414,8 @@
   "logs.stream_stop": "스트리밍 중지",
   "meeting.add": "추가",
   "meeting.default_title": "미팅",
+  "meeting.edit_title": "제목 편집",
+  "meeting.edit_title_prompt": "미팅 제목을 입력하세요(100자 이내)",
   "meeting.end": "종료",
   "meeting.no_animas": "사용 가능한 Anima가 없습니다",
   "meeting.placeholder": "미팅에 메시지...",

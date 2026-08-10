@@ -216,9 +216,18 @@ export function createMeetingController(ctx) {
       .join("");
 
     panel.innerHTML = `
+      <div class="meeting-room-title">
+        <span>${escapeHtml(room.title || t("meeting.default_title"))}</span>
+        <button type="button" class="meeting-title-edit-btn" data-chat-id="meetingTitleEditBtn" title="${escapeHtml(t("meeting.edit_title"))}">✎</button>
+      </div>
       ${chipsHtml}
       <button type="button" class="meeting-add-btn" data-chat-id="meetingAddBtn">${t("meeting.add")} +</button>
       <button type="button" class="meeting-end-btn" data-chat-id="meetingEndBtn">${t("meeting.end")}</button>`;
+
+    const titleEditBtn = panel.querySelector('[data-chat-id="meetingTitleEditBtn"]');
+    if (titleEditBtn) {
+      titleEditBtn.addEventListener("click", () => editTitle());
+    }
 
     panel.querySelectorAll(".chip-remove").forEach((btn) => {
       btn.addEventListener("click", (e) => {
@@ -369,6 +378,29 @@ export function createMeetingController(ctx) {
     }
   }
 
+  async function editTitle() {
+    const room = state.meetingRoom;
+    if (!room?.room_id) return;
+    const currentTitle = room.title || t("meeting.default_title");
+    const entered = window.prompt(t("meeting.edit_title_prompt"), currentTitle);
+    if (entered === null) return;
+    const title = entered.trim();
+    if (!title || title === currentTitle || title.length > 100) return;
+
+    try {
+      await api(`/api/rooms/${encodeURIComponent(room.room_id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      await _refetchRoom(room.room_id);
+      await loadRooms();
+      _updateMeetingPanel();
+    } catch (err) {
+      deps.logger?.error?.("Failed to update meeting title", err);
+    }
+  }
+
   async function endMeeting() {
     const room = state.meetingRoom;
     if (!room?.room_id) return;
@@ -399,6 +431,7 @@ export function createMeetingController(ctx) {
     openRoom,
     addParticipant,
     removeParticipant,
+    editTitle,
     endMeeting,
     isActive: () => Boolean(state.meetingMode && state.meetingRoom != null),
     getRoom: () => state.meetingRoom,

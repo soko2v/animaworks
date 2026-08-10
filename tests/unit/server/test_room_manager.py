@@ -122,6 +122,23 @@ class TestListRooms:
         assert rooms[0].closed is True
 
 
+class TestUpdateTitle:
+    """Tests for RoomManager.update_title."""
+
+    def test_update_title_persists(self, room_manager: RoomManager, sample_room: MeetingRoom):
+        room_manager.update_title(sample_room.room_id, "  新しいタイトル  ")
+        assert room_manager.get_room(sample_room.room_id).title == "新しいタイトル"
+        saved = (room_manager._data_dir / f"{sample_room.room_id}.json").read_text(encoding="utf-8")
+        assert '"title": "新しいタイトル"' in saved
+
+    @pytest.mark.parametrize("title", ["", "   ", "x" * 101])
+    def test_update_title_rejects_invalid_title(
+        self, room_manager: RoomManager, sample_room: MeetingRoom, title: str
+    ):
+        with pytest.raises(ValueError):
+            room_manager.update_title(sample_room.room_id, title)
+
+
 class TestAddParticipant:
     """Tests for RoomManager.add_participant."""
 
