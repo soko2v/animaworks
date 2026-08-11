@@ -43,7 +43,11 @@ from pathlib import Path
 
 from core.exceptions import ExecutionError, LLMAPIError, MemoryWriteError  # noqa: F401
 from core.execution import _sdk_session
-from core.execution._claude_auth_lock import claude_execution_lock, trip_claude_oauth_circuit
+from core.execution._claude_auth_lock import (
+    ClaudeOAuthCircuitOpen,
+    claude_execution_lock,
+    trip_claude_oauth_circuit,
+)
 from core.execution._sdk_patch import apply_sdk_transport_patch
 
 apply_sdk_transport_patch()
@@ -675,7 +679,7 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                         if self._active_client is fc:
                             self._active_client = None
             except BaseException as exc:
-                if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                if isinstance(exc, (asyncio.CancelledError, GeneratorExit, ClaudeOAuthCircuitOpen)):
                     raise
                 logger.exception("Agent SDK streaming error (fresh session retry)")
                 raise StreamDisconnectedError(
@@ -751,9 +755,9 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                     logger.warning("SDK resume failed (session_id=%s): %s", session_id_to_resume, e)
                     _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
                     fell_back = True
+                except ClaudeOAuthCircuitOpen:
+                    raise
                 except Exception as e:
-                    if isinstance(e, (asyncio.CancelledError, GeneratorExit)):
-                        raise
                     logger.warning(
                         "SDK resume failed with unexpected error (session_id=%s): %s", session_id_to_resume, e
                     )
@@ -767,7 +771,7 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                     yield ev
             logger.debug("ClaudeSDKClient disconnected")
         except BaseException as e:
-            if isinstance(e, (asyncio.CancelledError, GeneratorExit)):
+            if isinstance(e, (asyncio.CancelledError, GeneratorExit, ClaudeOAuthCircuitOpen)):
                 raise
             logger.exception("Agent SDK streaming error")
             raise StreamDisconnectedError(

@@ -591,6 +591,68 @@ class TestAgentSDKExecutorStreaming:
         assert len(done_events) == 1
         assert done_events[0]["full_text"] == "reply from completed message"
 
+    async def test_streaming_oauth_circuit_open_is_not_wrapped_as_disconnect(
+        self,
+        model_config,
+        anima_dir,
+    ):
+        """An open auth circuit must bypass outer transient stream retries."""
+        from core.execution._claude_auth_lock import ClaudeOAuthCircuitOpen
+        from core.execution.agent_sdk import AgentSDKExecutor
+        from core.prompt.context import ContextTracker
+
+        executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
+        tracker = ContextTracker(model="claude-sonnet-4-6")
+
+        with (
+            patch(
+                "core.execution.agent_sdk.claude_execution_lock",
+                side_effect=ClaudeOAuthCircuitOpen("centralized re-login is required"),
+            ),
+            pytest.raises(ClaudeOAuthCircuitOpen),
+        ):
+            async for _ in executor.execute_streaming(
+                system_prompt="sys",
+                prompt="test",
+                tracker=tracker,
+            ):
+                pass
+
+    async def test_streaming_resume_oauth_circuit_does_not_fallback_to_fresh_session(
+        self,
+        model_config,
+        anima_dir,
+    ):
+        """A resume blocked by the auth circuit must not spawn a fresh client."""
+        from core.execution._claude_auth_lock import ClaudeOAuthCircuitOpen
+        from core.execution._sdk_session import _save_session_id
+        from core.execution.agent_sdk import AgentSDKExecutor
+        from core.prompt.context import ContextTracker
+
+        _save_session_id(anima_dir, "stale-session", "chat")
+        executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
+        tracker = ContextTracker(model="claude-sonnet-4-6")
+
+        with (
+            patch(
+                "core.execution.agent_sdk.claude_execution_lock",
+                side_effect=ClaudeOAuthCircuitOpen("centralized re-login is required"),
+            ),
+            patch("core.execution.agent_sdk._sdk_session._clear_session_id") as clear_session,
+            patch.object(executor, "_build_sdk_options", wraps=executor._build_sdk_options) as build_options,
+            pytest.raises(ClaudeOAuthCircuitOpen),
+        ):
+            async for _ in executor.execute_streaming(
+                system_prompt="sys",
+                prompt="test",
+                tracker=tracker,
+                trigger="chat",
+            ):
+                pass
+
+        assert build_options.call_count == 1
+        clear_session.assert_not_called()
+
     async def test_streaming_does_not_retry_max_auth_failure_without_text_deltas(
         self,
         model_config,
