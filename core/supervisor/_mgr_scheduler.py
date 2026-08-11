@@ -822,6 +822,15 @@ class SchedulerMixin:
                             health.status,
                             health.db_path,
                         )
+                        try:
+                            from core.response_canary import notify_health_anomaly
+
+                            await notify_health_anomaly(
+                                "AnimaWorks RAG health anomaly",
+                                f"anima={anima_name} quick_check={health.status}; supervised repair requested",
+                            )
+                        except Exception:
+                            logger.warning("Failed to notify RAG health anomaly for %s", anima_name, exc_info=True)
                         continue
                     vector_store = get_vector_store(anima_name)
                 if vector_store is None:
