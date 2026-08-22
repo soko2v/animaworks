@@ -1063,6 +1063,29 @@ def test_agent_executor_factory_forwards_worker_codex_home(model_config, anima_d
 
 class TestBlockingExecution:
     @pytest.mark.asyncio
+    async def test_execute_passes_images_as_local_codex_input(self, executor):
+        import base64
+
+        from openai_codex import LocalImageInput, TextInput
+
+        mock_turn = MagicMock(final_response="I can see it", items=[], usage=None)
+        mock_thread = MagicMock(id="thread-image")
+        mock_thread.run = AsyncMock(return_value=mock_turn)
+
+        with patch.object(executor, "_create_codex_client", return_value=_mock_codex(mock_thread)):
+            result = await executor.execute(
+                prompt="Describe this image",
+                images=[{"media_type": "image/png", "data": base64.b64encode(b"png-data").decode()}],
+            )
+
+        run_input = mock_thread.run.call_args.args[0]
+        assert isinstance(run_input[0], TextInput)
+        assert run_input[0].text == "Describe this image"
+        assert isinstance(run_input[1], LocalImageInput)
+        assert not Path(run_input[1].path).exists()
+        assert result.text == "I can see it"
+
+    @pytest.mark.asyncio
     async def test_execute_returns_result(self, executor, anima_dir):
         mock_turn = MagicMock()
         mock_turn.final_response = "Hello from Codex!"
@@ -1280,6 +1303,27 @@ class TestBlockingExecution:
 
 
 class TestStreamingExecution:
+    @pytest.mark.asyncio
+    async def test_stream_passes_images_as_local_codex_input(self, executor):
+        import base64
+
+        from openai_codex import LocalImageInput, TextInput
+
+        mock_thread = _mock_stream_thread("stream-image", [])
+        with patch.object(executor, "_create_codex_client", return_value=_mock_codex(mock_thread)):
+            async for _ in executor.execute_streaming(
+                system_prompt="test",
+                prompt="Describe",
+                tracker=ContextTracker(model="codex/o4-mini"),
+                images=[{"media_type": "image/jpeg", "data": base64.b64encode(b"jpeg-data").decode()}],
+            ):
+                pass
+
+        run_input = mock_thread.turn.call_args.args[0]
+        assert isinstance(run_input[0], TextInput)
+        assert isinstance(run_input[1], LocalImageInput)
+        assert not Path(run_input[1].path).exists()
+
     @pytest.mark.asyncio
     async def test_stream_yields_events(self, executor, anima_dir):
         msg_item = MagicMock(spec=["type", "id", "text"])

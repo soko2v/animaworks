@@ -58,6 +58,14 @@ def fake_openai_codex_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
         def __init__(self, config: _CodexConfig) -> None:
             self.config = config
 
+    class _TextInput:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class _LocalImageInput:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
     class _ReasoningSummary:
         def __init__(self, root: Any) -> None:
             self.root = root
@@ -68,6 +76,8 @@ def fake_openai_codex_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     openai_codex = types.ModuleType("openai_codex")
     openai_codex.AsyncCodex = _AsyncCodex
     openai_codex.CodexConfig = _CodexConfig
+    openai_codex.TextInput = _TextInput
+    openai_codex.LocalImageInput = _LocalImageInput
     openai_codex.ApprovalMode = SimpleNamespace(deny_all=SimpleNamespace(value="deny_all"))
     openai_codex.Sandbox = SimpleNamespace(full_access="full_access", workspace_write="workspace_write")
 
