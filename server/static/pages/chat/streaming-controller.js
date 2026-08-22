@@ -166,6 +166,7 @@ export function createStreamingController(ctx) {
     const input = $("chatPageInput");
     if (!input) return;
     const msg = input.value.trim();
+    if (state.imageInputManager && !state.imageInputManager.prepareForSubmit()) return;
     const hasImages = state.imageInputManager && state.imageInputManager.getImageCount() > 0;
     if (!msg && !hasImages) return;
     const name = state.selectedAnima;
@@ -196,6 +197,7 @@ export function createStreamingController(ctx) {
     const input = $("chatPageInput");
     if (!input) return;
     const msg = input.value.trim();
+    if (state.imageInputManager && !state.imageInputManager.prepareForSubmit()) return;
     const hasImages = state.imageInputManager && state.imageInputManager.getImageCount() > 0;
     const meetingActive = ctx.controllers.meeting?.isActive?.();
     const name = state.selectedAnima;

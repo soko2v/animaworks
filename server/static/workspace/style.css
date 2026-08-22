@@ -2962,11 +2962,24 @@ html, body {
 
 .image-preview-bar {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 8px 0;
   overflow-x: auto;
   flex-shrink: 0;
 }
+
+.image-input-status {
+  flex: 1 1 220px;
+  min-width: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.image-input-status-error { color: #b42318; }
+.image-input-status-info { color: #666; }
+.image-input-status-success { color: #16794b; }
 
 .image-preview-item {
   position: relative;

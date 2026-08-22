@@ -2313,11 +2313,24 @@
 
 .image-preview-bar {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 8px 12px;
   overflow-x: auto;
   flex-shrink: 0;
 }
+
+.image-input-status {
+  flex: 1 1 220px;
+  min-width: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.image-input-status-error { color: var(--aw-color-danger, #b42318); }
+.image-input-status-info { color: var(--aw-color-text-muted); }
+.image-input-status-success { color: var(--aw-color-success, #16794b); }
 
 .image-preview-item {
   position: relative;

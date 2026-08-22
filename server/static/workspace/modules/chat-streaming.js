@@ -97,6 +97,7 @@ function _enqueueInput() {
   const dom = _getDom();
   const text = dom.convInput?.value?.trim();
   const im = _getImageManager();
+  if (im && !im.prepareForSubmit()) return null;
   const hasImages = im && im.getImageCount() > 0;
   if (!text && !hasImages) return null;
 

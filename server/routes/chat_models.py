@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from core.schemas import ImageData
 
 MAX_CHAT_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB decoded per image
 MAX_IMAGE_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB total base64
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}

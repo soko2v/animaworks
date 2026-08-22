@@ -152,6 +152,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "ja": "画像データが大きすぎます（{size_mb}MB / 上限20MB）",
         "en": "Image data too large ({size_mb}MB / max 20MB)",
     },
+    "chat.image_file_too_large": {
+        "ja": "画像が大きすぎます（{size_mb}MB / 1枚あたり上限5MB）",
+        "en": "Image too large ({size_mb}MB / max 5MB per image)",
+    },
+    "chat.invalid_image_data": {
+        "ja": "画像データが破損しているか、申告された形式と一致しません。",
+        "en": "The image data is invalid or does not match its declared format.",
+    },
     "chat.internal_error": {
         "ja": "内部エラーが発生しました。再試行してください。",
         "en": "An internal error occurred. Please retry.",
