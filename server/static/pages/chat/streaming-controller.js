@@ -82,12 +82,15 @@ export function createStreamingController(ctx) {
     const sendBtn = $("chatPageSendBtn");
     const inputVal = $("chatPageInput")?.value?.trim() || "";
     const hasInput = inputVal.length > 0;
+    const hasAttachment = (state.imageInputManager?.getImageCount() || 0) > 0
+      || (state.imageInputManager?.getFileCount() || 0) > 0;
     const meetingActive = ctx.controllers.meeting?.isActive?.();
     const name = state.selectedAnima;
     const tid = state.selectedThreadId;
     const streamCtx = name ? mgr.getStreamingContext(name) : null;
     const isChatStreaming = streamCtx && streamCtx.thread === tid;
     const pendingQueue = name ? mgr.getPendingQueue(name, tid) : [];
+
     const isMeetingStreaming = state.meetingStreaming === true;
 
     if (!sendBtn) return;
@@ -95,11 +98,11 @@ export function createStreamingController(ctx) {
     sendBtn.classList.remove("stop", "interrupt");
     if (meetingActive) {
       setSendButtonIcon(sendBtn, "send");
-      sendBtn.disabled = !hasInput || isMeetingStreaming;
+      sendBtn.disabled = (!hasInput && !hasAttachment) || isMeetingStreaming;
     } else if (!isChatStreaming) {
       setSendButtonIcon(sendBtn, "send");
-      sendBtn.disabled = !name || (!hasInput && pendingQueue.length === 0);
-    } else if (hasInput) {
+      sendBtn.disabled = !name || (!hasInput && !hasAttachment && pendingQueue.length === 0);
+    } else if (hasInput || hasAttachment) {
       setSendButtonIcon(sendBtn, "send");
       sendBtn.disabled = false;
     } else if (pendingQueue.length > 0) {
@@ -120,13 +123,15 @@ export function createStreamingController(ctx) {
     const name = state.selectedAnima;
     const tid = state.selectedThreadId;
     const pendingQueue = name ? mgr.getPendingQueue(name, tid) : [];
+
     if (!bar || !list) return;
     if (pendingQueue.length === 0) { bar.style.display = "none"; return; }
     if (label) label.textContent = `${t("chat.queue_label")} (${pendingQueue.length})`;
     list.innerHTML = pendingQueue.map((p, i) => {
       const txt = escapeHtml(p.text.length > 60 ? p.text.slice(0, 60) + "\u2026" : p.text);
       const img = p.images?.length ? ` <span style="opacity:0.6">(+${p.images.length} images)</span>` : "";
-      return `<div class="pending-queue-item" data-idx="${i}"><span class="pending-queue-item-num">${i + 1}.</span><span class="pending-queue-item-text">${txt || "(images only)"}${img}</span><button class="pending-queue-item-del" data-idx="${i}" type="button">\u2715</button></div>`;
+      const file = p.files?.length ? ` <span style="opacity:0.6">(+${p.files.length} files)</span>` : "";
+      return `<div class="pending-queue-item" data-idx="${i}"><span class="pending-queue-item-num">${i + 1}.</span><span class="pending-queue-item-text">${txt || "(attachments only)"}${img}${file}</span><button class="pending-queue-item-del" data-idx="${i}" type="button">\u2715</button></div>`;
     }).join("");
     bar.style.display = "";
 
@@ -168,13 +173,16 @@ export function createStreamingController(ctx) {
     const msg = input.value.trim();
     if (state.imageInputManager && !state.imageInputManager.prepareForSubmit()) return;
     const hasImages = state.imageInputManager && state.imageInputManager.getImageCount() > 0;
-    if (!msg && !hasImages) return;
+    const hasFiles = state.imageInputManager && state.imageInputManager.getFileCount() > 0;
+    if (!msg && !hasImages && !hasFiles) return;
     const name = state.selectedAnima;
     const tid = state.selectedThreadId;
     mgr.enqueue(name, tid, {
       text: msg,
       images: state.imageInputManager?.getPendingImages() || [],
       displayImages: state.imageInputManager?.getDisplayImages() || [],
+      files: state.imageInputManager?.getPendingFiles() || [],
+      displayFiles: state.imageInputManager?.getDisplayFiles() || [],
     });
     input.value = "";
     input.style.height = "auto";
@@ -199,6 +207,7 @@ export function createStreamingController(ctx) {
     const msg = input.value.trim();
     if (state.imageInputManager && !state.imageInputManager.prepareForSubmit()) return;
     const hasImages = state.imageInputManager && state.imageInputManager.getImageCount() > 0;
+    const hasFiles = state.imageInputManager && state.imageInputManager.getFileCount() > 0;
     const meetingActive = ctx.controllers.meeting?.isActive?.();
     const name = state.selectedAnima;
     const tid = state.selectedThreadId;
@@ -206,7 +215,12 @@ export function createStreamingController(ctx) {
     const isChatStreaming = streamCtx && streamCtx.thread === tid;
     const pendingQueue = name ? mgr.getPendingQueue(name, tid) : [];
 
-    if (meetingActive && (msg || hasImages)) {
+    if (meetingActive && hasFiles) {
+      state.imageInputManager?.showError(t("chat.file_meeting_unsupported"));
+      return;
+    }
+
+    if (meetingActive && (msg || hasImages || hasFiles)) {
       sendMeetingChat(msg, {
         images: state.imageInputManager?.getPendingImages() || [],
         displayImages: state.imageInputManager?.getDisplayImages() || [],
@@ -218,11 +232,13 @@ export function createStreamingController(ctx) {
     }
 
     if (!isChatStreaming) {
-      if (msg || hasImages) {
+      if (msg || hasImages || hasFiles) {
         mgr.enqueue(name, tid, {
           text: msg,
           images: state.imageInputManager?.getPendingImages() || [],
           displayImages: state.imageInputManager?.getDisplayImages() || [],
+      files: state.imageInputManager?.getPendingFiles() || [],
+      displayFiles: state.imageInputManager?.getDisplayFiles() || [],
         });
         input.value = "";
         input.style.height = "auto";
@@ -233,15 +249,17 @@ export function createStreamingController(ctx) {
       const next = mgr.dequeue(name, tid);
       showPendingIndicator();
       if (mgr.getPendingQueue(name, tid).length === 0) hidePendingIndicator();
-      sendChat(next.text, { images: next.images, displayImages: next.displayImages });
+      sendChat(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles });
       return;
     }
 
-    if (msg || hasImages) {
+    if (msg || hasImages || hasFiles) {
       mgr.enqueue(name, tid, {
         text: msg,
         images: state.imageInputManager?.getPendingImages() || [],
         displayImages: state.imageInputManager?.getDisplayImages() || [],
+      files: state.imageInputManager?.getPendingFiles() || [],
+      displayFiles: state.imageInputManager?.getDisplayFiles() || [],
       });
       input.value = "";
       input.style.height = "auto";
@@ -265,8 +283,10 @@ export function createStreamingController(ctx) {
     const name = overrideImages?.targetAnima || state.selectedAnima;
     const images = overrideImages?.images || state.imageInputManager?.getPendingImages() || [];
     const displayImages = overrideImages?.displayImages || state.imageInputManager?.getDisplayImages() || [];
+    const files = overrideImages?.files || state.imageInputManager?.getPendingFiles() || [];
+    const displayFiles = overrideImages?.displayFiles || state.imageInputManager?.getDisplayFiles() || [];
     const tid = overrideImages?.targetThread || state.selectedThreadId;
-    if (!name || (!message.trim() && images.length === 0)) return;
+    if (!name || (!message.trim() && images.length === 0 && files.length === 0)) return;
     if (mgr.isStreamingFor(name, tid)) {
       logger.warn("Blocked: this thread is already streaming", { anima: name, thread: tid });
       return;
@@ -376,6 +396,8 @@ export function createStreamingController(ctx) {
     const { success, error } = await mgr.sendChat(name, tid, message, {
       images,
       displayImages,
+      files,
+      displayFiles,
       callbacks: {
         onStreamCreated: msg => {
           streamingMsg = msg;
@@ -589,7 +611,7 @@ export function createStreamingController(ctx) {
             const next = mgr.dequeue(name, tid);
             showPendingIndicator();
             if (mgr.getPendingQueue(name, tid).length === 0) hidePendingIndicator();
-            setTimeout(() => sendChat(next.text, { images: next.images, displayImages: next.displayImages, targetAnima: name, targetThread: tid }), 150);
+            setTimeout(() => sendChat(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles, targetAnima: name, targetThread: tid }), 150);
           }
         }
       },
@@ -907,7 +929,7 @@ export function createStreamingController(ctx) {
             const next = mgr.dequeue(animaName, tid);
             showPendingIndicator();
             if (mgr.getPendingQueue(animaName, tid).length === 0) hidePendingIndicator();
-            setTimeout(() => sendChat(next.text, { images: next.images, displayImages: next.displayImages, targetAnima: animaName, targetThread: tid }), 150);
+            setTimeout(() => sendChat(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles, targetAnima: animaName, targetThread: tid }), 150);
           }
         }
       },

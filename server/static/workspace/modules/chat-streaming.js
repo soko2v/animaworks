@@ -99,12 +99,13 @@ function _enqueueInput() {
   const im = _getImageManager();
   if (im && !im.prepareForSubmit()) return null;
   const hasImages = im && im.getImageCount() > 0;
-  if (!text && !hasImages) return null;
+  const hasFiles = im && im.getFileCount() > 0;
+  if (!text && !hasImages && !hasFiles) return null;
 
   const { anima, thread } = _animaThread();
   if (!anima) return null;
 
-  const entry = { text: text || "", images: im?.getPendingImages() || [], displayImages: im?.getDisplayImages() || [] };
+  const entry = { text: text || "", images: im?.getPendingImages() || [], displayImages: im?.getDisplayImages() || [], files: im?.getPendingFiles() || [], displayFiles: im?.getDisplayFiles() || [] };
   _mgr().enqueue(anima, thread, entry);
   if (dom.convInput) { dom.convInput.value = ""; dom.convInput.style.height = "auto"; }
   wsSaveDraft(); im?.clearImages();
@@ -153,7 +154,7 @@ export function submitConversation() {
     const next = mgr.dequeue(anima, thread);
     wsShowPendingIndicator();
     if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
-    _sendConversation(next.text, { images: next.images, displayImages: next.displayImages });
+    _sendConversation(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles });
     return;
   }
   if (_enqueueInput()) { wsShowPendingIndicator(); wsUpdateSendButton(true); return; }
@@ -171,7 +172,9 @@ async function _sendConversation(text, overrideImages = null) {
   const im = _getImageManager();
   const images = overrideImages?.images || im?.getPendingImages() || [];
   const displayImages = overrideImages?.displayImages || im?.getDisplayImages() || [];
-  if (!text && images.length === 0) return;
+  const files = overrideImages?.files || im?.getPendingFiles() || [];
+  const displayFiles = overrideImages?.displayFiles || im?.getDisplayFiles() || [];
+  if (!text && images.length === 0 && files.length === 0) return;
   const { anima, thread } = _animaThread();
   if (!anima) return;
 
@@ -199,6 +202,8 @@ async function _sendConversation(text, overrideImages = null) {
   const { success, error } = await mgr.sendChat(anima, thread, text, {
     images,
     displayImages,
+    files,
+    displayFiles,
     callbacks: {
       onStreamCreated: (msg) => {
         streamingMsg = msg;
@@ -453,11 +458,13 @@ export function wsUpdateSendButton(isStreaming) {
   const mgr = _mgr();
   const q = anima ? mgr.getPendingQueue(anima, thread) : [];
   const hasInput = (dom.convInput?.value?.trim() || "").length > 0;
-  if (dom.convQueueBtn) dom.convQueueBtn.disabled = !hasInput;
+  const im = _getImageManager();
+  const hasAttachment = (im?.getImageCount() || 0) > 0 || (im?.getFileCount() || 0) > 0;
+  if (dom.convQueueBtn) dom.convQueueBtn.disabled = !hasInput && !hasAttachment;
   if (!dom.convSend) return;
   dom.convSend.classList.remove("stop", "interrupt");
-  if (!isStreaming) { dom.convSend.innerHTML = _ICONS.send; dom.convSend.disabled = !hasInput && q.length === 0; }
-  else if (hasInput) { dom.convSend.innerHTML = _ICONS.send; dom.convSend.disabled = false; }
+  if (!isStreaming) { dom.convSend.innerHTML = _ICONS.send; dom.convSend.disabled = !hasInput && !hasAttachment && q.length === 0; }
+  else if (hasInput || hasAttachment) { dom.convSend.innerHTML = _ICONS.send; dom.convSend.disabled = false; }
   else if (q.length > 0) { dom.convSend.innerHTML = _ICONS.interrupt; dom.convSend.classList.add("interrupt"); dom.convSend.disabled = false; }
   else { dom.convSend.innerHTML = _ICONS.stop; dom.convSend.classList.add("stop"); dom.convSend.disabled = false; }
 }

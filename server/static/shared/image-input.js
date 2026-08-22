@@ -4,11 +4,19 @@
 
 import { t } from "/shared/i18n.js";
 import { basePath } from "/shared/base-path.js";
+import { createLogger } from "/shared/logger.js";
+
+const logger = createLogger("image-input");
 
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB per image
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per document
 const MAX_DIMENSION = 1568; // Max pixel dimension (Anthropic recommendation)
 const SUPPORTED_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const HEIC_TYPES = new Set(["image/heic", "image/heif"]);
+const DOCUMENT_TYPES = new Map([
+  ["pdf", "application/pdf"],
+  ["csv", "text/csv"],
+]);
 const TYPE_BY_EXTENSION = new Map([
   ["jpg", "image/jpeg"], ["jpeg", "image/jpeg"], ["png", "image/png"],
   ["gif", "image/gif"], ["webp", "image/webp"], ["heic", "image/heic"],
@@ -34,6 +42,7 @@ function resolvedFileType(file) {
  */
 export function createImageInput({ container, inputArea, previewContainer, onImagesChanged }) {
   const pendingImages = []; // Array of { data: base64String, media_type: string, dataUrl: string }
+  const pendingFiles = []; // Array of { data: base64String, media_type: string, name: string }
   let processingCount = 0;
   let status = null;
   let rejectedSinceLastSubmit = false;
@@ -42,6 +51,10 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     status = message ? { kind, message } : null;
     if (kind === "error") rejectedSinceLastSubmit = true;
     renderPreviews();
+  }
+
+  function renderedPreviewCount() {
+    return previewContainer?.querySelectorAll?.(".image-preview-item")?.length || 0;
   }
 
   // ── File Processing Pipeline ──────────────────────
@@ -102,6 +115,12 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
           dataUrl, // Keep for preview display
         });
 
+        logger.info("[IMAGE-SEND] image ready", {
+          image_count: pendingImages.length,
+          media_type: outputType,
+          base64_chars: base64Data.length,
+        });
+
         rejectedSinceLastSubmit = false;
         status = { kind: "success", message: t("chat.image_ready", { count: pendingImages.length }) };
         onImagesChanged?.();
@@ -123,8 +142,44 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
 
   function processImageFiles(files) {
     for (const file of files) {
-      processImageFile(file);
+      const extension = (file?.name || "").split(".").pop()?.toLowerCase();
+      if (DOCUMENT_TYPES.has(extension)) processDocumentFile(file, extension);
+      else processImageFile(file);
     }
+  }
+
+  function processDocumentFile(file, extension) {
+    if (file.size > MAX_FILE_SIZE) {
+      setStatus("error", t("chat.file_too_large_client", {
+        size: (file.size / 1024 / 1024).toFixed(1),
+      }));
+      return;
+    }
+    const mediaType = DOCUMENT_TYPES.get(extension);
+    processingCount += 1;
+    setStatus("info", t("chat.file_processing"));
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const result = String(reader.result || "");
+        const base64Data = result.split(",")[1];
+        if (!base64Data) throw new Error(t("chat.file_read_failed"));
+        pendingFiles.push({ data: base64Data, media_type: mediaType, name: file.name });
+        rejectedSinceLastSubmit = false;
+        status = { kind: "success", message: t("chat.file_ready", { count: pendingFiles.length }) };
+        onImagesChanged?.();
+      } catch (error) {
+        status = { kind: "error", message: error?.message || t("chat.file_read_failed") };
+      } finally {
+        processingCount -= 1;
+        renderPreviews();
+      }
+    };
+    reader.onerror = () => {
+      processingCount -= 1;
+      setStatus("error", t("chat.file_read_failed"));
+    };
+    reader.readAsDataURL(file);
   }
 
   // ── Preview Rendering ─────────────────────────────
@@ -132,7 +187,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
   function renderPreviews() {
     if (!previewContainer) return;
 
-    if (pendingImages.length === 0 && !status && processingCount === 0) {
+    if (pendingImages.length === 0 && pendingFiles.length === 0 && !status && processingCount === 0) {
       previewContainer.style.display = "none";
       previewContainer.innerHTML = "";
       return;
@@ -145,10 +200,17 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         <button class="image-preview-remove" data-index="${i}" title="${t("assets.delete")}">&times;</button>
       </div>
     `).join("");
+    const filePreviews = pendingFiles.map((file, i) => `
+      <div class="file-preview-item">
+        <span class="file-preview-icon" aria-hidden="true">${file.media_type === "application/pdf" ? "PDF" : "CSV"}</span>
+        <span class="file-preview-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
+        <button class="file-preview-remove" data-index="${i}" title="${t("assets.delete")}">&times;</button>
+      </div>
+    `).join("");
     const statusHtml = status
       ? `<div class="image-input-status image-input-status-${status.kind}" role="${status.kind === "error" ? "alert" : "status"}">${status.message}</div>`
       : "";
-    previewContainer.innerHTML = previews + statusHtml;
+    previewContainer.innerHTML = previews + filePreviews + statusHtml;
 
     // Bind remove buttons
     previewContainer.querySelectorAll(".image-preview-remove").forEach((btn) => {
@@ -157,6 +219,15 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         e.stopPropagation();
         const idx = parseInt(btn.dataset.index, 10);
         pendingImages.splice(idx, 1);
+        renderPreviews();
+        onImagesChanged?.();
+      });
+    });
+    previewContainer.querySelectorAll(".file-preview-remove").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        pendingFiles.splice(parseInt(btn.dataset.index, 10), 1);
         renderPreviews();
         onImagesChanged?.();
       });
@@ -203,7 +274,13 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
   return {
     /** Get pending images for sending (without dataUrl preview field). */
     getPendingImages() {
-      return pendingImages.map(({ data, media_type }) => ({ data, media_type }));
+      const images = pendingImages.map(({ data, media_type }) => ({ data, media_type }));
+      logger.info("[IMAGE-SEND] manager snapshot", {
+        image_count: images.length,
+        rendered_preview_count: renderedPreviewCount(),
+        processing_count: processingCount,
+      });
+      return images;
     },
 
     /** Get pending images with dataUrl for display in chat history. */
@@ -211,9 +288,18 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       return pendingImages.map(({ data, media_type, dataUrl }) => ({ data, media_type, dataUrl }));
     },
 
+    getPendingFiles() {
+      return pendingFiles.map(({ data, media_type, name }) => ({ data, media_type, name }));
+    },
+
+    getDisplayFiles() {
+      return pendingFiles.map(({ media_type, name }) => ({ media_type, name }));
+    },
+
     /** Clear all pending images. */
     clearImages() {
       pendingImages.length = 0;
+      pendingFiles.length = 0;
       status = null;
       rejectedSinceLastSubmit = false;
       renderPreviews();
@@ -224,6 +310,14 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       return pendingImages.length;
     },
 
+    getFileCount() {
+      return pendingFiles.length;
+    },
+
+    showError(message) {
+      setStatus("error", message);
+    },
+
     /** True while selected files are still being decoded or converted. */
     isProcessing() {
       return processingCount > 0;
@@ -231,12 +325,23 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
 
     /** Block sending while processing, or once after every selected image was rejected. */
     prepareForSubmit() {
+      logger.info("[IMAGE-SEND] prepare submit", {
+        image_count: pendingImages.length,
+        rendered_preview_count: renderedPreviewCount(),
+        processing_count: processingCount,
+      });
       if (processingCount > 0) {
         setStatus("info", t("chat.image_wait_for_processing"));
         return false;
       }
-      if (rejectedSinceLastSubmit && pendingImages.length === 0) {
+      if (rejectedSinceLastSubmit && pendingImages.length === 0 && pendingFiles.length === 0) {
         rejectedSinceLastSubmit = false;
+        setStatus("error", t("chat.image_send_without_attachment"));
+        return false;
+      }
+      // Never allow a visible thumbnail to degrade silently into a text-only
+      // message. This also catches stale/duplicate manager wiring in the UI.
+      if (renderedPreviewCount() > pendingImages.length) {
         setStatus("error", t("chat.image_send_without_attachment"));
         return false;
       }
@@ -248,6 +353,12 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       processImageFiles(files);
     },
   };
+}
+
+function escapeHtml(value) {
+  const div = document.createElement("div");
+  div.textContent = value || "";
+  return div.innerHTML;
 }
 
 // ── Lightbox ────────────────────────────────────────

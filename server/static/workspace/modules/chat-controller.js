@@ -216,6 +216,7 @@ export function initChatController(dom) {
       container: convMain,
       inputArea: dom.convInput,
       previewContainer: dom.convPreviewBar,
+      onImagesChanged: () => wsUpdateSendButton(isConvStreaming()),
     });
   }
 

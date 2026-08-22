@@ -99,7 +99,7 @@ function paneHtml() {
             disabled
           ></textarea>
           <div class="chat-input-actions">
-            <button type="button" class="chat-attach-btn" data-chat-id="chatPageAttachBtn" title="${t("chat.attach_image")}">+</button>
+            <button type="button" class="chat-attach-btn" data-chat-id="chatPageAttachBtn" title="${t("chat.attach_file")}">+</button>
             <div class="context-ring-wrap" data-chat-id="chatContextRing" title="">
               <svg class="context-ring" viewBox="0 0 36 36" aria-hidden="true">
                 <circle class="context-ring-bg" cx="18" cy="18" r="15.5" fill="none" stroke-width="3"/>
@@ -116,7 +116,7 @@ function paneHtml() {
             </button>
           </div>
         </div>
-        <input type="file" data-chat-id="chatPageFileInput" accept="image/jpeg,image/png,image/gif,image/webp,image/heic,image/heif,.heic,.heif" multiple style="display:none" />
+        <input type="file" data-chat-id="chatPageFileInput" accept="image/jpeg,image/png,image/gif,image/webp,image/heic,image/heif,.heic,.heif,application/pdf,text/csv,.pdf,.csv" multiple style="display:none" />
       </form>
     </div>
   `;
