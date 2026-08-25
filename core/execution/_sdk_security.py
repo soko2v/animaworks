@@ -166,6 +166,35 @@ def _check_a1_bash_command(
 
     This is a best-effort heuristic — not a complete sandbox.
     """
+    # A raw Claude CLI would create a second OAuth-credential user outside
+    # the fleet-wide execution gateway.  Keep this guard above the superuser
+    # bypass: credential serialization is an integrity invariant, not a file
+    # permission restriction.  The supported path is machine(engine=claude),
+    # which acquires the same cross-process lock as Mode S.
+    for segment in [s.strip() for s in re.split(r"[;\n]|\|(?!\|)|\&\&|\|\|", command) if s.strip()]:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        is_gateway = (
+            bool(tokens)
+            and Path(tokens[0]).name == "animaworks-tool"
+            and len(tokens) >= 3
+            and tokens[1:3] == ["machine", "run"]
+        )
+        if is_gateway:
+            continue
+        if any(Path(token).name == "claude" for token in tokens):
+            return "Direct Claude CLI is disabled; use the centralized machine/claude gateway"
+        if any(
+            Path(tokens[index]).name in {"bash", "sh", "zsh"}
+            and index + 2 < len(tokens)
+            and tokens[index + 1] == "-c"
+            and re.search(r"(?:^|[;&|\s])(?:\S*/)?claude(?:\s|$)", tokens[index + 2])
+            for index in range(len(tokens))
+        ):
+            return "Direct Claude CLI is disabled; use the centralized machine/claude gateway"
+
     if superuser:
         return None
 

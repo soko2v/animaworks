@@ -231,14 +231,42 @@ class TestStopServer:
         mock_orphans.assert_called_once()
 
     @patch("cli.commands.server._kill_orphan_runners", return_value=0)
+    @patch("cli.commands.server._find_server_pid_by_process", return_value=None)
     @patch("cli.commands.server._remove_pid_file")
     @patch("cli.commands.server.terminate_pid")
+    @patch("cli.commands.server._is_server_process", return_value=False)
+    @patch("cli.commands.server._is_process_alive", return_value=True)
+    @patch("cli.commands.server._read_pid", return_value=869)
+    def test_live_reused_pid_is_not_signalled(
+        self,
+        mock_pid,
+        mock_alive,
+        mock_server_process,
+        mock_terminate,
+        mock_remove,
+        mock_find,
+        mock_orphans,
+        capsys,
+    ):
+        """A live PID reused by another application is stale, not a kill target."""
+        from cli.commands.server import _stop_server
+
+        assert _stop_server() is True
+        mock_terminate.assert_not_called()
+        mock_remove.assert_called_once()
+        assert "non-server process" in capsys.readouterr().out
+
+    @patch("cli.commands.server._kill_orphan_runners", return_value=0)
+    @patch("cli.commands.server._remove_pid_file")
+    @patch("cli.commands.server.terminate_pid")
+    @patch("cli.commands.server._is_server_process", return_value=True)
     @patch("cli.commands.server._is_process_alive", side_effect=[True, False])
     @patch("cli.commands.server._read_pid", return_value=12345)
     def test_successful_stop(
         self,
         mock_pid,
         mock_alive,
+        mock_server_process,
         mock_terminate,
         mock_remove,
         mock_orphans,
@@ -314,12 +342,14 @@ class TestStopServer:
     @patch("cli.commands.server.terminate_pid")
     @patch("time.sleep")
     @patch("time.monotonic")
+    @patch("cli.commands.server._is_server_process", return_value=True)
     @patch("cli.commands.server._is_process_alive")
     @patch("cli.commands.server._read_pid", return_value=12345)
     def test_force_sigkill_after_timeout(
         self,
         mock_pid,
         mock_alive,
+        mock_server_process,
         mock_monotonic,
         mock_sleep,
         mock_terminate,
@@ -618,12 +648,14 @@ class TestCmdRestart:
     @patch("cli.commands.server._clear_pycache", return_value=0)
     @patch("cli.commands.server._stop_server", return_value=True)
     @patch("cli.commands.server._spawn_restart_helper", return_value=99999)
+    @patch("cli.commands.server._is_server_process", return_value=True)
     @patch("cli.commands.server._is_process_alive", return_value=True)
     @patch("cli.commands.server._read_pid", return_value=12345)
     def test_restart_spawns_helper_then_stops(
         self,
         mock_pid,
         mock_alive,
+        mock_server_process,
         mock_helper,
         mock_stop,
         mock_clear,

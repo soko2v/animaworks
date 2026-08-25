@@ -526,6 +526,20 @@ def _get_tool_handler() -> Any:
         # ── BackgroundTaskManager ──
         bg_manager = _build_background_manager(anima_dir)
 
+        # Register the running event loop so background submits initiated from
+        # a worker thread (asyncio.to_thread -> handler.handle -> bg.submit)
+        # can schedule coroutines via run_coroutine_threadsafe. Falls back
+        # silently when the handler is initialised outside an async context;
+        # main() re-registers eagerly as a safety net.
+        if bg_manager is not None:
+            try:
+                bg_manager.set_event_loop(asyncio.get_running_loop())
+            except RuntimeError:
+                logger.debug(
+                    "BackgroundTaskManager loop registration deferred "
+                    "(no running loop at handler init)"
+                )
+
         _tool_handler = ToolHandler(
             anima_dir=anima_dir,
             memory=memory,
@@ -845,6 +859,20 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
 async def main() -> None:
     """Run the MCP stdio server."""
     logger.info("AnimaWorks MCP server starting (name=aw)")
+
+    # Eagerly initialise the ToolHandler so its BackgroundTaskManager can
+    # capture the running event loop up-front. This guarantees that
+    # subsequent worker-thread submits (from asyncio.to_thread) can schedule
+    # coroutines via run_coroutine_threadsafe.
+    handler = _get_tool_handler()
+    if handler is not None and getattr(handler, "_background_manager", None) is not None:
+        try:
+            handler._background_manager.set_event_loop(asyncio.get_running_loop())
+        except RuntimeError:
+            logger.warning(
+                "Failed to register event loop with BackgroundTaskManager in main()"
+            )
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,

@@ -25,6 +25,7 @@ from core.tools.machine import (
     _build_command,
     _build_env,
     _build_instruction,
+    _execute,
     _get_available_engines,
     _validate_working_directory,
     dispatch,
@@ -193,6 +194,26 @@ class TestExecutionProfile:
 
 
 class TestBuildEnv:
+    def test_claude_central_profile_overrides_external_api_key(self, tmp_path):
+        credential = SimpleNamespace(
+            type="api_key",
+            api_key="invalid-external-key",
+            keys={"claude_home": str(tmp_path / "claude-profile")},
+        )
+        config = SimpleNamespace(
+            machine=SimpleNamespace(engine_priority=[], default_models={}),
+            credentials={"anthropic": credential},
+            workspaces={},
+        )
+        with (
+            patch("core.config.models.load_config", return_value=config),
+            patch.dict(os.environ, {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "inherited"}, clear=True),
+        ):
+            env = _build_env("claude")
+
+        assert "ANTHROPIC_API_KEY" not in env
+        assert env["CLAUDE_HOME"] == str(tmp_path / "claude-profile")
+
     def test_allows_path(self):
         with patch.dict(os.environ, {"PATH": "/usr/bin", "HOME": "/home/test"}, clear=True):
             env = _build_env("claude")
@@ -677,6 +698,63 @@ class TestDispatch:
                 assert "Implementation complete" in result["output"]
                 assert result["engine"] == "claude"
 
+    def test_claude_execution_uses_central_profile_and_trips_revoked_circuit(self, tmp_path):
+        from core.execution._claude_auth_lock import claude_circuit_path
+
+        wd = tmp_path / "workspace"
+        wd.mkdir()
+        anima_dir = tmp_path / "anima"
+        anima_dir.mkdir()
+        profile = tmp_path / "claude-profile"
+        env = {"PATH": "/usr/bin", "CLAUDE_HOME": str(profile)}
+        mock_proc = MagicMock()
+        _set_pipe_output(mock_proc, "API Error: 401 OAuth access token has been revoked.\n")
+        mock_proc.stdin = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.pid = 99999
+        mock_proc.wait = MagicMock(return_value=None)
+        with (
+            patch("core.tools.machine.shutil.which", return_value="/usr/bin/claude"),
+            patch("core.tools.machine._build_env", return_value=env),
+            patch("core.tools.machine.subprocess.Popen", return_value=mock_proc) as popen,
+        ):
+            result = json.loads(
+                dispatch(
+                    "machine_run",
+                    {
+                        "engine": "claude",
+                        "instruction": "canary",
+                        "working_directory": str(wd),
+                        "anima_dir": str(anima_dir),
+                    },
+                )
+            )
+
+        assert result["success"] is False
+        assert popen.call_args.kwargs["env"]["CLAUDE_HOME"] == str(profile)
+        assert claude_circuit_path(profile).exists()
+
+    def test_claude_exception_after_spawn_terminates_before_unlock(self, tmp_path):
+        wd = tmp_path / "workspace"
+        wd.mkdir()
+        profile = tmp_path / "claude-profile"
+        env = {"PATH": "/usr/bin", "CLAUDE_HOME": str(profile)}
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.wait.return_value = 0
+        with (
+            patch("core.tools.machine.shutil.which", return_value="/usr/bin/claude"),
+            patch("core.tools.machine._build_env", return_value=env),
+            patch("core.tools.machine.subprocess.Popen", return_value=mock_proc),
+            patch("core.tools.machine._stream_to_file", side_effect=OSError("output failed")),
+            patch("core.tools.machine.terminate_subprocess") as terminate,
+        ):
+            result = _execute("claude", "canary", str(wd))
+
+        assert result.success is False
+        terminate.assert_called_once_with(mock_proc, force=True)
+
     def test_execution_with_nonzero_exit(self, tmp_path):
         wd = tmp_path / "workspace"
         wd.mkdir()
@@ -961,6 +1039,10 @@ class TestCliMain:
         assert "machine tool" in captured.out.lower() or "usage" in captured.out.lower()
 
     def test_run_success_text_output(self, tmp_path, capsys):
+        # engine=claude を明示: default engine (cursor-agent) では shallow-
+        # completion heuristic (2026-07-27 追加) が短い mock 出力を空振り扱い
+        # し success=False にするため、engine 非依存な CLI success 検証には
+        # cursor-agent 以外を指定する必要がある。
         from core.tools.machine import cli_main
 
         with patch("core.tools.machine.shutil.which", return_value="/usr/bin/claude"):
@@ -971,11 +1053,12 @@ class TestCliMain:
             mock_proc.pid = 99999
             mock_proc.wait = MagicMock(return_value=None)
             with patch("core.tools.machine.subprocess.Popen", return_value=mock_proc):
-                cli_main(["run", "test instruction", "-d", str(tmp_path)])
+                cli_main(["run", "--engine", "claude", "test instruction", "-d", str(tmp_path)])
                 captured = capsys.readouterr()
                 assert "Hello from CLI" in captured.out
 
     def test_run_success_json_output(self, tmp_path, capsys):
+        # engine=claude を明示（理由は test_run_success_text_output と同じ）。
         from core.tools.machine import cli_main
 
         with patch("core.tools.machine.shutil.which", return_value="/usr/bin/claude"):
@@ -986,7 +1069,7 @@ class TestCliMain:
             mock_proc.pid = 99999
             mock_proc.wait = MagicMock(return_value=None)
             with patch("core.tools.machine.subprocess.Popen", return_value=mock_proc):
-                cli_main(["run", "test", "-d", str(tmp_path), "-j"])
+                cli_main(["run", "--engine", "claude", "test", "-d", str(tmp_path), "-j"])
                 captured = capsys.readouterr()
                 data = json.loads(captured.out)
                 assert data["success"] is True
@@ -1028,6 +1111,62 @@ class TestCliMain:
             cli_main(["run", "--help"])
         captured = capsys.readouterr()
         assert "--background" in captured.out
+
+    def test_run_cursor_agent_shallow_completion_rejected(self, tmp_path, capsys):
+        """cursor-agent shallow-completion heuristic 回帰 (2026-07-27):
+
+        cursor-agent は exit==0 を返しつつ実質的な仕事をしていない
+        「空振り成功」ケースが実測されているため、elapsed<3s または
+        output<500B を空振りと判定して success=False にする。
+        """
+        from core.tools.machine import cli_main
+
+        with patch("core.tools.machine.shutil.which", return_value="/usr/bin/cursor-agent"):
+            mock_proc = MagicMock()
+            _set_pipe_output(mock_proc, "quick\n")  # 6B, well below 500B
+            mock_proc.stdin = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.pid = 99999
+            mock_proc.wait = MagicMock(return_value=None)
+            with patch("core.tools.machine.subprocess.Popen", return_value=mock_proc):
+                cli_main(["run", "--engine", "cursor-agent", "test", "-d", str(tmp_path), "-j"])
+                captured = capsys.readouterr()
+                data = json.loads(captured.out)
+                assert data["success"] is False
+                assert "cursor-agent" in data.get("error", "")
+                # heuristic 由来の error 文言を厳密チェック
+                assert "空振り" in data.get("error", "") or "shallow" in data.get("reason", "")
+
+    def test_run_cursor_agent_sufficient_output_success(self, tmp_path, capsys):
+        """cursor-agent でも十分な elapsed (>=3s) と出力量 (>=500B) が
+        あれば success=True。heuristic が正常出力を誤検知しないことを保証。
+        """
+        from core.tools.machine import cli_main
+
+        long_output = "x" * 600 + "\n"  # 601B, above 500B
+        # _stream_to_file 内は start / end の 2 回 time.monotonic() を呼ぶ。
+        # 尽きたら 1005.0 を返し続けて他所からの呼出でも耐える。
+        monotonic_seq = iter([1000.0] + [1005.0] * 100)
+
+        with patch("core.tools.machine.shutil.which", return_value="/usr/bin/cursor-agent"):
+            mock_proc = MagicMock()
+            _set_pipe_output(mock_proc, long_output)
+            mock_proc.stdin = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.pid = 99999
+            mock_proc.wait = MagicMock(return_value=None)
+            with (
+                patch("core.tools.machine.subprocess.Popen", return_value=mock_proc),
+                patch(
+                    "core.tools.machine.time.monotonic",
+                    side_effect=lambda: next(monotonic_seq, 1005.0),
+                ),
+            ):
+                cli_main(["run", "--engine", "cursor-agent", "test", "-d", str(tmp_path), "-j"])
+                captured = capsys.readouterr()
+                data = json.loads(captured.out)
+                assert data["success"] is True
+                assert "x" * 100 in data["output"]
 
 
 # ── Auto-Discovery Test ───────────────────────────────────

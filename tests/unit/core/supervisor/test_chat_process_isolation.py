@@ -95,6 +95,38 @@ async def test_closing_isolated_stream_cancels_producer_and_releases_lock(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_phase3_stream_emits_root_keepalive_while_child_has_no_events(tmp_path: Path) -> None:
+    release = asyncio.Event()
+
+    class _SilentStreamSupervisor:
+        async def run_chat_stream(self, payload: dict):
+            await release.wait()
+            yield {"done": True, "result": {"response": "recovered"}}
+
+    anima = MagicMock(needs_bootstrap=False)
+    handler = StreamingIPCHandler(
+        anima,
+        "sakura",
+        tmp_path,
+        task_runner_supervisor=_SilentStreamSupervisor(),
+        chat_isolated=True,
+    )
+    request = IPCRequest(id="req-keepalive", method="process_message", params={"message": "hello", "stream": True})
+
+    with patch("core.config.load_config") as config:
+        config.return_value.server.keepalive_interval = 0.01
+        stream = handler.handle_stream(request)
+        first = await anext(stream)
+        release.set()
+        second = await anext(stream)
+        await stream.aclose()
+
+    assert json.loads(first.chunk or "{}")["type"] == "keepalive"
+    assert second.done is True
+    assert second.result == {"response": "recovered"}
+
+
+@pytest.mark.asyncio
 async def test_chat_child_sigkill_becomes_stream_error_and_root_stays_usable(tmp_path: Path) -> None:
     anima = MagicMock(needs_bootstrap=False)
     handler = StreamingIPCHandler(

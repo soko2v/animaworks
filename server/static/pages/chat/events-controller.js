@@ -80,9 +80,6 @@ export function createEventsController(ctx) {
     document.addEventListener("pointerdown", closeMenu);
     state.boundListeners.push({ el: document, event: "pointerdown", handler: closeMenu });
 
-    // New thread
-    addListener("chatNewThreadBtn", "click", () => ctx.controllers.thread.createNewThread());
-
     // Chat form submit
     addListener("chatPageForm", "submit", e => { e.preventDefault(); ctx.controllers.streaming.submitChat(); });
 

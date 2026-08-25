@@ -12,6 +12,8 @@ export function createMeetingController(ctx) {
     state.meetingRoom = null;
     state.meetingParticipants = [];
     state.meetingChair = null;
+    state.meetingRooms = [];
+    state.meetingRoomCreating = false;
     _bindEvents();
   }
 
@@ -22,7 +24,7 @@ export function createMeetingController(ctx) {
     }
   }
 
-  function toggleMeetingMode() {
+  async function toggleMeetingMode() {
     state.meetingMode = !state.meetingMode;
     if (!state.meetingMode) {
       state.meetingRoom = null;
@@ -32,6 +34,9 @@ export function createMeetingController(ctx) {
     _updateMeetingPanel();
     _updateAnimaTabsVisibility();
     ctx.controllers.renderer?.renderChat();
+    if (state.meetingMode && !state.meetingRoom) {
+      await loadRooms();
+    }
   }
 
   function _updateToggleUI() {
@@ -85,6 +90,15 @@ export function createMeetingController(ctx) {
     );
     const selected = new Set(state.meetingParticipants);
     const chair = state.meetingChair || null;
+    const rooms = Array.isArray(state.meetingRooms) ? state.meetingRooms : [];
+
+    const roomListHtml = rooms.map((room) => {
+      const participants = (room.participants || []).map((p) => typeof p === "string" ? p : p.name || p);
+      return `<button type="button" class="meeting-start-btn meeting-room-reopen" data-room-id="${escapeHtml(room.room_id)}">`
+        + `<span>${escapeHtml(room.title || t("meeting.default_title"))}</span>`
+        + `<span>${escapeHtml(participants.join(", "))}</span>`
+        + `</button>`;
+    }).join("");
 
     let animaListHtml = "";
     for (const a of animas) {
@@ -112,6 +126,7 @@ export function createMeetingController(ctx) {
 
     panel.innerHTML = `
       <div class="meeting-setup">
+        ${roomListHtml ? `<div class="meeting-setup-label">${t("meeting.recent")}</div><div class="meeting-setup-actions meeting-room-list">${roomListHtml}</div>` : ""}
         <div class="meeting-setup-label">${t("meeting.select_participants")}</div>
         <div class="meeting-setup-anima-list">${animaListHtml || t("meeting.no_animas")}</div>
         <div class="meeting-setup-actions">
@@ -138,6 +153,10 @@ export function createMeetingController(ctx) {
         state.meetingParticipants = [...selected];
         _updateMeetingPanel();
       });
+    });
+
+    panel.querySelectorAll(".meeting-room-reopen").forEach((btn) => {
+      btn.addEventListener("click", () => openRoom(btn.dataset.roomId));
     });
 
     panel.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
@@ -197,9 +216,18 @@ export function createMeetingController(ctx) {
       .join("");
 
     panel.innerHTML = `
+      <div class="meeting-room-title">
+        <span>${escapeHtml(room.title || t("meeting.default_title"))}</span>
+        <button type="button" class="meeting-title-edit-btn" data-chat-id="meetingTitleEditBtn" title="${escapeHtml(t("meeting.edit_title"))}">✎</button>
+      </div>
       ${chipsHtml}
       <button type="button" class="meeting-add-btn" data-chat-id="meetingAddBtn">${t("meeting.add")} +</button>
       <button type="button" class="meeting-end-btn" data-chat-id="meetingEndBtn">${t("meeting.end")}</button>`;
+
+    const titleEditBtn = panel.querySelector('[data-chat-id="meetingTitleEditBtn"]');
+    if (titleEditBtn) {
+      titleEditBtn.addEventListener("click", () => editTitle());
+    }
 
     panel.querySelectorAll(".chip-remove").forEach((btn) => {
       btn.addEventListener("click", (e) => {
@@ -261,8 +289,9 @@ export function createMeetingController(ctx) {
   async function createRoom() {
     const participants = [...state.meetingParticipants];
     const chair = state.meetingChair;
-    if (participants.length < 2 || !chair) return;
+    if (participants.length < 2 || !chair || state.meetingRoomCreating) return;
 
+    state.meetingRoomCreating = true;
     try {
       const res = await api("/api/rooms", {
         method: "POST",
@@ -281,7 +310,30 @@ export function createMeetingController(ctx) {
       ctx.controllers.renderer?.renderChat();
     } catch (err) {
       deps.logger?.error?.("Failed to create meeting room", err);
+    } finally {
+      state.meetingRoomCreating = false;
     }
+  }
+
+  async function loadRooms() {
+    try {
+      const rooms = await api("/api/rooms");
+      state.meetingRooms = Array.isArray(rooms) ? rooms : [];
+      _updateMeetingPanel();
+    } catch (err) {
+      deps.logger?.error?.("Failed to load meeting rooms", err);
+    }
+  }
+
+  async function openRoom(roomId) {
+    if (!roomId) return;
+    await _refetchRoom(roomId);
+    if (!state.meetingRoom) return;
+    _updateMeetingPanel();
+    const input = $("chatPageInput");
+    if (input) input.placeholder = t("meeting.placeholder");
+    ctx.controllers.streaming?.updateSendButton?.();
+    ctx.controllers.renderer?.renderChat();
   }
 
   async function _refetchRoom(roomId) {
@@ -326,6 +378,29 @@ export function createMeetingController(ctx) {
     }
   }
 
+  async function editTitle() {
+    const room = state.meetingRoom;
+    if (!room?.room_id) return;
+    const currentTitle = room.title || t("meeting.default_title");
+    const entered = window.prompt(t("meeting.edit_title_prompt"), currentTitle);
+    if (entered === null) return;
+    const title = entered.trim();
+    if (!title || title === currentTitle || title.length > 100) return;
+
+    try {
+      await api(`/api/rooms/${encodeURIComponent(room.room_id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      await _refetchRoom(room.room_id);
+      await loadRooms();
+      _updateMeetingPanel();
+    } catch (err) {
+      deps.logger?.error?.("Failed to update meeting title", err);
+    }
+  }
+
   async function endMeeting() {
     const room = state.meetingRoom;
     if (!room?.room_id) return;
@@ -352,8 +427,11 @@ export function createMeetingController(ctx) {
     init,
     toggleMeetingMode,
     createRoom,
+    loadRooms,
+    openRoom,
     addParticipant,
     removeParticipant,
+    editTitle,
     endMeeting,
     isActive: () => Boolean(state.meetingMode && state.meetingRoom != null),
     getRoom: () => state.meetingRoom,
