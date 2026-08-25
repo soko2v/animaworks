@@ -806,7 +806,11 @@ class TaskRunnerSupervisor:
                 await connection.send_event("interrupt", {"thread_id": job.interrupt_thread_id})
 
             while True:
-                envelope = await asyncio.wait_for(connection.receive(), timeout=15.0)
+                # Do not impose an idle frame timeout here. Some executors can block
+                # the child event loop during a model call, which also pauses its
+                # progress sender. Process exit and the separate hang watcher own
+                # liveness detection; timing out this read closes healthy jobs.
+                envelope = await connection.receive()
                 if envelope.kind == "request":
                     await self._handle_memory_request(connection, envelope)
                     continue

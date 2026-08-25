@@ -34,6 +34,7 @@ from core.exceptions import AnimaNotRunningError, ExecutionError, MemoryWriteErr
 from core.i18n import t
 from core.memory.streaming_journal import StreamingJournal
 from core.platform.locks import acquire_file_lock, release_file_lock
+from core.schemas import CronTask
 from core.supervisor.inbox_rate_limiter import InboxRateLimiter
 from core.supervisor.ipc import IPCRequest, IPCResponse, IPCServer
 from core.supervisor.pending_executor import PendingTaskExecutor
@@ -960,11 +961,17 @@ class AnimaRunner:
         if not task_name:
             raise ValueError("task_name is required")
 
-        await self.anima.run_cron_task(
-            task_name,
-            str(task_description),
-            skills=task_skills if isinstance(task_skills, list) else None,
-        )
+        # Manual cron requests must use the same scheduler path as timed jobs
+        # so process isolation and cron_stats accounting are preserved.
+        task_data: dict[str, Any] = {
+            "name": str(task_name),
+            "schedule": "0 0 1 1 *",
+            "type": "llm",
+            "description": str(task_description),
+        }
+        if isinstance(task_skills, list):
+            task_data["skills"] = task_skills
+        await self._scheduler_mgr._run_cron_task(CronTask.model_validate(task_data))
 
         return {"status": "completed"}
 

@@ -277,6 +277,23 @@ class ProcessSupervisor(HealthMixin, RAGRepairMixin, ReconcileMixin, SchedulerMi
                     pid_file.unlink(missing_ok=True)
                     continue
 
+                try:
+                    _cmdline = " ".join(proc.cmdline())
+                    _same_user = proc.username() == _psutil.Process().username()
+                except _psutil.Error:
+                    pid_file.unlink(missing_ok=True)
+                    continue
+                if not _same_user or "animaworks" not in _cmdline.lower():
+                    logger.warning(
+                        "Stale pidfile for %s: pid=%d is an unrelated process "
+                        "(%s); refusing to kill",
+                        anima_name,
+                        pid,
+                        _cmdline[:120],
+                    )
+                    pid_file.unlink(missing_ok=True)
+                    continue
+
                 logger.warning(
                     "Killing zombie runner: %s (pid=%d)",
                     anima_name,

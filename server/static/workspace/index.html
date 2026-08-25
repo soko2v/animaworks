@@ -119,7 +119,7 @@
               <div class="chat-input-wrap">
                 <textarea class="ws-conv-input" id="wsConvInput" data-i18n-placeholder="ws.message_placeholder" placeholder="Type a message... (Ctrl+Enter, Alt+Enter to queue)" rows="1"></textarea>
                 <div class="chat-input-actions">
-                  <button class="chat-attach-btn" type="button" id="wsConvAttachBtn" data-i18n-title="ws.attach_image" title="Attach image">+</button>
+                  <button class="chat-attach-btn" type="button" id="wsConvAttachBtn" data-i18n-title="chat.attach_file" title="Attach file">+</button>
                   <button class="chat-queue-btn" type="button" id="wsConvQueueBtn" data-i18n-title="chat.queue_add" title="Add to queue (Alt+Enter)">
                     <svg class="chat-queue-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                       <path d="M12 5v14M5 12l7 7 7-7" />
@@ -133,7 +133,7 @@
                   </button>
                 </div>
               </div>
-              <input type="file" id="wsConvFileInput" accept="image/jpeg,image/png,image/gif,image/webp" multiple style="display:none" />
+              <input type="file" id="wsConvFileInput" accept="image/jpeg,image/png,image/gif,image/webp,image/heic,image/heif,.heic,.heif,application/pdf,text/csv,.pdf,.csv" multiple style="display:none" />
             </div>
           </main>
 
