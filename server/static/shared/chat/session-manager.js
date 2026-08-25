@@ -4,6 +4,9 @@
 
 import { createHistoryState, applyHistoryData, mergePolledHistory } from "./history-loader.js";
 import { basePath } from "/shared/base-path.js";
+import { createLogger } from "/shared/logger.js";
+
+const logger = createLogger("chat-session");
 
 // ── ChatSession ──────────────────────
 
@@ -252,18 +255,21 @@ export class ChatSessionManager extends EventTarget {
    * @returns {Promise<{ streamingMsg, success, queued, error }>}
    */
   async sendChat(anima, thread, text, options = {}) {
-    const { images = [], displayImages = [], callbacks = {}, onFinally, model } = options;
+    const {
+      images = [], displayImages = [], files = [], displayFiles = [],
+      callbacks = {}, onFinally, model,
+    } = options;
 
     const session = this.getSession(anima, thread);
     if (session.isStreaming) {
-      this.enqueue(anima, thread, { text, images, displayImages });
+      this.enqueue(anima, thread, { text, images, displayImages, files, displayFiles });
       return { streamingMsg: null, success: false, queued: true };
     }
     const streamId = session.nextStreamId();
     const sendTs = new Date().toISOString();
     const user = this.#config.getUser();
 
-    session.messages.push({ role: "user", text, images: displayImages, timestamp: sendTs });
+    session.messages.push({ role: "user", text, images: displayImages, files: displayFiles, timestamp: sendTs });
 
     const streamingMsg = {
       role: "assistant", text: "", streaming: true, activeTool: null,
@@ -286,6 +292,14 @@ export class ChatSessionManager extends EventTarget {
       const bodyObj = { message: text || "", from_person: user, thread_id: thread };
       if (images.length > 0) bodyObj.images = images;
       if (model) bodyObj.model = model;
+      if (files.length > 0) bodyObj.files = files;
+
+      // Metadata-only diagnostics: never log image contents or base64 data.
+      const imageBytes = images.reduce((total, image) => total + (image?.data?.length || 0), 0);
+      logger.info("[IMAGE-SEND] payload", {
+        anima, thread, image_count: images.length, base64_chars: imageBytes,
+        media_types: images.map(image => image?.media_type || "unknown"),
+      });
 
       await this.#config.streamChat(
         anima, JSON.stringify(bodyObj), session._abortController.signal, callbacks,

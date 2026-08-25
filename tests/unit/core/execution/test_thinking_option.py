@@ -141,11 +141,24 @@ class TestLiteLLMThinkingOption:
     def test_openai_model_thinking_true_sets_extra_body(
         self, anima_dir, tool_handler, memory,
     ):
-        """openai/* model + thinking=True → extra_body.enable_thinking=True."""
-        cfg = ModelConfig(model="openai/gpt-4o", thinking=True, api_key="k")
+        """openai/* custom endpoint + thinking=True → extra_body.enable_thinking=True."""
+        cfg = ModelConfig(
+            model="openai/gpt-4o", thinking=True, api_key="k",
+            api_base_url="http://localhost:8000/v1",
+        )
         ex = _make_litellm_executor(cfg, anima_dir, tool_handler, memory)
         kwargs = ex._build_llm_kwargs()
         assert kwargs["extra_body"]["enable_thinking"] is True
+        assert "think" not in kwargs
+
+    def test_openai_model_without_base_url_omits_extra_body(
+        self, anima_dir, tool_handler, memory,
+    ):
+        """Real OpenAI API rejects unknown parameters (HTTP 400): no extra_body without api_base_url."""
+        cfg = ModelConfig(model="openai/gpt-4o", thinking=True, api_key="k")
+        ex = _make_litellm_executor(cfg, anima_dir, tool_handler, memory)
+        kwargs = ex._build_llm_kwargs()
+        assert "extra_body" not in kwargs
         assert "think" not in kwargs
 
     def test_non_ollama_model_thinking_false_sets_think(
@@ -216,14 +229,30 @@ class TestAssistedThinkingOption:
     async def test_openai_model_thinking_true_sets_extra_body(
         self, anima_dir, tool_handler, memory,
     ):
-        """openai/* model + thinking=True → extra_body.enable_thinking=True passed to litellm."""
-        cfg = ModelConfig(model="openai/gpt-4o", thinking=True, api_key="k", max_tokens=512)
+        """openai/* custom endpoint + thinking=True → extra_body.enable_thinking=True passed to litellm."""
+        cfg = ModelConfig(
+            model="openai/gpt-4o", thinking=True, api_key="k", max_tokens=512,
+            api_base_url="http://localhost:8000/v1",
+        )
         ex = _make_assisted_executor(cfg, anima_dir, tool_handler, memory)
         mock_acompletion = AsyncMock(return_value=MagicMock())
         with patch("litellm.acompletion", mock_acompletion):
             await ex._call_llm([{"role": "user", "content": "hi"}])
         _, kwargs = mock_acompletion.call_args
         assert kwargs["extra_body"]["enable_thinking"] is True
+        assert "think" not in kwargs
+
+    async def test_openai_model_without_base_url_omits_extra_body(
+        self, anima_dir, tool_handler, memory,
+    ):
+        """Real OpenAI API rejects unknown parameters (HTTP 400): no extra_body without api_base_url."""
+        cfg = ModelConfig(model="openai/gpt-4o", thinking=True, api_key="k", max_tokens=512)
+        ex = _make_assisted_executor(cfg, anima_dir, tool_handler, memory)
+        mock_acompletion = AsyncMock(return_value=MagicMock())
+        with patch("litellm.acompletion", mock_acompletion):
+            await ex._call_llm([{"role": "user", "content": "hi"}])
+        _, kwargs = mock_acompletion.call_args
+        assert "extra_body" not in kwargs
         assert "think" not in kwargs
 
     async def test_non_ollama_model_thinking_false_sets_think(

@@ -158,7 +158,10 @@ class ContextMixin:
             elif model.startswith("openai/"):
                 if self._thinking_format() == "deepseek":
                     self._apply_deepseek_thinking(kwargs, self._model_config.thinking)
-                else:
+                # vLLM / OpenAI-compatible servers accept these hints; the real
+                # OpenAI API rejects unknown parameters with HTTP 400. Only send
+                # them to non-DeepSeek models when a custom endpoint is configured.
+                elif self._model_config.api_base_url:
                     kwargs.setdefault("extra_body", {})
                     kwargs["extra_body"]["enable_thinking"] = self._model_config.thinking
                     kwargs["extra_body"].setdefault("chat_template_kwargs", {})
@@ -169,7 +172,7 @@ class ContextMixin:
             if self._thinking_format() == "deepseek":
                 # DeepSeek-format models default to thinking on (effort high).
                 self._apply_deepseek_thinking(kwargs, True)
-            else:
+            elif self._model_config.api_base_url:
                 kwargs.setdefault("extra_body", {})
                 kwargs["extra_body"]["enable_thinking"] = True
                 kwargs["extra_body"].setdefault("chat_template_kwargs", {})

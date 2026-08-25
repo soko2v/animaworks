@@ -491,6 +491,7 @@ class TestLiteLLMAdaptiveThinking:
             model="openai/qwen3.5-9b",
             thinking=True,
             api_key="k",
+            api_base_url="http://localhost:8000/v1",
         )
         ex = LiteLLMExecutor(
             model_config=cfg,
@@ -512,6 +513,7 @@ class TestLiteLLMAdaptiveThinking:
             model="openai/qwen3.5-9b",
             thinking=False,
             api_key="k",
+            api_base_url="http://localhost:8000/v1",
         )
         ex = LiteLLMExecutor(
             model_config=cfg,
@@ -530,6 +532,7 @@ class TestLiteLLMAdaptiveThinking:
         cfg = ModelConfig(
             model="openai/qwen3.5-9b",
             api_key="k",
+            api_base_url="http://localhost:8000/v1",
         )
         ex = LiteLLMExecutor(
             model_config=cfg,
@@ -541,6 +544,25 @@ class TestLiteLLMAdaptiveThinking:
         kwargs = ex._build_llm_kwargs()
         assert kwargs["extra_body"]["enable_thinking"] is True
         assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_openai_without_base_url_omits_extra_body(self, anima_dir, tool_handler, memory):
+        """Real OpenAI API rejects unknown parameters (HTTP 400): no extra_body without api_base_url."""
+        from core.execution.litellm_loop import LiteLLMExecutor
+
+        cfg = ModelConfig(
+            model="openai/gpt-4o",
+            api_key="k",
+        )
+        ex = LiteLLMExecutor(
+            model_config=cfg,
+            anima_dir=anima_dir,
+            tool_handler=tool_handler,
+            tool_registry=[],
+            memory=memory,
+        )
+        kwargs = ex._build_llm_kwargs()
+        assert "extra_body" not in kwargs
+        assert "think" not in kwargs
 
     def test_bedrock_glm_gets_enable_thinking_true(self, anima_dir, tool_handler, memory):
         from core.execution.litellm_loop import LiteLLMExecutor
@@ -591,6 +613,7 @@ class TestLiteLLMAdaptiveThinking:
             model="openai/gpt-4o",
             thinking=True,
             api_key="k",
+            api_base_url="http://localhost:8000/v1",
         )
         ex = LiteLLMExecutor(
             model_config=cfg,

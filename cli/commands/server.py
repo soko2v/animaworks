@@ -395,6 +395,14 @@ def _spawn_daemon(args: argparse.Namespace) -> None:
     from core.paths import get_data_dir
 
     existing_pid = _read_pid()
+    if existing_pid is not None and not _is_server_process(existing_pid):
+        logger.warning(
+            "Discarding stale PID file: pid=%d is not an AnimaWorks server "
+            "(PID reuse after reboot)",
+            existing_pid,
+        )
+        _remove_pid_file()
+        existing_pid = None
     if existing_pid is not None and _is_process_alive(existing_pid):
         print(f"Error: Server is already running (pid={existing_pid}).")
         print("Use 'animaworks stop' first, or 'animaworks restart'.")
@@ -737,6 +745,14 @@ def _start_foreground(args: argparse.Namespace) -> None:
     raise_fd_soft_limit(logger=logger, process_label="server")
 
     existing_pid = _read_pid()
+    if existing_pid is not None and not _is_server_process(existing_pid):
+        logger.warning(
+            "Discarding stale PID file: pid=%d is not an AnimaWorks server "
+            "(PID reuse after reboot)",
+            existing_pid,
+        )
+        _remove_pid_file()
+        existing_pid = None
     if existing_pid is not None and _is_process_alive(existing_pid):
         print(f"Error: Server is already running (pid={existing_pid}).")
         print("Use 'animaworks stop' first, or 'animaworks restart'.")
