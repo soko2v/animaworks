@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from core.supervisor.ipc_v2 import IPCV2ConnectionState, IPCV2Identity
 from core.supervisor.pending_executor import PendingTaskExecutor
 from core.supervisor.task_runner_supervisor import (
     TaskRunnerError,
+    TaskRunnerInterruptedError,
     TaskRunnerJob,
     TaskRunnerSupervisor,
 )
@@ -197,6 +199,161 @@ async def test_child_crash_records_failed_retryable_and_root_continues(tmp_path:
     assert "INTERRUPTED" in summary
     # The original TaskRunnerError must survive into the summary (no flattening).
     assert "exit=-9" in summary
+
+
+@pytest.mark.asyncio
+async def test_sigterm_child_requeues_after_dead_lease_and_replacement_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, anima, anima_dir = _executor(tmp_path, task_isolated=True)
+    type(anima)._acquire_background_worker = None  # type: ignore[attr-defined]
+    pending = anima_dir / "state" / "pending"
+    processing = pending / "processing"
+    failed = pending / "failed"
+    processing.mkdir(parents=True)
+    failed.mkdir()
+    task_desc = {
+        "task_id": "t-sigterm",
+        "title": "sigterm recovery",
+        "description": "write a safe fixture result",
+        "task_type": "llm",
+    }
+    processing_path = processing / "t-sigterm.json"
+    processing_path.write_text(json.dumps(task_desc), encoding="utf-8")
+
+    from core.memory.task_queue import TaskQueueManager
+
+    queue = TaskQueueManager(anima_dir)
+    queue.add_task(
+        source="anima",
+        original_instruction="write a safe fixture result",
+        assignee="sakura",
+        summary="sigterm recovery",
+        status="in_progress",
+        task_id="t-sigterm",
+    )
+    child_pids: list[int] = []
+    original_run_task = executor._task_runner_supervisor.run_task
+    monkeypatch.setenv("ANIMAWORKS_EMBED_URL", "http://127.0.0.1:9")
+
+    async def _run_task(task, *, attempt=1, display_lane="background", on_spawned=None):
+        if not child_pids:
+            async def _term_after_spawn(job):
+                if on_spawned is not None:
+                    await on_spawned(job)
+                child_pids.append(job.pid)
+                os.kill(job.pid, signal.SIGTERM)
+
+            return await original_run_task(
+                task,
+                attempt=attempt,
+                display_lane=display_lane,
+                on_spawned=_term_after_spawn,
+            )
+        fixture = anima_dir / "state" / "task_results" / "t-sigterm.fixture"
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('replacement reached fixture\\n')",
+            str(fixture),
+            start_new_session=True,
+        )
+        child_pids.append(process.pid)
+        assert await asyncio.wait_for(process.wait(), timeout=2) == 0
+        return {"task_type": "llm", "result": "replacement completed", "success": True}
+
+    executor._task_runner_supervisor.run_task = AsyncMock(side_effect=_run_task)
+    lease_live_checks = 0
+
+    def _lease_is_live(*args, **kwargs):
+        nonlocal lease_live_checks
+        lease_live_checks += 1
+        return lease_live_checks == 1
+
+    monkeypatch.setattr(
+        "core.supervisor.pending_executor.is_processing_lease_live",
+        _lease_is_live,
+    )
+    with patch(
+        "core.supervisor.pending_executor._completion_declaration_required",
+        return_value=True,
+    ):
+        await executor._execute_claimed_llm_task(task_desc, processing_path, failed, None)
+        assert processing_path.exists()
+        assert not (pending / "t-sigterm.json").exists()
+        assert lease_live_checks == 1
+        executor._recover_blocked_and_orphaned_tasks()
+
+    requeued_path = pending / "t-sigterm.json"
+    requeued = json.loads(requeued_path.read_text(encoding="utf-8"))
+    assert lease_live_checks == 2
+    assert requeued["continuation_count"] == 1
+    assert queue.get_task_by_id("t-sigterm").status == "in_progress"
+    assert not list(failed.glob("*.json"))
+
+    replacement_path = processing / requeued_path.name
+    requeued_path.rename(replacement_path)
+    claimed = executor._claim_processing_task(replacement_path, failed, requeued)
+    assert claimed == "t-sigterm"
+    await executor._execute_claimed_llm_task(requeued, replacement_path, failed, None)
+
+    assert len(child_pids) == 2
+    assert child_pids[0] != child_pids[1]
+    assert not replacement_path.exists()
+    assert (anima_dir / "state" / "task_results" / "t-sigterm.fixture").read_text(
+        encoding="utf-8"
+    ) == "replacement reached fixture\n"
+    assert queue.get_task_by_id("t-sigterm").status == "done"
+    anima.messenger.send.assert_not_called()
+    await executor._task_runner_supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_sigterm_child_with_live_or_unknown_lease_is_not_requeued(tmp_path: Path) -> None:
+    executor, anima, anima_dir = _executor(tmp_path, task_isolated=True)
+    type(anima)._acquire_background_worker = None  # type: ignore[attr-defined]
+    pending = anima_dir / "state" / "pending"
+    processing = pending / "processing"
+    failed = pending / "failed"
+    processing.mkdir(parents=True)
+    failed.mkdir()
+    task_desc = {
+        "task_id": "t-live-sigterm",
+        "title": "live lease",
+        "description": "must not duplicate",
+        "task_type": "llm",
+    }
+    processing_path = processing / "t-live-sigterm.json"
+    processing_path.write_text(json.dumps(task_desc), encoding="utf-8")
+    write_processing_lease(
+        processing_path,
+        anima="sakura",
+        task_id="t-live-sigterm",
+        pid=os.getpid(),
+        job_id="job-live",
+        task_pid=os.getpid(),
+        pgid=os.getpid(),
+        root_epoch="epoch-live",
+        attempt=1,
+        process_start_time=1.0,
+    )
+    executor._task_runner_supervisor.run_task = AsyncMock(
+        side_effect=TaskRunnerInterruptedError(-signal.SIGTERM)
+    )
+
+    with (
+        patch("core.supervisor.pending_executor._completion_declaration_required", return_value=True),
+        patch("core.supervisor.pending_executor.is_processing_lease_live", return_value=True),
+    ):
+        await executor._execute_claimed_llm_task(task_desc, processing_path, failed, None)
+
+    assert processing_path.exists()
+    assert read_processing_lease(processing_path) is not None
+    assert not (pending / "t-live-sigterm.json").exists()
+    assert not list(failed.glob("*.json"))
+    executor._task_runner_supervisor.run_task.assert_awaited_once()
 
 
 @pytest.mark.asyncio

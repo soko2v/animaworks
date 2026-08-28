@@ -599,6 +599,65 @@ class TestExecuteLLMTaskFailureHandling:
         assert queue.get_task_by_id("shutdown").status == "in_progress"
         executor._anima.messenger.send.assert_not_called()
 
+    def test_periodic_recovery_keeps_live_lease_then_requeues_when_dead(self, tmp_path: Path) -> None:
+        executor = _make_executor(tmp_path)
+        task_desc = {
+            "task_type": "llm",
+            "task_id": "periodic-recovery",
+            "title": "Periodic recovery",
+            "context": "original",
+        }
+        pending = executor._anima_dir / "state" / "pending"
+        processing = pending / "processing"
+        processing.mkdir(parents=True)
+        processing_path = processing / "periodic-recovery.json"
+        processing_path.write_text(json.dumps(task_desc), encoding="utf-8")
+        write_processing_lease(
+            processing_path,
+            anima="test-anima",
+            task_id="periodic-recovery",
+        )
+
+        from core.memory.task_queue import TaskQueueManager
+
+        queue = TaskQueueManager(executor._anima_dir)
+        queue.add_task(
+            source="anima",
+            original_instruction="work",
+            assignee="test-anima",
+            summary="work",
+            status="in_progress",
+            task_id="periodic-recovery",
+        )
+
+        with (
+            patch(
+                "core.supervisor.pending_executor._completion_declaration_required",
+                return_value=True,
+            ),
+            patch("core.supervisor.pending_executor.is_processing_lease_live", return_value=True),
+            patch("core.blocked_recovery.revalidate_blocked_tasks"),
+        ):
+            executor._recover_blocked_and_orphaned_tasks()
+
+        assert processing_path.exists()
+        assert not (pending / "periodic-recovery.json").exists()
+
+        with (
+            patch(
+                "core.supervisor.pending_executor._completion_declaration_required",
+                return_value=True,
+            ),
+            patch("core.supervisor.pending_executor.is_processing_lease_live", return_value=False),
+            patch("core.blocked_recovery.revalidate_blocked_tasks"),
+        ):
+            executor._recover_blocked_and_orphaned_tasks()
+
+        recovered = json.loads((pending / "periodic-recovery.json").read_text(encoding="utf-8"))
+        assert recovered["continuation_count"] == 1
+        assert not processing_path.exists()
+        assert queue.get_task_by_id("periodic-recovery").status == "in_progress"
+
     def test_recovery_at_continuation_limit_notifies_reply_to(self, tmp_path: Path) -> None:
         executor = _make_executor(tmp_path)
         task_desc = {

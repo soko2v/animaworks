@@ -50,6 +50,14 @@ class TaskRunnerError(RuntimeError):
     """A task runner could not complete its execution contract."""
 
 
+class TaskRunnerInterruptedError(TaskRunnerError):
+    """A task runner was terminated before it returned a result."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+        super().__init__(f"task runner exited before returning a result (exit={returncode})")
+
+
 @dataclass
 class TaskRunnerJob:
     """Root registry entry created before a task runner is spawned."""
@@ -557,8 +565,11 @@ class TaskRunnerSupervisor:
                 try:
                     await asyncio.wait_for(asyncio.shield(job.result), timeout=0.25)
                 except TimeoutError as exc:
+                    returncode = process.returncode or 0
+                    if returncode == -signal.SIGTERM:
+                        raise TaskRunnerInterruptedError(returncode) from exc
                     raise TaskRunnerError(
-                        f"task runner exited before returning a result (exit={process.returncode})"
+                        f"task runner exited before returning a result (exit={returncode})"
                     ) from exc
             terminal = await job.result
             slow_exit = False
@@ -991,4 +1002,9 @@ class TaskRunnerSupervisor:
             return
 
 
-__all__ = ["TaskRunnerError", "TaskRunnerJob", "TaskRunnerSupervisor"]
+__all__ = [
+    "TaskRunnerError",
+    "TaskRunnerInterruptedError",
+    "TaskRunnerJob",
+    "TaskRunnerSupervisor",
+]

@@ -46,6 +46,10 @@ class TaskExecError(RuntimeError):
     """Raised when a TaskExec LLM session encounters a non-recoverable error."""
 
 
+class TaskRunnerInterrupted(RuntimeError):
+    """Raised after an isolated TaskRunner exits without returning a result."""
+
+
 _PENDING_WATCHER_POLL_INTERVAL = 3.0
 _LLM_TASK_TTL_HOURS = 24
 _PENDING_TASK_SUBPROCESS_TIMEOUT = 1800
@@ -800,6 +804,12 @@ class PendingTaskExecutor:
 
         pending_dir = self._anima_dir / "state" / "pending"
         processing_dir = pending_dir / "processing"
+        self._recover_processing(
+            processing_dir,
+            pending_dir / "failed",
+            self._anima_dir,
+            self._fail_task_terminal,
+        )
         queue = TaskQueueManager(self._anima_dir)
         try:
             # in_progress is included because update_task(in_progress) can be
@@ -1326,6 +1336,7 @@ class PendingTaskExecutor:
             self._touch_processing_descriptor(processing_path),
             name=f"task-touch-{self._anima_name}-{task_id}",
         )
+        preserve_processing_lease = False
         try:
             exec_kwargs: dict[str, Any] = {"worker_slot": worker_slot}
             if self._task_isolated and self._task_runner_supervisor is not None:
@@ -1362,6 +1373,28 @@ class PendingTaskExecutor:
                     task_id,
                 )
                 return
+            if isinstance(exc, TaskRunnerInterrupted):
+                self._recover_processing(
+                    processing_path.parent,
+                    failed_dir,
+                    self._anima_dir,
+                    self._fail_task_terminal,
+                )
+                if processing_path.exists():
+                    preserve_processing_lease = True
+                    logger.warning(
+                        "[%s] Interrupted TaskRunner lease is still live or unknown; "
+                        "left task %s in processing/",
+                        self._anima_name,
+                        task_id,
+                    )
+                else:
+                    logger.warning(
+                        "[%s] Re-enqueued task %s after interrupted TaskRunner lease became dead",
+                        self._anima_name,
+                        task_id,
+                    )
+                return
             logger.exception("Error processing LLM pending task file: %s", processing_path.name)
             try:
                 _move_processing_without_lease(
@@ -1380,7 +1413,10 @@ class PendingTaskExecutor:
             await asyncio.gather(touch_task, return_exceptions=True)
             # A replacement root must see a still-live isolated child; removing
             # its lease here allowed restart recovery to dispatch the same task.
-            if not (self._shutdown_event.is_set() and processing_path.exists()):
+            if not (
+                processing_path.exists()
+                and (self._shutdown_event.is_set() or preserve_processing_lease)
+            ):
                 _remove_processing_lease(processing_path)
             self._active_task_ids.discard(task_id)
             # A pre-leased slot is normally released by _execute_llm_task.  If
@@ -2802,6 +2838,8 @@ class PendingTaskExecutor:
                     self._sync_task_queue(task_id, status, summary=summary)
                     if status == "done":
                         await self._handle_goal_completion(task_desc, result)
+        except TaskRunnerInterrupted:
+            raise
         except Exception as exc:
             if self._shutdown_event.is_set():
                 logger.info(
@@ -2848,7 +2886,10 @@ class PendingTaskExecutor:
 
         Caller is responsible for exclusion locks and worker-slot leasing.
         """
-        from core.supervisor.task_runner_supervisor import TaskRunnerError
+        from core.supervisor.task_runner_supervisor import (
+            TaskRunnerError,
+            TaskRunnerInterruptedError,
+        )
 
         assert self._task_runner_supervisor is not None
         task_id = str(task_desc.get("task_id") or "unknown")
@@ -2872,6 +2913,14 @@ class PendingTaskExecutor:
                 display_lane=display_lane,
                 on_spawned=_on_spawned,
             )
+        except TaskRunnerInterruptedError as exc:
+            logger.warning(
+                "[%s] Isolated TaskExec child was interrupted: id=%s err=%s",
+                self._anima_name,
+                task_id,
+                exc,
+            )
+            raise TaskRunnerInterrupted(str(exc)) from exc
         except TaskRunnerError as exc:
             logger.warning(
                 "[%s] Isolated TaskExec child failed: id=%s err=%s",
@@ -2879,10 +2928,6 @@ class PendingTaskExecutor:
                 task_id,
                 exc,
             )
-            # Crash semantics: treat as interrupted / retryable for Layer2.
-            # Keep the original TaskRunnerError early in the summary (before the
-            # 200-char truncation) — flattening it cost a day of log archaeology
-            # on 2026-08-12.
             raise RuntimeError(
                 f"INTERRUPTED: task runner child exited without a result (cause: {exc}). "
                 "May have PARTIALLY EXECUTED; verify actual completion state before re-delegating."
