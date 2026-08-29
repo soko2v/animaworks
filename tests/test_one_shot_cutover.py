@@ -130,7 +130,8 @@ def test_temporary_bootout_failure_is_fail_safe(config: CutoverConfig) -> None:
 
 def test_candidate_check_uses_launchd_pid_and_real_process(config: CutoverConfig, tmp_path: Path) -> None:
     marker = tmp_path / "candidate-identity-token"
-    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", str(marker)])
+    marker.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    process = subprocess.Popen([sys.executable, str(marker)])
     try:
         def command(args: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
             if args[:2] == ["launchctl", "print"]:
@@ -145,6 +146,18 @@ def test_candidate_check_uses_launchd_pid_and_real_process(config: CutoverConfig
 
         substring = CutoverConfig(**{**config.__dict__, "expected_program_fragment": str(marker)[:-1]})
         assert not _candidate_is_running(substring, command, time.monotonic() + 2)
+
+        def unrelated_command(args: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+            if args[:2] == ["launchctl", "print"]:
+                return subprocess.CompletedProcess(args, 0, "state = running\n pid = 4242\n", "")
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                f"/usr/bin/python3 unrelated.py --description {marker}",
+                "",
+            )
+
+        assert not _candidate_is_running(candidate, unrelated_command, time.monotonic() + 2)
 
         def self_command(args: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(args, 0, f"state = running\n pid = {os.getpid()}\n", "")
@@ -329,7 +342,37 @@ def test_destructive_timeout_preserves_rollback_command_budget(
         ["launchctl", "bootstrap"],
     ]
     assert all(call[1] > 0 for call in rollback_calls)
-    assert rollback_calls[0][1] == pytest.approx(config.timeout_seconds * 0.2)
+    assert rollback_calls[0][1] == pytest.approx(config.timeout_seconds * 0.1)
+
+
+def test_rollback_bootout_timeout_still_attempts_bootstrap(
+    config: CutoverConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr("scripts.one_shot_cutover.time.monotonic", lambda: now[0])
+    observed: list[tuple[list[str], float]] = []
+    destructive_bootstrap_seen = False
+    rollback_bootout_seen = False
+
+    def command(args: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal destructive_bootstrap_seen, rollback_bootout_seen
+        observed.append((list(args), timeout))
+        if args[:2] == ["launchctl", "print"] and len(observed) == 1:
+            return subprocess.CompletedProcess(args, 1, "", "")
+        if args[:2] == ["launchctl", "bootstrap"] and not destructive_bootstrap_seen:
+            destructive_bootstrap_seen = True
+            now[0] += timeout
+            raise subprocess.TimeoutExpired(args, timeout)
+        if args[:2] == ["launchctl", "bootout"] and destructive_bootstrap_seen and not rollback_bootout_seen:
+            rollback_bootout_seen = True
+            now[0] += timeout
+            raise subprocess.TimeoutExpired(args, timeout)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    assert cutover(config, command) == 1
+    rollback_bootstrap = observed[4]
+    assert rollback_bootstrap[0][:2] == ["launchctl", "bootstrap"]
+    assert rollback_bootstrap[1] > 0
 
 
 def test_generated_plist_has_non_restart_contract(tmp_path: Path) -> None:

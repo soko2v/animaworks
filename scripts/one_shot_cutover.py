@@ -160,12 +160,25 @@ def _candidate_is_running(config: CutoverConfig, command: RunCommand, deadline: 
     if not expected_argv:
         return False
     width = len(expected_argv)
-    return any(actual_argv[index : index + width] == expected_argv for index in range(len(actual_argv)))
+    if actual_argv[:width] == expected_argv:
+        return True
+    return (
+        len(actual_argv) > width
+        and Path(actual_argv[0]).name.lower().startswith("python")
+        and actual_argv[1 : 1 + width] == expected_argv
+    )
 
 
 def _rollback_once(config: CutoverConfig, command: RunCommand, deadline: float) -> None:
     _atomic_replace(config.service_plist, config.rollback_plist.read_bytes())
-    _command_ok(command, ["launchctl", "bootout", f"{config.domain}/{config.service_label}"], deadline)
+    bootstrap_reserve = _remaining(deadline) * 0.5
+    try:
+        command(
+            ["launchctl", "bootout", f"{config.domain}/{config.service_label}"],
+            bootstrap_reserve,
+        )
+    except subprocess.TimeoutExpired:
+        pass
     if not _command_ok(command, ["launchctl", "bootstrap", config.domain, str(config.service_plist)], deadline):
         raise RuntimeError("rollback bootstrap failed")
 
