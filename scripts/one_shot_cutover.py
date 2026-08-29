@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import os
 import plistlib
+import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -30,6 +32,7 @@ class CutoverConfig:
     expected_program_fragment: str
     timeout_seconds: float = 120.0
     poll_seconds: float = 1.0
+    cleanup_timeout_seconds: float = 5.0
 
 
 def run_command(args: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -46,9 +49,34 @@ def make_launchd_plist(*, label: str, program_arguments: list[str], output_path:
         "KeepAlive": False,
         "ProcessType": "Background",
     }
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("wb") as file_handle:
+    with tempfile.SpooledTemporaryFile() as file_handle:
         plistlib.dump(payload, file_handle, sort_keys=False)
+        file_handle.seek(0)
+        _atomic_replace(output_path, file_handle.read())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_replace(path: Path, content: bytes) -> None:
+    """Durably replace a file without exposing a partial destination."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as file_handle:
+            file_handle.write(content)
+            file_handle.flush()
+            os.fsync(file_handle.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _claim_attempt(marker: Path) -> bool:
@@ -59,6 +87,9 @@ def _claim_attempt(marker: Path) -> bool:
         return False
     with os.fdopen(descriptor, "w", encoding="utf-8") as file_handle:
         file_handle.write(f"pid={os.getpid()}\n")
+        file_handle.flush()
+        os.fsync(file_handle.fileno())
+    _fsync_directory(marker.parent)
     return True
 
 
@@ -74,28 +105,48 @@ def _command_ok(command: RunCommand, args: Sequence[str], deadline: float) -> bo
 
 
 def _candidate_is_running(config: CutoverConfig, command: RunCommand, deadline: float) -> bool:
-    result = command(["pgrep", "-f", config.expected_program_fragment], _remaining(deadline))
-    return result.returncode == 0
+    state = command(
+        ["launchctl", "print", f"{config.domain}/{config.service_label}"], _remaining(deadline)
+    )
+    if state.returncode != 0:
+        return False
+    match = re.search(r"^\s*pid\s*=\s*(\d+)\s*$", state.stdout, re.MULTILINE)
+    if match is None:
+        return False
+    pid = int(match.group(1))
+    if pid == os.getpid():
+        return False
+    process = command(["ps", "-p", str(pid), "-o", "command="], _remaining(deadline))
+    return process.returncode == 0 and config.expected_program_fragment in process.stdout
 
 
 def _rollback_once(config: CutoverConfig, command: RunCommand, deadline: float) -> None:
-    config.service_plist.write_bytes(config.rollback_plist.read_bytes())
+    _atomic_replace(config.service_plist, config.rollback_plist.read_bytes())
     _command_ok(command, ["launchctl", "bootout", f"{config.domain}/{config.service_label}"], deadline)
     if not _command_ok(command, ["launchctl", "bootstrap", config.domain, str(config.service_plist)], deadline):
         raise RuntimeError("rollback bootstrap failed")
 
 
-def _cleanup(config: CutoverConfig, command: RunCommand, deadline: float) -> None:
-    """Disable the temporary job and remove its source plist."""
+def _cleanup(config: CutoverConfig, command: RunCommand) -> None:
+    """Prevent respawn before asking launchd to terminate the temporary job."""
+    disabled_plist = config.temporary_plist.with_name(
+        f".{config.temporary_plist.name}.disabled.{os.getpid()}"
+    )
+    if config.temporary_plist.exists():
+        os.replace(config.temporary_plist, disabled_plist)
+        _fsync_directory(config.temporary_plist.parent)
     try:
-        _command_ok(command, ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"], deadline)
+        command(
+            ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
+            config.cleanup_timeout_seconds,
+        )
     finally:
-        config.temporary_plist.unlink(missing_ok=True)
+        disabled_plist.unlink(missing_ok=True)
 
 
-def _best_effort_cleanup(config: CutoverConfig, command: RunCommand, deadline: float) -> None:
+def _best_effort_cleanup(config: CutoverConfig, command: RunCommand) -> None:
     try:
-        _cleanup(config, command, deadline)
+        _cleanup(config, command)
     except (OSError, subprocess.TimeoutExpired, TimeoutError):
         pass
 
@@ -108,18 +159,18 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
     try:
         already_running = _candidate_is_running(config, command, deadline)
     except (OSError, subprocess.TimeoutExpired, TimeoutError):
-        _best_effort_cleanup(config, command, deadline)
+        _best_effort_cleanup(config, command)
         return 1
     if already_running:
-        _best_effort_cleanup(config, command, deadline)
+        _best_effort_cleanup(config, command)
         return 0
     if not _claim_attempt(config.attempt_marker):
-        _best_effort_cleanup(config, command, deadline)
+        _best_effort_cleanup(config, command)
         return 0
 
     exit_code = 1
     try:
-        config.service_plist.write_bytes(config.candidate_plist.read_bytes())
+        _atomic_replace(config.service_plist, config.candidate_plist.read_bytes())
         _command_ok(command, ["launchctl", "bootout", f"{config.domain}/{config.service_label}"], operation_deadline)
         if not _command_ok(
             command, ["launchctl", "bootstrap", config.domain, str(config.service_plist)], operation_deadline
@@ -134,7 +185,7 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
         except (OSError, RuntimeError, subprocess.TimeoutExpired, TimeoutError):
             pass
     finally:
-        _best_effort_cleanup(config, command, deadline)
+        _best_effort_cleanup(config, command)
     return exit_code
 
 
