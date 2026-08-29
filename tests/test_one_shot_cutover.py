@@ -16,7 +16,7 @@ class FakeCommand:
 
     def __call__(self, args: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(args))
-        return subprocess.CompletedProcess(args, next(self.results), "", "")
+        return subprocess.CompletedProcess(args, next(self.results, 0), "", "")
 
 
 @pytest.fixture
@@ -47,14 +47,24 @@ def test_bootstrap_failure_then_respawn_does_not_bootout_twice(config: CutoverCo
     second = FakeCommand([1])
     assert cutover(config, second) == 0
     calls = first.calls + second.calls
-    assert sum(call[:2] == ["launchctl", "bootout"] for call in calls) == 2  # cutover + rollback only
-    assert all(call[:2] != ["launchctl", "bootout"] for call in second.calls)
+    service_bootouts = [
+        call for call in calls if call == ["launchctl", "bootout", f"{config.domain}/{config.service_label}"]
+    ]
+    temporary_bootouts = [
+        call for call in calls if call == ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"]
+    ]
+    assert len(service_bootouts) == 2  # cutover + rollback only
+    assert len(temporary_bootouts) == 2  # one cleanup per execution
+    assert all(call != ["launchctl", "bootout", f"{config.domain}/{config.service_label}"] for call in second.calls)
 
 
 def test_already_running_is_noop(config: CutoverConfig) -> None:
     fake = FakeCommand([0])
     assert cutover(config, fake) == 0
-    assert fake.calls == [["pgrep", "-f", config.expected_program_fragment]]
+    assert fake.calls == [
+        ["pgrep", "-f", config.expected_program_fragment],
+        ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
+    ]
     assert config.service_plist.read_text() == "old"
 
 
@@ -63,7 +73,7 @@ def test_successful_cutover_cannot_run_again(config: CutoverConfig) -> None:
     assert cutover(config, first) == 0
     second = FakeCommand([1])
     assert cutover(config, second) == 0
-    assert all(call[:2] != ["launchctl", "bootout"] for call in second.calls)
+    assert all(call != ["launchctl", "bootout", f"{config.domain}/{config.service_label}"] for call in second.calls)
 
 
 def test_timeout_rolls_back_once(config: CutoverConfig, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,16 +95,28 @@ def test_timeout_rolls_back_once(config: CutoverConfig, monkeypatch: pytest.Monk
 def test_rollback_happens_only_once(config: CutoverConfig) -> None:
     fake = FakeCommand([1, 0, 5, 0, 5])
     assert cutover(config, fake) == 1
-    assert sum(call[:2] == ["launchctl", "bootout"] for call in fake.calls) == 2
+    assert sum(
+        call == ["launchctl", "bootout", f"{config.domain}/{config.service_label}"] for call in fake.calls
+    ) == 2
 
 
-def test_cleanup_failure_is_fail_safe(config: CutoverConfig, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = FakeCommand([1, 0, 5, 0, 0])
-    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("denied")))
+def test_temporary_bootout_failure_is_fail_safe(config: CutoverConfig) -> None:
+    # Candidate bootstrap fails; rollback succeeds; the temporary-job bootout fails.
+    fake = FakeCommand([1, 0, 5, 0, 0, 1])
     assert cutover(config, fake) == 1
-    respawn = FakeCommand([1])
+    respawn = FakeCommand([1, 0])
     assert cutover(config, respawn) == 0
-    assert all(call[:2] != ["launchctl", "bootout"] for call in respawn.calls)
+    assert all(call != ["launchctl", "bootout", f"{config.domain}/{config.service_label}"] for call in respawn.calls)
+
+
+def test_initial_candidate_timeout_is_fail_safe(config: CutoverConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "scripts.one_shot_cutover._candidate_is_running",
+        lambda *_args: (_ for _ in ()).throw(TimeoutError("pgrep timeout")),
+    )
+    fake = FakeCommand([0])
+    assert cutover(config, fake) == 1
+    assert fake.calls == [["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"]]
 
 
 def test_generated_plist_has_non_restart_contract(tmp_path: Path) -> None:

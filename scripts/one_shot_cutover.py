@@ -85,15 +85,18 @@ def _rollback_once(config: CutoverConfig, command: RunCommand, deadline: float) 
         raise RuntimeError("rollback bootstrap failed")
 
 
-def _cleanup(config: CutoverConfig) -> None:
-    """Remove the source plist; the marker remains as the durable retry barrier."""
-    config.temporary_plist.unlink(missing_ok=True)
-
-
-def _best_effort_cleanup(config: CutoverConfig) -> None:
+def _cleanup(config: CutoverConfig, command: RunCommand, deadline: float) -> None:
+    """Disable the temporary job and remove its source plist."""
     try:
-        _cleanup(config)
-    except OSError:
+        _command_ok(command, ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"], deadline)
+    finally:
+        config.temporary_plist.unlink(missing_ok=True)
+
+
+def _best_effort_cleanup(config: CutoverConfig, command: RunCommand, deadline: float) -> None:
+    try:
+        _cleanup(config, command, deadline)
+    except (OSError, subprocess.TimeoutExpired, TimeoutError):
         pass
 
 
@@ -105,13 +108,13 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
     try:
         already_running = _candidate_is_running(config, command, deadline)
     except (OSError, subprocess.TimeoutExpired, TimeoutError):
-        _best_effort_cleanup(config)
+        _best_effort_cleanup(config, command, deadline)
         return 1
     if already_running:
-        _best_effort_cleanup(config)
+        _best_effort_cleanup(config, command, deadline)
         return 0
     if not _claim_attempt(config.attempt_marker):
-        _best_effort_cleanup(config)
+        _best_effort_cleanup(config, command, deadline)
         return 0
 
     exit_code = 1
@@ -131,7 +134,7 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
         except (OSError, RuntimeError, subprocess.TimeoutExpired, TimeoutError):
             pass
     finally:
-        _best_effort_cleanup(config)
+        _best_effort_cleanup(config, command, deadline)
     return exit_code
 
 
