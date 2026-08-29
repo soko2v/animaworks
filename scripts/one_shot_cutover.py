@@ -164,7 +164,7 @@ def _candidate_is_running(config: CutoverConfig, command: RunCommand, deadline: 
         return True
     return (
         len(actual_argv) > width
-        and Path(actual_argv[0]).name.lower().startswith("python")
+        and re.fullmatch(r"python(?:3(?:\.\d+)*)?", Path(actual_argv[0]).name.lower()) is not None
         and actual_argv[1 : 1 + width] == expected_argv
     )
 

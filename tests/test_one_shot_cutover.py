@@ -159,6 +159,13 @@ def test_candidate_check_uses_launchd_pid_and_real_process(config: CutoverConfig
 
         assert not _candidate_is_running(candidate, unrelated_command, time.monotonic() + 2)
 
+        def fake_python_command(args: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+            if args[:2] == ["launchctl", "print"]:
+                return subprocess.CompletedProcess(args, 0, "state = running\n pid = 4242\n", "")
+            return subprocess.CompletedProcess(args, 0, f"/tmp/python-wrapper {marker}", "")
+
+        assert not _candidate_is_running(candidate, fake_python_command, time.monotonic() + 2)
+
         def self_command(args: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(args, 0, f"state = running\n pid = {os.getpid()}\n", "")
 
