@@ -14,6 +14,7 @@ from scripts.one_shot_cutover import (
     _atomic_replace,
     _candidate_is_running,
     _claim_attempt,
+    _ensure_old_service_exited,
     cutover,
     launch_cutover,
     make_launchd_plist,
@@ -173,6 +174,56 @@ def test_candidate_check_uses_launchd_pid_and_real_process(config: CutoverConfig
     finally:
         process.terminate()
         process.wait(timeout=2)
+
+
+def test_stuck_old_service_is_killed_only_after_identity_recheck(
+    config: CutoverConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr("scripts.one_shot_cutover.time.monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        "scripts.one_shot_cutover.time.sleep", lambda seconds: now.__setitem__(0, now[0] + seconds)
+    )
+    calls: list[list[str]] = []
+
+    def command(args: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[:2] == ["kill", "-KILL"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        ps_calls = sum(call[:2] == ["ps", "-p"] for call in calls)
+        return subprocess.CompletedProcess(
+            args,
+            1 if ps_calls > 6 else 0,
+            "uv run animaworks serve --foreground\n",
+            "",
+        )
+
+    _ensure_old_service_exited(
+        (4242, "uv run animaworks serve --foreground"),
+        command,
+        120.0,
+        1.0,
+        5.0,
+    )
+    assert ["kill", "-KILL", "4242"] in calls
+
+
+def test_old_service_pid_reuse_is_never_killed(
+    config: CutoverConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("scripts.one_shot_cutover.time.monotonic", lambda: 100.0)
+
+    def command(args: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, "unrelated process\n", "")
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        _ensure_old_service_exited(
+            (4242, "uv run animaworks serve --foreground"),
+            command,
+            120.0,
+            1.0,
+            5.0,
+        )
 
 
 def test_cleanup_disables_plist_before_bootout_after_deadline(

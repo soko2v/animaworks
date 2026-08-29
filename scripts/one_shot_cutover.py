@@ -35,6 +35,7 @@ class CutoverConfig:
     timeout_seconds: float = 120.0
     poll_seconds: float = 1.0
     cleanup_timeout_seconds: float = 5.0
+    old_service_grace_seconds: float = 0.0
 
 
 def run_command(args: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -135,6 +136,58 @@ def _remaining(deadline: float) -> float:
 
 def _command_ok(command: RunCommand, args: Sequence[str], deadline: float) -> bool:
     return command(args, _remaining(deadline)).returncode == 0
+
+
+def _loaded_service_process(
+    config: CutoverConfig, command: RunCommand, deadline: float
+) -> tuple[int, str] | None:
+    """Return the launchd-owned service PID and exact command, if available."""
+    state = command(
+        ["launchctl", "print", f"{config.domain}/{config.service_label}"],
+        _remaining(deadline),
+    )
+    if state.returncode != 0:
+        return None
+    match = re.search(r"^\s*pid\s*=\s*(\d+)\s*$", state.stdout, re.MULTILINE)
+    if match is None:
+        return None
+    pid = int(match.group(1))
+    if pid == os.getpid():
+        return None
+    process = command(["ps", "-p", str(pid), "-o", "command="], _remaining(deadline))
+    if process.returncode != 0 or "animaworks serve" not in process.stdout:
+        return None
+    return pid, process.stdout.strip()
+
+
+def _ensure_old_service_exited(
+    process: tuple[int, str] | None,
+    command: RunCommand,
+    deadline: float,
+    poll_seconds: float,
+    grace_seconds: float,
+) -> None:
+    """Bound shutdown and kill only the unchanged, previously launchd-owned process."""
+    if process is None:
+        return
+    pid, expected_command = process
+    grace_deadline = min(deadline, time.monotonic() + grace_seconds)
+    while time.monotonic() < grace_deadline:
+        current = command(["ps", "-p", str(pid), "-o", "command="], _remaining(deadline))
+        if current.returncode != 0:
+            return
+        if current.stdout.strip() != expected_command:
+            raise RuntimeError("old service PID identity changed during cutover")
+        time.sleep(min(poll_seconds, max(0.01, grace_deadline - time.monotonic())))
+    current = command(["ps", "-p", str(pid), "-o", "command="], _remaining(deadline))
+    if current.returncode != 0:
+        return
+    if current.stdout.strip() != expected_command:
+        raise RuntimeError("old service PID identity changed before forced shutdown")
+    if not _command_ok(command, ["kill", "-KILL", str(pid)], deadline):
+        raise RuntimeError("old service did not exit and forced shutdown failed")
+    while command(["ps", "-p", str(pid), "-o", "command="], _remaining(deadline)).returncode == 0:
+        time.sleep(min(poll_seconds, _remaining(deadline)))
 
 
 def _candidate_is_running(config: CutoverConfig, command: RunCommand, deadline: float) -> bool:
@@ -239,8 +292,20 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
 
     exit_code = 1
     try:
+        old_service_process = (
+            _loaded_service_process(config, command, operation_deadline)
+            if config.old_service_grace_seconds > 0
+            else None
+        )
         _atomic_replace(config.service_plist, config.candidate_plist.read_bytes())
         _command_ok(command, ["launchctl", "bootout", f"{config.domain}/{config.service_label}"], operation_deadline)
+        _ensure_old_service_exited(
+            old_service_process,
+            command,
+            operation_deadline,
+            config.poll_seconds,
+            config.old_service_grace_seconds,
+        )
         if not _command_ok(
             command, ["launchctl", "bootstrap", config.domain, str(config.service_plist)], operation_deadline
         ):
@@ -270,6 +335,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temporary-plist", required=True, type=Path)
     parser.add_argument("--expected-program-fragment", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--old-service-grace-seconds", type=float, default=5.0)
     parser.add_argument("--execute", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
@@ -300,6 +366,8 @@ def _worker_arguments(args: argparse.Namespace) -> list[str]:
         args.expected_program_fragment,
         "--timeout-seconds",
         str(args.timeout_seconds),
+        "--old-service-grace-seconds",
+        str(args.old_service_grace_seconds),
     ]
 
 
