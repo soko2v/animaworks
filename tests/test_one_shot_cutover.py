@@ -168,7 +168,10 @@ def test_cleanup_disables_plist_before_bootout_after_deadline(
 
     assert cutover(config, command) == 1
     assert observed == [
-        (["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"], config.cleanup_timeout_seconds)
+        (
+            ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
+            config.timeout_seconds * 0.2,
+        )
     ]
 
 
@@ -217,6 +220,29 @@ def test_attempt_marker_fsyncs_file_and_parent(config: CutoverConfig, monkeypatc
     monkeypatch.setattr(os, "fsync", real_fsync)
 
 
+@pytest.mark.parametrize("failing_fsync_call", [1, 2], ids=["file", "parent"])
+def test_attempt_marker_fsync_failure_cleans_up_without_service_bootout(
+    config: CutoverConfig, monkeypatch: pytest.MonkeyPatch, failing_fsync_call: int
+) -> None:
+    fsync_calls = 0
+    real_fsync = os.fsync
+
+    def fail_selected_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == failing_fsync_call:
+            raise OSError("injected claim fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_selected_fsync)
+    fake = FakeCommand([1, 0])
+
+    assert cutover(config, fake) == 1
+    assert not config.temporary_plist.exists()
+    assert ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"] in fake.calls
+    assert ["launchctl", "bootout", f"{config.domain}/{config.service_label}"] not in fake.calls
+
+
 def test_command_timeouts_decrease_and_stay_within_operation_budget(
     config: CutoverConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -238,7 +264,30 @@ def test_command_timeouts_decrease_and_stay_within_operation_budget(
     main_timeouts = timeouts[:-1]
     assert main_timeouts == sorted(main_timeouts, reverse=True)
     assert now[0] - 100.0 <= config.timeout_seconds
-    assert timeouts[-1] == config.cleanup_timeout_seconds
+    assert timeouts[-1] == pytest.approx(config.timeout_seconds * 0.2)
+
+
+def test_operation_timeout_reserves_cleanup_within_overall_timeout(
+    config: CutoverConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr("scripts.one_shot_cutover.time.monotonic", lambda: now[0])
+    observed: list[tuple[list[str], float]] = []
+
+    def command(args: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        observed.append((list(args), timeout))
+        now[0] += timeout
+        if args[:2] == ["launchctl", "print"]:
+            raise subprocess.TimeoutExpired(args, timeout)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    assert cutover(config, command) == 1
+    assert now[0] - 100.0 <= config.timeout_seconds
+    assert observed[0][1] == pytest.approx(config.timeout_seconds * 0.8)
+    assert observed[1] == (
+        ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
+        pytest.approx(config.timeout_seconds * 0.2),
+    )
 
 
 def test_initial_candidate_timeout_is_fail_safe(config: CutoverConfig, monkeypatch: pytest.MonkeyPatch) -> None:

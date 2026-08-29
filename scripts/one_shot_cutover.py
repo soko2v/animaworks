@@ -73,10 +73,16 @@ def launch_cutover(
             config.timeout_seconds,
         )
     except (OSError, subprocess.TimeoutExpired):
-        _best_effort_cleanup(config, command)
+        cleanup_deadline = time.monotonic() + config.cleanup_timeout_seconds
+        _best_effort_cleanup(
+            config, command, cleanup_deadline, config.cleanup_timeout_seconds
+        )
         return 1
     if result.returncode != 0:
-        _best_effort_cleanup(config, command)
+        cleanup_deadline = time.monotonic() + config.cleanup_timeout_seconds
+        _best_effort_cleanup(
+            config, command, cleanup_deadline, config.cleanup_timeout_seconds
+        )
         return 1
     return 0
 
@@ -153,7 +159,9 @@ def _rollback_once(config: CutoverConfig, command: RunCommand, deadline: float) 
         raise RuntimeError("rollback bootstrap failed")
 
 
-def _cleanup(config: CutoverConfig, command: RunCommand) -> None:
+def _cleanup(
+    config: CutoverConfig, command: RunCommand, deadline: float, reserved_timeout: float
+) -> None:
     """Prevent respawn before asking launchd to terminate the temporary job."""
     disabled_plist = config.temporary_plist.with_name(
         f".{config.temporary_plist.name}.disabled.{os.getpid()}"
@@ -164,15 +172,17 @@ def _cleanup(config: CutoverConfig, command: RunCommand) -> None:
     try:
         command(
             ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
-            config.cleanup_timeout_seconds,
+            min(reserved_timeout, _remaining(deadline)),
         )
     finally:
         disabled_plist.unlink(missing_ok=True)
 
 
-def _best_effort_cleanup(config: CutoverConfig, command: RunCommand) -> None:
+def _best_effort_cleanup(
+    config: CutoverConfig, command: RunCommand, deadline: float, reserved_timeout: float
+) -> None:
     try:
-        _cleanup(config, command)
+        _cleanup(config, command, deadline, reserved_timeout)
     except (OSError, subprocess.TimeoutExpired, TimeoutError):
         pass
 
@@ -181,17 +191,25 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
     """Perform at most one destructive cutover and one rollback."""
     started = time.monotonic()
     deadline = started + config.timeout_seconds
-    operation_deadline = started + (config.timeout_seconds * 0.8)
+    cleanup_reserve = min(config.cleanup_timeout_seconds, config.timeout_seconds * 0.2)
+    if cleanup_reserve <= 0:
+        return 1
+    operation_deadline = deadline - cleanup_reserve
     try:
-        already_running = _candidate_is_running(config, command, deadline)
+        already_running = _candidate_is_running(config, command, operation_deadline)
     except (OSError, subprocess.TimeoutExpired, TimeoutError):
-        _best_effort_cleanup(config, command)
+        _best_effort_cleanup(config, command, deadline, cleanup_reserve)
         return 1
     if already_running:
-        _best_effort_cleanup(config, command)
+        _best_effort_cleanup(config, command, deadline, cleanup_reserve)
         return 0
-    if not _claim_attempt(config.attempt_marker):
-        _best_effort_cleanup(config, command)
+    try:
+        claimed = _claim_attempt(config.attempt_marker)
+    except OSError:
+        _best_effort_cleanup(config, command, deadline, cleanup_reserve)
+        return 1
+    if not claimed:
+        _best_effort_cleanup(config, command, deadline, cleanup_reserve)
         return 0
 
     exit_code = 1
@@ -207,11 +225,11 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
         exit_code = 0
     except (OSError, RuntimeError, subprocess.TimeoutExpired, TimeoutError):
         try:
-            _rollback_once(config, command, deadline)
+            _rollback_once(config, command, operation_deadline)
         except (OSError, RuntimeError, subprocess.TimeoutExpired, TimeoutError):
             pass
     finally:
-        _best_effort_cleanup(config, command)
+        _best_effort_cleanup(config, command, deadline, cleanup_reserve)
     return exit_code
 
 
