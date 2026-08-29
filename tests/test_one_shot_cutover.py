@@ -336,3 +336,26 @@ def test_launch_failure_disables_and_boots_out_temporary_agent(config: CutoverCo
         ["launchctl", "bootstrap", config.domain, str(config.temporary_plist)],
         ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
     ]
+
+
+def test_launch_timeout_reserves_cleanup_within_overall_timeout(
+    config: CutoverConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr("scripts.one_shot_cutover.time.monotonic", lambda: now[0])
+    observed: list[tuple[list[str], float]] = []
+
+    def command(args: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        observed.append((list(args), timeout))
+        now[0] += timeout
+        if args[:2] == ["launchctl", "bootstrap"]:
+            raise subprocess.TimeoutExpired(args, timeout)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    assert launch_cutover(config, [sys.executable, "helper.py", "--execute"], command) == 1
+    assert now[0] - 100.0 <= config.timeout_seconds
+    assert observed[0][1] == pytest.approx(config.timeout_seconds * 0.8)
+    assert observed[1] == (
+        ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
+        pytest.approx(config.timeout_seconds * 0.2),
+    )

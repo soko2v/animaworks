@@ -62,27 +62,27 @@ def launch_cutover(
     command: RunCommand = run_command,
 ) -> int:
     """Create and bootstrap one non-restarting temporary launchd job."""
-    make_launchd_plist(
-        label=config.temporary_label,
-        program_arguments=program_arguments,
-        output_path=config.temporary_plist,
-    )
+    started = time.monotonic()
+    deadline = started + config.timeout_seconds
+    cleanup_reserve = min(config.cleanup_timeout_seconds, config.timeout_seconds * 0.2)
+    if cleanup_reserve <= 0:
+        return 1
+    operation_deadline = deadline - cleanup_reserve
     try:
+        make_launchd_plist(
+            label=config.temporary_label,
+            program_arguments=program_arguments,
+            output_path=config.temporary_plist,
+        )
         result = command(
             ["launchctl", "bootstrap", config.domain, str(config.temporary_plist)],
-            config.timeout_seconds,
+            _remaining(operation_deadline),
         )
-    except (OSError, subprocess.TimeoutExpired):
-        cleanup_deadline = time.monotonic() + config.cleanup_timeout_seconds
-        _best_effort_cleanup(
-            config, command, cleanup_deadline, config.cleanup_timeout_seconds
-        )
+    except (OSError, subprocess.TimeoutExpired, TimeoutError):
+        _best_effort_cleanup(config, command, deadline, cleanup_reserve)
         return 1
     if result.returncode != 0:
-        cleanup_deadline = time.monotonic() + config.cleanup_timeout_seconds
-        _best_effort_cleanup(
-            config, command, cleanup_deadline, config.cleanup_timeout_seconds
-        )
+        _best_effort_cleanup(config, command, deadline, cleanup_reserve)
         return 1
     return 0
 
@@ -169,13 +169,12 @@ def _cleanup(
     if config.temporary_plist.exists():
         os.replace(config.temporary_plist, disabled_plist)
         _fsync_directory(config.temporary_plist.parent)
-    try:
-        command(
-            ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
-            min(reserved_timeout, _remaining(deadline)),
-        )
-    finally:
-        disabled_plist.unlink(missing_ok=True)
+    disabled_plist.unlink(missing_ok=True)
+    _fsync_directory(config.temporary_plist.parent)
+    command(
+        ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
+        min(reserved_timeout, _remaining(deadline)),
+    )
 
 
 def _best_effort_cleanup(
