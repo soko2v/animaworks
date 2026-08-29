@@ -15,6 +15,7 @@ from scripts.one_shot_cutover import (
     _candidate_is_running,
     _claim_attempt,
     cutover,
+    launch_cutover,
     make_launchd_plist,
     run_command,
 )
@@ -259,3 +260,30 @@ def test_generated_plist_has_non_restart_contract(tmp_path: Path) -> None:
     assert plist["KeepAlive"] is False
     assert "StartInterval" not in plist
     assert "StartCalendarInterval" not in plist
+
+
+def test_launch_path_generates_temporary_agent_and_bootstraps_once(config: CutoverConfig) -> None:
+    fake = FakeCommand([0])
+    worker_arguments = [sys.executable, "/tmp/one_shot_cutover.py", "--execute"]
+
+    assert launch_cutover(config, worker_arguments, fake) == 0
+    assert fake.calls == [
+        ["launchctl", "bootstrap", config.domain, str(config.temporary_plist)]
+    ]
+    with config.temporary_plist.open("rb") as file_handle:
+        plist = plistlib.load(file_handle)
+    assert plist["Label"] == config.temporary_label
+    assert plist["ProgramArguments"] == worker_arguments
+    assert plist["RunAtLoad"] is True
+    assert plist["KeepAlive"] is False
+
+
+def test_launch_failure_disables_and_boots_out_temporary_agent(config: CutoverConfig) -> None:
+    fake = FakeCommand([5, 0])
+
+    assert launch_cutover(config, [sys.executable, "helper.py", "--execute"], fake) == 1
+    assert not config.temporary_plist.exists()
+    assert fake.calls == [
+        ["launchctl", "bootstrap", config.domain, str(config.temporary_plist)],
+        ["launchctl", "bootout", f"{config.domain}/{config.temporary_label}"],
+    ]

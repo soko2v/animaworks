@@ -8,6 +8,7 @@ import os
 import plistlib
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
@@ -53,6 +54,31 @@ def make_launchd_plist(*, label: str, program_arguments: list[str], output_path:
         plistlib.dump(payload, file_handle, sort_keys=False)
         file_handle.seek(0)
         _atomic_replace(output_path, file_handle.read())
+
+
+def launch_cutover(
+    config: CutoverConfig,
+    program_arguments: list[str],
+    command: RunCommand = run_command,
+) -> int:
+    """Create and bootstrap one non-restarting temporary launchd job."""
+    make_launchd_plist(
+        label=config.temporary_label,
+        program_arguments=program_arguments,
+        output_path=config.temporary_plist,
+    )
+    try:
+        result = command(
+            ["launchctl", "bootstrap", config.domain, str(config.temporary_plist)],
+            config.timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _best_effort_cleanup(config, command)
+        return 1
+    if result.returncode != 0:
+        _best_effort_cleanup(config, command)
+        return 1
+    return 0
 
 
 def _fsync_directory(path: Path) -> None:
@@ -201,13 +227,48 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temporary-plist", required=True, type=Path)
     parser.add_argument("--expected-program-fragment", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--execute", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
+
+
+def _worker_arguments(args: argparse.Namespace) -> list[str]:
+    """Build the exact argv stored in the temporary LaunchAgent."""
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--execute",
+        "--domain",
+        args.domain,
+        "--service-label",
+        args.service_label,
+        "--temporary-label",
+        args.temporary_label,
+        "--service-plist",
+        str(args.service_plist),
+        "--candidate-plist",
+        str(args.candidate_plist),
+        "--rollback-plist",
+        str(args.rollback_plist),
+        "--attempt-marker",
+        str(args.attempt_marker),
+        "--temporary-plist",
+        str(args.temporary_plist),
+        "--expected-program-fragment",
+        args.expected_program_fragment,
+        "--timeout-seconds",
+        str(args.timeout_seconds),
+    ]
 
 
 def main() -> int:
     """CLI entry point."""
     args = _parse_args()
-    return cutover(CutoverConfig(**vars(args)))
+    execute = args.execute
+    del args.execute
+    config = CutoverConfig(**vars(args))
+    if execute:
+        return cutover(config)
+    return launch_cutover(config, _worker_arguments(args))
 
 
 if __name__ == "__main__":
