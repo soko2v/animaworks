@@ -7,6 +7,7 @@ import argparse
 import os
 import plistlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -149,7 +150,17 @@ def _candidate_is_running(config: CutoverConfig, command: RunCommand, deadline: 
     if pid == os.getpid():
         return False
     process = command(["ps", "-p", str(pid), "-o", "command="], _remaining(deadline))
-    return process.returncode == 0 and config.expected_program_fragment in process.stdout
+    if process.returncode != 0:
+        return False
+    try:
+        actual_argv = shlex.split(process.stdout)
+        expected_argv = shlex.split(config.expected_program_fragment)
+    except ValueError:
+        return False
+    if not expected_argv:
+        return False
+    width = len(expected_argv)
+    return any(actual_argv[index : index + width] == expected_argv for index in range(len(actual_argv)))
 
 
 def _rollback_once(config: CutoverConfig, command: RunCommand, deadline: float) -> None:
@@ -191,9 +202,11 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
     started = time.monotonic()
     deadline = started + config.timeout_seconds
     cleanup_reserve = min(config.cleanup_timeout_seconds, config.timeout_seconds * 0.2)
-    if cleanup_reserve <= 0:
+    rollback_reserve = min(config.cleanup_timeout_seconds * 2, config.timeout_seconds * 0.2)
+    if cleanup_reserve <= 0 or rollback_reserve <= 0:
         return 1
-    operation_deadline = deadline - cleanup_reserve
+    rollback_deadline = deadline - cleanup_reserve
+    operation_deadline = rollback_deadline - rollback_reserve
     try:
         already_running = _candidate_is_running(config, command, operation_deadline)
     except (OSError, subprocess.TimeoutExpired, TimeoutError):
@@ -224,7 +237,7 @@ def cutover(config: CutoverConfig, command: RunCommand = run_command) -> int:
         exit_code = 0
     except (OSError, RuntimeError, subprocess.TimeoutExpired, TimeoutError):
         try:
-            _rollback_once(config, command, operation_deadline)
+            _rollback_once(config, command, rollback_deadline)
         except (OSError, RuntimeError, subprocess.TimeoutExpired, TimeoutError):
             pass
     finally:
