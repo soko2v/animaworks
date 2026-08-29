@@ -51,6 +51,8 @@ def _group_exists(pgid: int) -> bool:
         os.killpg(pgid, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
     return True
 
 
@@ -110,6 +112,51 @@ async def test_stalled_job_kills_only_target_group(
         if _group_exists(process.pid):
             os.killpg(process.pid, signal.SIGKILL)
         await process.wait()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group assertion requires POSIX")
+@pytest.mark.asyncio
+async def test_cancelled_job_escalates_and_releases_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot wait forever on a task group that ignores SIGTERM."""
+    code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        code,
+        start_new_session=True,
+    )
+    supervisor = TaskRunnerSupervisor("sakura", tmp_path / "animas" / "sakura", tmp_path / "shared")
+    job = _job(supervisor, process, job_id="job-cancel")
+    supervisor.jobs[job.identity.job_id] = job
+    monkeypatch.setattr(task_runner_supervisor, "_TASK_RUNNER_TERM_TIMEOUT", 0.05)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    monkeypatch.setattr(supervisor, "_ensure_started", AsyncMock())
+    monkeypatch.setattr(supervisor, "_required_url_environment", lambda: {"ANIMAWORKS_EMBED_URL": "http://x"})
+
+    task = asyncio.create_task(
+        supervisor._spawn_and_await(
+            lane="cron",
+            job_prefix="cron",
+            params_builder=lambda _env: {},
+            log_context="cancel-test",
+            attempt=1,
+            display_lane="background",
+            on_spawned=None,
+            url_env={"ANIMAWORKS_EMBED_URL": "http://x"},
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1.0)
+
+    assert process.returncode == -signal.SIGKILL
+    assert supervisor.jobs == {"job-cancel": job}
+    supervisor.jobs.pop("job-cancel")
+    assert supervisor.active_child_count == 0
 
 
 @pytest.mark.asyncio

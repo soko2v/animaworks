@@ -247,6 +247,218 @@ class TestCronGuard:
             schedule="0 9 * * *",
         )
 
+    @pytest.mark.asyncio
+    async def test_hard_timeout_releases_slot_and_next_tick_runs(self, tmp_path):
+        """A hung watchdog times out without permanently occupying single-flight."""
+        from core.schemas import CronTask
+
+        mgr = _make_scheduler_mgr(tmp_path)
+        blocker = asyncio.Event()
+        calls = 0
+
+        async def run_cron(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await blocker.wait()
+            result = MagicMock(action="completed", usage={})
+            result.model_dump.return_value = {}
+            return result
+
+        mgr._anima.run_cron_task = AsyncMock(side_effect=run_cron)
+        task = CronTask(
+            name="watchdog",
+            schedule="*/10 * * * *",
+            description="bounded exact-path check",
+            hard_timeout_seconds=0.02,
+        )
+
+        await mgr.cron_tick(task)
+        await asyncio.sleep(0.05)
+        assert "watchdog" not in mgr._cron_running
+        assert mgr._anima.memory.append_cron_event.call_args_list[-1].args[1] == "timeout"
+
+        await mgr.cron_tick(task)
+        await asyncio.sleep(0.05)
+        assert calls == 2
+        assert "watchdog" not in mgr._cron_running
+        assert mgr._anima.memory.append_cron_event.call_args_list[-1].args[1] == "succeeded"
+
+    @pytest.mark.asyncio
+    async def test_watchdog_precheck_is_inside_hard_timeout(self, tmp_path, monkeypatch):
+        """Even the bounded-path precheck cannot overrun the job budget."""
+        import time
+
+        from core.schemas import CronTask
+
+        mgr = _make_scheduler_mgr(tmp_path)
+        monkeypatch.setattr(mgr, "_watchdog_stop_suspicion", lambda _task: time.sleep(0.05))
+        task = CronTask(
+            name="watchdog",
+            schedule="*/10 * * * *",
+            description="bounded check",
+            hard_timeout_seconds=0.01,
+        )
+
+        await mgr._run_cron_task(task)
+
+        mgr._anima.run_cron_task.assert_not_called()
+        assert "watchdog" not in mgr._cron_running
+        assert mgr._anima.memory.append_cron_event.call_args_list[-1].args[1] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_isolated_timeout_cancels_runner_and_releases_slot(self, tmp_path):
+        """Timeout cancellation reaches the isolated runner lease owner."""
+        from core.schemas import CronTask
+
+        mgr = _make_scheduler_mgr(tmp_path)
+        mgr._cron_isolated = True
+        runner = AsyncMock()
+        cancelled = asyncio.Event()
+
+        async def hang(_task):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        runner.run_cron.side_effect = hang
+        mgr._task_runner_supervisor = runner
+        task = CronTask(name="watchdog", schedule="*/10 * * * *", hard_timeout_seconds=0.02)
+
+        await mgr._run_cron_task(task)
+
+        assert cancelled.is_set()
+        assert "watchdog" not in mgr._cron_running
+
+    @pytest.mark.asyncio
+    async def test_missing_descriptor_beats_old_artifact_mtime(self, tmp_path):
+        """An old result artifact cannot mask a missing unfinished descriptor."""
+        import json
+        import os
+        import time
+
+        from core.schemas import CronTask
+
+        mgr = _make_scheduler_mgr(tmp_path)
+        target = tmp_path / "animas" / "sofia"
+        (target / "state" / "task_results").mkdir(parents=True)
+        queue_entry = {
+            "task_id": "durable1",
+            "source": "human",
+            "original_instruction": "continue",
+            "assignee": "sofia",
+            "status": "in_progress",
+            "summary": "running",
+            "ts": "2026-08-29T03:00:00+09:00",
+            "updated_at": "2026-08-29T03:35:45+09:00",
+            "deadline": "2026-08-29T12:00:00+09:00",
+            "relay_chain": [],
+            "meta": {},
+        }
+        (target / "state" / "task_queue.jsonl").write_text(json.dumps(queue_entry) + "\n", encoding="utf-8")
+        artifact = target / "state" / "task_results" / "durable1.md"
+        artifact.write_text("old progress", encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(artifact, (old, old))
+        task = CronTask(
+            name="watchdog",
+            schedule="*/10 * * * *",
+            watchdog_anima="sofia",
+            watchdog_task_id="durable1",
+            hard_timeout_seconds=120,
+        )
+
+        assert mgr._watchdog_stop_suspicion(task) == "unfinished task descriptor is missing"
+        result = MagicMock(action="completed", usage={})
+        result.model_dump.return_value = {}
+        mgr._anima.run_cron_task = AsyncMock(return_value=result)
+        await mgr._run_cron_task(task)
+        prompt = mgr._anima.run_cron_task.await_args.args[1]
+        assert prompt.startswith("STOP_SUSPECTED: unfinished task descriptor is missing")
+        events = [call.args[1] for call in mgr._anima.memory.append_cron_event.call_args_list]
+        assert events[-2:] == ["stop_suspected", "succeeded"]
+
+    @pytest.mark.asyncio
+    async def test_dead_processing_lease_is_stop_suspected(self, tmp_path):
+        """An unfinished processing descriptor without a runner is fail-closed."""
+        import json
+
+        from core.schemas import CronTask
+
+        mgr = _make_scheduler_mgr(tmp_path)
+        target = tmp_path / "animas" / "sofia"
+        processing = target / "state" / "pending" / "processing"
+        processing.mkdir(parents=True)
+        queue_entry = {
+            "task_id": "durable2",
+            "ts": "2026-08-29T03:00:00+09:00",
+            "source": "human",
+            "original_instruction": "continue",
+            "assignee": "sofia",
+            "status": "in_progress",
+            "summary": "running",
+            "updated_at": "2026-08-29T03:35:45+09:00",
+            "relay_chain": [],
+            "meta": {},
+        }
+        (target / "state" / "task_queue.jsonl").write_text(json.dumps(queue_entry) + "\n", encoding="utf-8")
+        (processing / "durable2.json").write_text(json.dumps(queue_entry), encoding="utf-8")
+        task = CronTask(
+            name="watchdog",
+            schedule="*/10 * * * *",
+            watchdog_anima="sofia",
+            watchdog_task_id="durable2",
+            hard_timeout_seconds=120,
+        )
+
+        assert mgr._watchdog_stop_suspicion(task) == "unfinished task has no live runner lease"
+
+    @pytest.mark.asyncio
+    async def test_live_processing_lease_is_not_stop_suspected(self, tmp_path, monkeypatch):
+        """A live runner lease preserves the normal watchdog path."""
+        import json
+
+        from core.schemas import CronTask
+
+        mgr = _make_scheduler_mgr(tmp_path)
+        target = tmp_path / "animas" / "sofia"
+        processing = target / "state" / "pending" / "processing"
+        processing.mkdir(parents=True)
+        queue_entry = {
+            "task_id": "durable3",
+            "ts": "2026-08-29T03:00:00+09:00",
+            "source": "human",
+            "original_instruction": "continue",
+            "assignee": "sofia",
+            "status": "in_progress",
+            "summary": "running",
+            "updated_at": "2026-08-29T03:35:45+09:00",
+            "relay_chain": [],
+            "meta": {},
+        }
+        (target / "state" / "task_queue.jsonl").write_text(json.dumps(queue_entry) + "\n", encoding="utf-8")
+        (processing / "durable3.json").write_text(json.dumps(queue_entry), encoding="utf-8")
+        monkeypatch.setattr(
+            "core.supervisor.scheduler_manager.classify_processing_lease",
+            lambda *_args, **_kwargs: "live",
+        )
+        task = CronTask(
+            name="watchdog",
+            schedule="*/10 * * * *",
+            watchdog_anima="sofia",
+            watchdog_task_id="durable3",
+            hard_timeout_seconds=120,
+        )
+        result = MagicMock(action="completed", usage={})
+        result.model_dump.return_value = {}
+        mgr._anima.run_cron_task = AsyncMock(return_value=result)
+
+        assert mgr._watchdog_stop_suspicion(task) is None
+        await mgr._run_cron_task(task)
+        assert "STOP_SUSPECTED" not in mgr._anima.run_cron_task.await_args.args[1]
+        assert mgr._anima.memory.append_cron_event.call_args_list[-1].args[1] == "succeeded"
+
 
 class TestMessageTriggeredHeartbeatGuard:
     """Verify message-triggered heartbeat respects the guard flag."""

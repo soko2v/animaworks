@@ -153,6 +153,8 @@ def parse_cron_md(content: str, *, warn: bool = True) -> list[CronTask]:
         - ``tool: <name>`` — for command type with tool
         - ``args:`` — YAML block for tool arguments
         - ``skip_pattern: <regex>`` — stdout matching this skips heartbeat
+        - ``hard_timeout_seconds: <seconds>`` — hard execution budget
+        - ``watchdog_anima`` + ``watchdog_task_id`` — exact durable task to guard
         - Remaining text lines become the task description (LLM type)
         - HTML comments (``<!-- -->``) are stripped before parsing
     """
@@ -230,6 +232,9 @@ def _parse_section(name: str, lines: list[str], *, warn: bool = True) -> CronTas
     skills: list[str] = []
     skip_pattern = None
     trigger_heartbeat = True
+    hard_timeout_seconds: float | None = None
+    watchdog_anima: str | None = None
+    watchdog_task_id: str | None = None
     description_lines: list[str] = []
 
     i = 0
@@ -263,6 +268,19 @@ def _parse_section(name: str, lines: list[str], *, warn: bool = True) -> CronTas
         elif stripped.startswith("trigger_heartbeat:"):
             val = _strip_inline_comment(stripped.split(":", 1)[1].strip()).lower()
             trigger_heartbeat = val not in ("false", "no", "0")
+        elif stripped.startswith("hard_timeout_seconds:"):
+            val = _strip_inline_comment(stripped.split(":", 1)[1].strip())
+            try:
+                hard_timeout_seconds = float(val)
+            except ValueError:
+                if warn:
+                    logger.warning("Invalid hard_timeout_seconds for task %s: %s", name, val)
+        elif stripped.startswith("watchdog_anima:"):
+            val = _strip_inline_comment(stripped.split(":", 1)[1].strip())
+            watchdog_anima = _strip_outer_quotes(val) or None
+        elif stripped.startswith("watchdog_task_id:"):
+            val = _strip_inline_comment(stripped.split(":", 1)[1].strip())
+            watchdog_task_id = _strip_outer_quotes(val) or None
         elif stripped.startswith("args:"):
             # Parse YAML args block (indented lines following "args:")
             yaml_lines = [line]
@@ -330,6 +348,9 @@ def _parse_section(name: str, lines: list[str], *, warn: bool = True) -> CronTas
         skills=skills,
         skip_pattern=skip_pattern,
         trigger_heartbeat=trigger_heartbeat,
+        hard_timeout_seconds=hard_timeout_seconds,
+        watchdog_anima=watchdog_anima,
+        watchdog_task_id=watchdog_task_id,
     )
 
 

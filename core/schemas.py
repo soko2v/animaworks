@@ -68,6 +68,20 @@ class CronTask(BaseModel):
     skills: list[str] = Field(default_factory=list)  # Optional skill pointers attached to the cron task
     skip_pattern: str | None = None  # stdoutがマッチしたらheartbeatをスキップ
     trigger_heartbeat: bool = True  # Falseならcron出力時のHBトリガーを抑制
+    hard_timeout_seconds: float | None = Field(default=None, gt=0, le=86_400)
+    watchdog_anima: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]+$")
+    watchdog_task_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]+$")
+
+    @model_validator(mode="after")
+    def _watchdog_pair_is_complete(self) -> CronTask:
+        """Require both exact watchdog coordinates when either is configured."""
+        if bool(self.watchdog_anima) != bool(self.watchdog_task_id):
+            raise ValueError("watchdog_anima and watchdog_task_id must be configured together")
+        if self.watchdog_task_id and self.hard_timeout_seconds is None:
+            raise ValueError("watchdog jobs require hard_timeout_seconds")
+        if self.watchdog_task_id and self.hard_timeout_seconds > 120:
+            raise ValueError("watchdog hard_timeout_seconds must be at most 120")
+        return self
 
 
 class ModelConfig(BaseModel):

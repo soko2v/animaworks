@@ -151,6 +151,34 @@ args:
         assert tasks[0].tool == "slack_post"
         assert tasks[0].args == {"channel": "general", "message": "おはようございます"}
 
+    def test_watchdog_budget_and_exact_target(self):
+        content = """\
+## Durable task watchdog
+schedule: */10 * * * *
+type: llm
+hard_timeout_seconds: 120
+watchdog_anima: sofia
+watchdog_task_id: df5043ad93b3
+Inspect only the configured durable task paths.
+"""
+        task = parse_cron_md(content)[0]
+        assert task.hard_timeout_seconds == 120
+        assert task.watchdog_anima == "sofia"
+        assert task.watchdog_task_id == "df5043ad93b3"
+        assert "hard_timeout_seconds" not in task.description
+
+    def test_watchdog_budget_cannot_exceed_two_minutes(self):
+        content = """\
+## Unbounded watchdog
+schedule: */10 * * * *
+hard_timeout_seconds: 121
+watchdog_anima: sofia
+watchdog_task_id: df5043ad93b3
+Check status.
+"""
+        with pytest.raises(ValueError):
+            parse_cron_md(content)
+
 
 class TestParseSchedule:
     """Tests for parse_schedule() with standard cron expressions."""

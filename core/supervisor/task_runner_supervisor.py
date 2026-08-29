@@ -601,7 +601,14 @@ class TaskRunnerSupervisor:
         except asyncio.CancelledError:
             self._terminate_job_group(job)
             if job.process is not None:
-                await job.process.wait()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(job.process.wait()),
+                        timeout=_TASK_RUNNER_TERM_TIMEOUT,
+                    )
+                except TimeoutError:
+                    self._kill_job_group(job)
+                    await job.process.wait()
             raise
         finally:
             if stderr_file is not None:

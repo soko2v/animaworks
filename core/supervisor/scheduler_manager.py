@@ -25,6 +25,8 @@ from apscheduler.triggers.cron import CronTrigger
 from core.config.models import ActivityScheduleEntry, load_config, save_config
 from core.config.resolver import resolve_process_model_config
 from core.i18n import t
+from core.memory.task_queue import TaskQueueManager
+from core.platform.processing_lease import classify_processing_lease
 from core.schedule_parser import parse_cron_md, parse_heartbeat_config, parse_schedule
 from core.schemas import CronTask
 from core.supervisor.task_runner_supervisor import TaskRunnerSupervisor
@@ -484,6 +486,29 @@ class SchedulerManager:
             )
         except Exception:
             logger.debug("Failed to record cron audit event", exc_info=True)
+
+    def _watchdog_stop_suspicion(self, task: CronTask) -> str | None:
+        """Return an authoritative stop reason using only exact bounded paths."""
+        if not task.watchdog_anima or not task.watchdog_task_id:
+            return None
+        target_dir = self._anima_dir.parent / task.watchdog_anima
+        entry = TaskQueueManager(target_dir).get_task_by_id(task.watchdog_task_id)
+        if entry is None:
+            return "task missing from durable queue"
+        if entry.status not in {"pending", "in_progress"}:
+            return None
+
+        pending_dir = target_dir / "state" / "pending"
+        descriptor = pending_dir / f"{task.watchdog_task_id}.json"
+        processing = pending_dir / "processing" / descriptor.name
+        if processing.is_file():
+            lease_state = classify_processing_lease(processing, expected_anima=task.watchdog_anima)
+            if lease_state == "dead":
+                return "unfinished task has no live runner lease"
+            return None
+        if descriptor.is_file() and entry.status == "pending":
+            return None
+        return "unfinished task descriptor is missing"
 
     # ── Cron Guard ───────────────────────────────────────────────
 
@@ -990,121 +1015,113 @@ class SchedulerManager:
             raise
 
     async def _run_cron_task(self, task: CronTask) -> None:
-        """Run a single cron task (LLM or command type)."""
+        """Run a single cron task within its optional hard execution budget."""
         if not self._anima:
             return
         self._cron_running.add(task.name)
         success = False
+        timed_out = False
+        cancelled = False
         usage: dict[str, int] | None = None
+        self._log_cron_event(task, "started")
         try:
-            if self._cron_isolated and self._task_runner_supervisor is not None:
-                isolated = await self._task_runner_supervisor.run_cron(task)
-                success = bool(isolated.get("success"))
-                isolated_usage = isolated.get("usage")
-                usage = isolated_usage if isinstance(isolated_usage, dict) else None
-                result = isolated.get("result")
-                if not isinstance(result, dict):
-                    raise ValueError("isolated cron result must be an object")
-                self._emit_event(
-                    "anima.cron",
-                    {
-                        "name": self._anima_name,
-                        "task": task.name,
-                        "task_type": task.type,
-                        "result": result,
-                    },
-                )
-                return
-            if task.type == "llm":
-                skill_kwargs = {"skills": task.skills} if task.skills else {}
-                result = await self._anima.run_cron_task(task.name, task.description, **skill_kwargs)
-                success = self._cron_result_succeeded(result)
-                usage = self._cron_usage(result)
-                self._emit_event(
-                    "anima.cron",
-                    {
-                        "name": self._anima_name,
-                        "task": task.name,
-                        "task_type": "llm",
-                        "result": result.model_dump(),
-                    },
-                )
-            elif task.type == "command":
-                result = await self._anima.run_cron_command(
-                    task.name,
-                    command=task.command,
-                    tool=task.tool,
-                    args=task.args,
-                )
-                success = result.get("exit_code", 1) == 0
-                self._emit_event(
-                    "anima.cron",
-                    {
-                        "name": self._anima_name,
-                        "task": task.name,
-                        "task_type": "command",
-                        "result": result,
-                    },
-                )
-                # If command produced non-empty output, run a follow-up
-                # cron LLM session so the Anima can review and act on the
-                # results with full background context (heartbeat-equivalent).
-                stdout = result.get("stdout", "").strip()
-                if stdout and result.get("exit_code", 0) == 0:
-                    # trigger_heartbeat=False means no follow-up analysis
-                    if not task.trigger_heartbeat:
-                        logger.info(
-                            "Cron command '%s' trigger_heartbeat=False, skipping cron LLM for %s",
-                            task.name,
-                            self._anima_name,
-                        )
-                        return
-
-                    # skip_pattern: if stdout matches, suppress follow-up
-                    if task.skip_pattern:
-                        try:
-                            if re.search(task.skip_pattern, stdout):
-                                logger.info(
-                                    "Cron command '%s' output matched skip_pattern, suppressing cron LLM for %s",
-                                    task.name,
-                                    self._anima_name,
-                                )
-                                return
-                        except re.error as e:
-                            logger.warning(
-                                "Invalid skip_pattern '%s' for task '%s': %s — continuing without skip",
-                                task.skip_pattern,
-                                task.name,
-                                e,
-                            )
-
-                    logger.info(
-                        "Cron command '%s' produced output, running cron LLM for %s",
-                        task.name,
-                        self._anima_name,
-                    )
-                    followup_result = await self._anima.run_cron_task(
-                        task.name,
-                        task.description or f"cron.mdの「{task.name}」の指示に従って処理してください。",
-                        command_output=stdout,
-                        **({"skills": task.skills} if task.skills else {}),
-                    )
-                    success = success and self._cron_result_succeeded(followup_result)
-                    usage = self._cron_usage(followup_result)
-            else:
-                logger.warning("Unknown cron type '%s' for task '%s'", task.type, task.name)
+            async with asyncio.timeout(task.hard_timeout_seconds):
+                suspicion = await asyncio.to_thread(self._watchdog_stop_suspicion, task)
+                if suspicion:
+                    self._log_cron_event(task, "stop_suspected", suspicion)
+                success, usage = await self._execute_cron_task(task, stop_suspicion=suspicion)
+        except TimeoutError:
+            timed_out = True
+            logger.error(
+                "Cron task hard timeout after %.1fs: %s -> %s",
+                task.hard_timeout_seconds,
+                self._anima_name,
+                task.name,
+            )
         except asyncio.CancelledError:
             current = asyncio.current_task()
             if current is not None and current.cancelling():
+                cancelled = True
                 raise
             logger.warning("Cron task cancelled without scheduler shutdown: %s -> %s", self._anima_name, task.name)
         except Exception:
             logger.exception("Cron task failed: %s -> %s", self._anima_name, task.name)
         finally:
             self._record_cron_result(task.name, success=success, usage=usage)
-            if not success:
+            if timed_out:
+                self._log_cron_event(task, "timeout", f"hard timeout after {task.hard_timeout_seconds:g}s")
+            elif cancelled:
+                self._log_cron_event(task, "cancelled", "scheduler shutdown")
+            elif success:
+                self._log_cron_event(task, "succeeded")
+            else:
                 self._log_cron_event(task, "failed", "execution failed")
             self._cron_running.discard(task.name)
+
+    async def _execute_cron_task(
+        self,
+        task: CronTask,
+        *,
+        stop_suspicion: str | None = None,
+    ) -> tuple[bool, dict[str, int] | None]:
+        """Execute one cron contract; timeout and audit are owned by the caller."""
+        if not self._anima:
+            return False, None
+        description = task.description
+        if stop_suspicion:
+            description = f"STOP_SUSPECTED: {stop_suspicion}\n\n{description}"
+        if self._cron_isolated and self._task_runner_supervisor is not None:
+            isolated_task = task.model_copy(update={"description": description})
+            isolated = await self._task_runner_supervisor.run_cron(isolated_task)
+            isolated_usage = isolated.get("usage")
+            usage = isolated_usage if isinstance(isolated_usage, dict) else None
+            result = isolated.get("result")
+            if not isinstance(result, dict):
+                raise ValueError("isolated cron result must be an object")
+            self._emit_event(
+                "anima.cron",
+                {"name": self._anima_name, "task": task.name, "task_type": task.type, "result": result},
+            )
+            return bool(isolated.get("success")), usage
+
+        if task.type == "llm":
+            skill_kwargs = {"skills": task.skills} if task.skills else {}
+            result = await self._anima.run_cron_task(task.name, description, **skill_kwargs)
+            self._emit_event(
+                "anima.cron",
+                {"name": self._anima_name, "task": task.name, "task_type": "llm", "result": result.model_dump()},
+            )
+            return self._cron_result_succeeded(result), self._cron_usage(result)
+
+        if task.type != "command":
+            raise ValueError(f"unknown cron type: {task.type!r}")
+        result = await self._anima.run_cron_command(
+            task.name,
+            command=task.command,
+            tool=task.tool,
+            args=task.args,
+        )
+        success = result.get("exit_code", 1) == 0
+        self._emit_event(
+            "anima.cron",
+            {"name": self._anima_name, "task": task.name, "task_type": "command", "result": result},
+        )
+        stdout = result.get("stdout", "").strip()
+        if not stdout or not success or not task.trigger_heartbeat:
+            return success, None
+        if task.skip_pattern:
+            try:
+                if re.search(task.skip_pattern, stdout):
+                    return success, None
+            except re.error as exc:
+                logger.warning("Invalid skip_pattern %r for task %r: %s", task.skip_pattern, task.name, exc)
+        followup_result = await self._anima.run_cron_task(
+            task.name,
+            description or f"cron.mdの「{task.name}」の指示に従って処理してください。",
+            command_output=stdout,
+            **({"skills": task.skills} if task.skills else {}),
+        )
+        return success and self._cron_result_succeeded(followup_result), self._cron_usage(followup_result)
 
     async def shutdown_task_runners(self) -> None:
         """Grace and reap isolated task processes before root shutdown."""
@@ -1236,11 +1253,11 @@ class SchedulerManager:
             )
             return True
 
-        for t in new_tasks:
+        for current_task in new_tasks:
             if (
-                t.name == fired_job.name
-                and t.schedule == fired_job.schedule
-                and t.type == fired_job.type
+                current_task.name == fired_job.name
+                and current_task.schedule == fired_job.schedule
+                and current_task.type == fired_job.type
             ):
                 logger.debug(
                     "Freshness: fired job '%s' still present after cron.md reload for %s — running",
