@@ -8,11 +8,13 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.continuous_dispatcher import dispatch_once
 from core.i18n import t
+from core.memory.task_queue import TaskQueueManager
 from core.supervisor.pending_executor import PendingTaskExecutor
 
 
@@ -70,6 +72,171 @@ def _make_lane_executor(tmp_path: Path) -> PendingTaskExecutor:
         anima_dir=anima_dir,
         shutdown_event=asyncio.Event(),
     )
+
+
+def _write_continuous_backlog(anima_dir: Path) -> None:
+    candidates = [
+        {
+            "task_id": task_id,
+            "title": f"Task {task_id}",
+            "description": f"Perform safe work {task_id}",
+            "priority": priority,
+            "enabled": True,
+            "approved_safe": True,
+            "capabilities": ["local_code"],
+        }
+        for priority, task_id in enumerate(("task-a", "task-b"), start=1)
+    ]
+    state_dir = anima_dir / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "continuous_backlog.json").write_text(
+        json.dumps({"candidates": candidates}),
+        encoding="utf-8",
+    )
+
+
+async def _run_claimed_with_status(
+    executor: PendingTaskExecutor,
+    *,
+    status: str,
+    summary: str,
+) -> tuple[Path, TaskQueueManager]:
+    _write_continuous_backlog(executor._anima_dir)
+    pending_dir = executor._anima_dir / "state" / "pending"
+    processing_dir = pending_dir / "processing"
+    failed_dir = pending_dir / "failed"
+    processing_dir.mkdir(parents=True, exist_ok=True)
+    failed_dir.mkdir(exist_ok=True)
+    processing_path = processing_dir / "task-a.json"
+    task_desc = {"task_id": "task-a", "task_type": "llm", "title": "Task task-a"}
+    processing_path.write_text(json.dumps(task_desc), encoding="utf-8")
+
+    queue = TaskQueueManager(executor._anima_dir)
+    queue.add_task(
+        source="anima",
+        original_instruction="Perform task-a",
+        assignee=executor._anima_name,
+        summary="Task task-a",
+        task_id="task-a",
+        status="in_progress",
+    )
+    executor._active_task_ids.add("task-a")
+
+    async def _finish(_task_desc, **_kwargs):
+        queue.update_status("task-a", status, summary=summary)
+
+    executor.execute_pending_task = AsyncMock(side_effect=_finish)
+    await executor._execute_claimed_llm_task(task_desc, processing_path, failed_dir, None)
+    return processing_path, queue
+
+
+class TestContinuousDispatchHandoff:
+    @pytest.mark.asyncio
+    async def test_arbitrary_in_progress_task_does_not_handoff(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        with patch("core.continuous_dispatcher.dispatch_once", wraps=dispatch_once) as handoff:
+            await _run_claimed_with_status(
+                executor,
+                status="in_progress",
+                summary="runner still active",
+            )
+
+        assert handoff.call_count == 0
+        assert not (executor._anima_dir / "state" / "pending" / "task-b.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_completed_task_dispatches_next_immediately_once(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        with patch(
+            "core.continuous_dispatcher.dispatch_once",
+            wraps=dispatch_once,
+        ) as handoff:
+            processing_path, queue = await _run_claimed_with_status(
+                executor,
+                status="done",
+                summary="completed",
+            )
+
+        assert not processing_path.exists()
+        assert handoff.call_count == 1
+        assert (executor._anima_dir / "state" / "pending" / "task-b.json").is_file()
+        assert [entry.task_id for entry in queue.list_tasks(status="pending")] == ["task-b"]
+
+    @pytest.mark.asyncio
+    async def test_blocked_checkpoint_is_preserved_before_next_dispatch(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        checkpoint = "[Waiting] approval checkpoint: reviewed files 1-3"
+        await _run_claimed_with_status(
+            executor,
+            status="blocked",
+            summary=checkpoint,
+        )
+
+        queue = TaskQueueManager(executor._anima_dir)
+        blocked = queue.get_task_by_id("task-a")
+        assert blocked is not None
+        assert blocked.status == "blocked"
+        assert blocked.summary == checkpoint
+        assert (executor._anima_dir / "state" / "pending" / "task-b.json").is_file()
+
+    @pytest.mark.asyncio
+    async def test_waiting_reenqueue_is_preserved_and_dispatches_next_once(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        _write_continuous_backlog(executor._anima_dir)
+        pending_dir = executor._anima_dir / "state" / "pending"
+        processing_dir = pending_dir / "processing"
+        failed_dir = pending_dir / "failed"
+        processing_dir.mkdir(parents=True)
+        failed_dir.mkdir()
+        processing_path = processing_dir / "task-a.json"
+        task_desc = {
+            "task_id": "task-a",
+            "task_type": "llm",
+            "title": "Task task-a",
+            "context": "Original task context",
+        }
+        processing_path.write_text(json.dumps(task_desc), encoding="utf-8")
+
+        queue = TaskQueueManager(executor._anima_dir)
+        queue.add_task(
+            source="anima",
+            original_instruction="Perform task-a",
+            assignee=executor._anima_name,
+            summary="Task task-a",
+            task_id="task-a",
+            status="in_progress",
+        )
+        waiting_descriptor: bytes | None = None
+
+        async def _wait(_task_desc, **_kwargs):
+            nonlocal waiting_descriptor
+            executor._reenqueue_with_checkpoint(
+                task_desc,
+                "Waiting for the external build",
+                [{"tool_name": "ScheduleWakeup", "input_summary": "build status"}],
+                waiting=True,
+            )
+            waiting_descriptor = (pending_dir / "task-a.json").read_bytes()
+
+        executor.execute_pending_task = AsyncMock(side_effect=_wait)
+        with patch(
+            "core.continuous_dispatcher.dispatch_once",
+            wraps=dispatch_once,
+        ) as handoff:
+            await executor._execute_claimed_llm_task(task_desc, processing_path, failed_dir, None)
+
+        waiting_path = pending_dir / "task-a.json"
+        assert waiting_descriptor is not None
+        assert waiting_path.read_bytes() == waiting_descriptor
+        waiting = json.loads(waiting_descriptor)
+        assert waiting["waiting_reenqueue_count"] == 1
+        assert any(line.strip().endswith(": waiting") for line in waiting["context"].splitlines())
+        waiting_entry = queue.get_task_by_id("task-a")
+        assert waiting_entry is not None
+        assert waiting_entry.status == "in_progress"
+        assert handoff.call_count == 1
+        assert (pending_dir / "task-b.json").is_file()
+        assert [entry.task_id for entry in queue.list_tasks(status="pending")] == ["task-b"]
 
 
 class TestPendingTaskExecutorInit:

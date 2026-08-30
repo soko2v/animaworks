@@ -776,6 +776,39 @@ class PendingTaskExecutor:
             )
             return None
 
+    async def _handoff_continuous_dispatch_once(self, task_id: str) -> None:
+        """Run one fail-closed backlog handoff after a task leaves processing."""
+        entry = self._get_task_queue_entry(task_id)
+        if entry is None:
+            return
+
+        from core.continuous_dispatcher import _is_dormant_waiting_reenqueue, dispatch_once
+        from core.memory.task_queue import TaskQueueManager
+
+        if entry.status == "in_progress":
+            queue = TaskQueueManager(self._anima_dir)
+            if not _is_dormant_waiting_reenqueue(self._anima_dir, queue, task_id):
+                return
+        elif entry.status not in _QUEUE_TERMINAL_STATUSES | {"blocked"}:
+            return
+
+        try:
+            result = await asyncio.to_thread(dispatch_once, self._anima_dir)
+        except Exception:
+            logger.exception(
+                "[%s] Immediate continuous dispatch handoff failed after task %s",
+                self._anima_name,
+                task_id,
+            )
+            return
+        logger.info(
+            "[%s] Immediate continuous dispatch handoff after task %s: status=%s next=%s",
+            self._anima_name,
+            task_id,
+            result.status,
+            result.task_id,
+        )
+
     def _recovery_scan_interval_seconds(self) -> float:
         """Return the configured blocked/orphan recovery scan interval."""
         try:
@@ -1428,6 +1461,8 @@ class PendingTaskExecutor:
                 and active.get(worker_slot.slot_id) == task_desc.get("task_id")
             ):
                 await self._release_worker(worker_slot)
+            if not self._shutdown_event.is_set() and not processing_path.exists():
+                await self._handoff_continuous_dispatch_once(task_id)
 
     async def _execute_claimed_batch(
         self,

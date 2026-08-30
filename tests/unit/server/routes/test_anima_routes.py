@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from httpx import ASGITransport, AsyncClient
-
 
 # ── Helper ───────────────────────────────────────────────
 
@@ -18,6 +19,7 @@ def _create_app(
     anima_names: list[str] | None = None,
     processes: dict | None = None,
     process_status: dict | None = None,
+    authenticated_username: str | None = None,
 ):
     """Build a minimal FastAPI app with the animas router and mocked supervisor.
 
@@ -35,6 +37,14 @@ def _create_app(
     from server.routes.animas import create_animas_router
 
     app = FastAPI()
+
+    if authenticated_username is not None:
+
+        @app.middleware("http")
+        async def _set_authenticated_user(request, call_next):
+            request.state.user = SimpleNamespace(username=authenticated_username)
+            return await call_next(request)
+
     app.state.animas_dir = Path("/tmp/fake/animas")
     app.state.anima_names = anima_names or []
 
@@ -148,3 +158,30 @@ class TestRestartAnima:
 
         assert resp.status_code == 404
         assert "Anima not found" in resp.json()["detail"]
+
+    async def test_restart_requester_is_logged_without_sensitive_values(self, caplog) -> None:
+        app = _create_app(
+            anima_names=["bob"],
+            processes={"bob": MagicMock()},
+            authenticated_username="private.user@example.test",
+        )
+        transport = ASGITransport(app=app)
+        with caplog.at_level(logging.INFO, logger="animaworks.routes.animas"):
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    "/api/animas/bob/restart",
+                    headers={
+                        "Authorization": "Bearer audit-secret-token",
+                        "Cookie": "session_token=audit-secret-cookie",
+                        "X-Forwarded-User": "header.user@example.test",
+                    },
+                )
+
+        assert resp.status_code == 200
+        audit_messages = [record.getMessage() for record in caplog.records if "restart requested" in record.getMessage()]
+        assert audit_messages == ["Anima restart requested: anima=bob requester=authenticated_user"]
+        combined = " ".join(audit_messages)
+        assert "private.user@example.test" not in combined
+        assert "audit-secret-token" not in combined
+        assert "audit-secret-cookie" not in combined
+        assert "header.user@example.test" not in combined

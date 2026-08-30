@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from core.continuous_dispatcher import DispatchResult, _exclusive_lock, dispatch_once
@@ -36,7 +38,7 @@ def test_dispatches_one_candidate_once(tmp_path: Path) -> None:
     assert first == DispatchResult("dispatched", "task-b", "one safe candidate published")
     assert (anima_dir / "state" / "pending" / "task-b.json").is_file()
     second = dispatch_once(anima_dir)
-    assert second.status == "idle"
+    assert second.status == "no_op"
     assert len(TaskQueueManager(anima_dir).list_tasks()) == 1
 
 
@@ -54,6 +56,13 @@ def test_processing_descriptor_is_no_op(tmp_path: Path) -> None:
     assert dispatch_once(anima_dir).status == "no_op"
 
 
+def test_pending_descriptor_is_no_op(tmp_path: Path) -> None:
+    anima_dir = _setup(tmp_path, [_candidate("task-b")])
+    (anima_dir / "state" / "pending" / "task-a.json").write_text("{}", encoding="utf-8")
+    assert dispatch_once(anima_dir).status == "no_op"
+    assert not (anima_dir / "state" / "pending" / "task-b.json").exists()
+
+
 def test_blocked_and_waiting_candidate_skipped_for_next(tmp_path: Path) -> None:
     anima_dir = _setup(tmp_path, [_candidate("task-a", 1), _candidate("task-b", 2)])
     queue = TaskQueueManager(anima_dir)
@@ -62,6 +71,10 @@ def test_blocked_and_waiting_candidate_skipped_for_next(tmp_path: Path) -> None:
     result = dispatch_once(anima_dir)
     assert result.task_id == "task-b"
     assert len(list((anima_dir / "state" / "pending").glob("task-b.json"))) == 1
+    blocked = queue.get_task_by_id("task-a")
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    assert blocked.summary == "[Waiting] credential"
 
 
 def test_descriptor_loss_is_restored_without_duplicate_queue_entry(tmp_path: Path) -> None:
@@ -90,6 +103,22 @@ def test_single_exclusive_lock(tmp_path: Path) -> None:
     with _exclusive_lock(lock) as acquired:
         assert acquired
         assert dispatch_once(anima_dir).reason == "dispatcher lock is held"
+
+
+def test_concurrent_handoffs_publish_no_duplicates(tmp_path: Path) -> None:
+    anima_dir = _setup(tmp_path, [_candidate("task-a", 1), _candidate("task-b", 2)])
+    barrier = threading.Barrier(2)
+
+    def _dispatch() -> DispatchResult:
+        barrier.wait(timeout=2)
+        return dispatch_once(anima_dir)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: _dispatch(), range(2)))
+
+    assert sum(result.status == "dispatched" for result in results) == 1
+    assert len(list((anima_dir / "state" / "pending").glob("*.json"))) == 1
+    assert len(TaskQueueManager(anima_dir).list_tasks()) == 1
 
 
 def test_completed_candidate_skipped_for_next(tmp_path: Path) -> None:

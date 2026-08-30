@@ -588,6 +588,9 @@ def create_animas_router() -> APIRouter:
         if name not in anima_names:
             raise HTTPException(status_code=404, detail=f"Anima not found: {name}")
 
+        user = getattr(request.state, "user", None)
+        requester = "authenticated_user" if getattr(user, "username", None) else "local_or_internal"
+        logger.info("Anima restart requested: anima=%s requester=%s", name, requester)
         await supervisor.restart_anima(name)
         proc_status = supervisor.get_process_status(name)
         return {

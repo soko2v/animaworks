@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import Iterator
@@ -87,11 +88,57 @@ def _record_state(anima_dir: Path, result: DispatchResult, *, error_count: int =
     )
 
 
-def _active_runner_exists(anima_dir: Path, queue: TaskQueueManager) -> bool:
-    processing = anima_dir / "state" / "pending" / "processing"
+def _is_dormant_waiting_reenqueue(
+    anima_dir: Path,
+    queue: TaskQueueManager,
+    task_id: str | None,
+) -> bool:
+    """Return whether task_id is a safely identifiable deferred Waiting task."""
+    if not task_id:
+        return False
+    entry = queue.get_task_by_id(task_id)
+    if (
+        entry is None
+        or entry.status != "in_progress"
+        or entry.summary != "background work waiting; automatic recheck scheduled"
+    ):
+        return False
+    descriptor_path = anima_dir / "state" / "pending" / f"{task_id}.json"
+    try:
+        descriptor = _read_json(descriptor_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    waiting_count = descriptor.get("waiting_reenqueue_count")
+    not_before = descriptor.get("continuation_not_before")
+    context = descriptor.get("context")
+    return (
+        descriptor.get("task_id") == task_id
+        and isinstance(waiting_count, int)
+        and not isinstance(waiting_count, bool)
+        and waiting_count > 0
+        and isinstance(not_before, (int, float))
+        and not isinstance(not_before, bool)
+        and math.isfinite(not_before)
+        and not_before > time.time()
+        and isinstance(context, str)
+        and any(line.strip().endswith(": waiting") for line in context.splitlines())
+    )
+
+
+def _active_runner_exists(
+    anima_dir: Path,
+    queue: TaskQueueManager,
+) -> bool:
+    pending = anima_dir / "state" / "pending"
+    processing = pending / "processing"
     if any(processing.glob("*.json")):
         return True
-    return bool(queue.list_tasks(status="in_progress"))
+    dormant_waiting: set[str] = set()
+    for path in pending.glob("*.json"):
+        if not _is_dormant_waiting_reenqueue(anima_dir, queue, path.stem):
+            return True
+        dormant_waiting.add(path.stem)
+    return any(entry.task_id not in dormant_waiting for entry in queue.list_tasks(status="in_progress"))
 
 
 def _eligible(candidate: dict[str, Any]) -> bool:
@@ -110,7 +157,11 @@ def _priority(candidate: dict[str, Any]) -> tuple[int, str]:
     return rank, str(candidate.get("task_id", ""))
 
 
-def dispatch_once(anima_dir: Path, *, config_path: Path | None = None) -> DispatchResult:
+def dispatch_once(
+    anima_dir: Path,
+    *,
+    config_path: Path | None = None,
+) -> DispatchResult:
     """Select and publish at most one safe candidate using bounded explicit inputs."""
     started = time.monotonic()
     config_file = config_path or anima_dir / "state" / "continuous_backlog.json"
@@ -127,7 +178,7 @@ def dispatch_once(anima_dir: Path, *, config_path: Path | None = None) -> Dispat
         candidates = candidates[:MAX_CANDIDATES]
         queue = TaskQueueManager(anima_dir)
         if _active_runner_exists(anima_dir, queue):
-            return DispatchResult("no_op", reason="an in_progress or processing runner exists")
+            return DispatchResult("no_op", reason="a pending, in_progress, or processing runner exists")
 
         entries = {
             entry.task_id: entry

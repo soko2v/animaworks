@@ -64,12 +64,20 @@ def _handle_resume(
         stream.complete,
         stream.event_count,
     )
+    terminal_at_resume = stream.complete
 
     async def _replay_events():
         current_seq = after_seq
         replay_count = 0
         for event in stream.events_after(after_seq):
-            yield format_sse_with_id(event.event, event.payload, event.event_id)
+            if terminal_at_resume and event.event == "error":
+                yield format_sse_with_id(
+                    "history",
+                    {"event": event.event, "payload": event.payload},
+                    event.event_id,
+                )
+            else:
+                yield format_sse_with_id(event.event, event.payload, event.event_id)
             current_seq = event.seq
             replay_count += 1
 
