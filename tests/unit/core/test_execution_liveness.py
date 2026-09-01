@@ -4,6 +4,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from core.execution_liveness import LivenessResult, reconcile_execution_once
 from core.goals import GoalManager
 from core.memory.task_queue import TaskQueueManager
@@ -115,6 +117,16 @@ def test_in_progress_without_execution_or_progress_recovers_only_once(tmp_path: 
     (anima_dir / "state" / "pending" / "docvault-review.json").unlink()
     result = reconcile_execution_once(anima_dir, now=NOW + timedelta(minutes=20))
     assert result.status == "recovery_exhausted"
+    assert not (anima_dir / "state" / "pending" / "docvault-review.json").exists()
+
+
+def test_corrupt_attempt_state_fails_closed_instead_of_recovering_again(tmp_path: Path) -> None:
+    anima_dir = _setup(tmp_path, _phase())
+    assert reconcile_execution_once(anima_dir, now=NOW).status == "recovered"
+    (anima_dir / "state" / "pending" / "docvault-review.json").unlink()
+    (anima_dir / "state" / "execution_liveness_state.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        reconcile_execution_once(anima_dir, now=NOW + timedelta(minutes=20))
     assert not (anima_dir / "state" / "pending" / "docvault-review.json").exists()
 
 

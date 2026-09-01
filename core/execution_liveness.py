@@ -122,12 +122,11 @@ def _external_runner_live(phase: dict[str, Any], probe: Callable[[int], str | No
 
 
 def _load_attempts(path: Path) -> dict[str, Any]:
-    try:
-        value = _read_json(path)
-    except (OSError, ValueError, json.JSONDecodeError):
+    if not path.exists():
         return {"tasks": {}}
+    value = _read_json(path)
     if not isinstance(value.get("tasks"), dict):
-        return {"tasks": {}}
+        raise ValueError("execution liveness state must contain a tasks object")
     return value
 
 
