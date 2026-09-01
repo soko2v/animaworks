@@ -162,6 +162,13 @@ class TestContinuousDispatchHandoff:
         assert (executor._anima_dir / "state" / "pending" / "task-b.json").is_file()
         assert [entry.task_id for entry in queue.list_tasks(status="pending")] == ["task-b"]
 
+    def test_periodic_recovery_invokes_execution_liveness(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        with patch("core.execution_liveness.reconcile_execution_once") as reconcile:
+            executor._recover_blocked_and_orphaned_tasks()
+
+        reconcile.assert_called_once_with(executor._anima_dir)
+
     @pytest.mark.asyncio
     async def test_blocked_checkpoint_is_preserved_before_next_dispatch(self, tmp_path):
         executor = _make_executor(tmp_path)

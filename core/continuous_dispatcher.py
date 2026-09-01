@@ -177,6 +177,22 @@ def dispatch_once(
             raise ValueError("candidates must be a list")
         candidates = candidates[:MAX_CANDIDATES]
         queue = TaskQueueManager(anima_dir)
+        # Reconcile durable, explicitly declared execution phases before
+        # selecting unrelated backlog work.  The import is local to avoid a
+        # module cycle: execution_liveness reuses this module's bounds/lock.
+        from core.execution_liveness import reconcile_execution_once
+
+        liveness = reconcile_execution_once(anima_dir)
+        if liveness.status in {
+            "recovered",
+            "runner_live",
+            "external_runner_live",
+            "scheduled",
+            "awaiting_progress",
+            "progress_verified",
+            "cooldown",
+        }:
+            return DispatchResult("no_op", liveness.task_id, f"execution liveness: {liveness.status}")
         if _active_runner_exists(anima_dir, queue):
             return DispatchResult("no_op", reason="a pending, in_progress, or processing runner exists")
 

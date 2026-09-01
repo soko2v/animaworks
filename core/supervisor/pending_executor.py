@@ -823,8 +823,18 @@ class PendingTaskExecutor:
     def _recover_blocked_and_orphaned_tasks(self) -> None:
         """Revalidate blocked tasks and restore missing pending descriptors."""
         from core.blocked_recovery import regenerate_pending_json, revalidate_blocked_tasks
+        from core.execution_liveness import reconcile_execution_once
         from core.memory.activity import ActivityLogger
         from core.memory.task_queue import TaskQueueManager
+
+        try:
+            reconcile_execution_once(self._anima_dir)
+        except Exception:
+            logger.warning(
+                "[%s] Execution-liveness reconciliation failed",
+                self._anima_name,
+                exc_info=True,
+            )
 
         try:
             revalidate_blocked_tasks(self._anima_dir, self._anima_name)
