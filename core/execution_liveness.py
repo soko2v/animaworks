@@ -100,10 +100,11 @@ def _progressed(before: dict[str, Any], after: dict[str, Any]) -> bool:
             continue
         if old is None:
             return True
-        if key == "progress_path" and old.get("count") is not None and new.get("count") is not None:
-            if new["count"] > old["count"]:
+        if key == "progress_path":
+            if old.get("count") is not None and new.get("count") is not None and new["count"] > old["count"]:
                 return True
-        if new.get("sha256") != old.get("sha256") or new.get("mtime_ns") > old.get("mtime_ns", 0):
+            continue
+        if new.get("sha256") != old.get("sha256"):
             return True
     return False
 
@@ -149,6 +150,29 @@ def _eligible_phase(phase: dict[str, Any]) -> bool:
         and isinstance(phase.get("description"), str)
         and bool(phase["description"].strip())
     )
+
+
+def _invalid_phase_reason(anima_dir: Path, phase: dict[str, Any]) -> str | None:
+    """Return why an otherwise eligible phase cannot be reconciled safely."""
+    if "start_at" in phase and _parse_datetime(phase.get("start_at")) is None:
+        return "start_at must be a valid ISO-8601 timestamp"
+    if not any(_safe_relative_path(anima_dir, phase.get(key)) is not None for key in ("checkpoint_path", "progress_path")):
+        return "a safe checkpoint_path or progress_path is required"
+    external = phase.get("external_runner")
+    if external is not None:
+        if not isinstance(external, dict):
+            return "external_runner must be an object"
+        pid = external.get("pid")
+        marker = external.get("command_contains")
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 1
+            or not isinstance(marker, str)
+            or not marker.strip()
+        ):
+            return "external_runner requires a valid pid and command marker"
+    return None
 
 
 def _recover(anima_dir: Path, queue: TaskQueueManager, phase: dict[str, Any]) -> None:
@@ -223,6 +247,9 @@ def reconcile_execution_once(
             goal = goals.get_goal(str(phase["goal_id"]))
             if goal is None or goal.status != "active":
                 continue
+            invalid_reason = _invalid_phase_reason(anima_dir, phase)
+            if invalid_reason is not None:
+                return LivenessResult("invalid_config", task_id, invalid_reason)
             capabilities = phase.get("capabilities", [])
             if not isinstance(capabilities, list) or any(str(item) in DENIED_CAPABILITIES for item in capabilities):
                 return LivenessResult("approval_boundary", task_id, "phase requires explicit approval")

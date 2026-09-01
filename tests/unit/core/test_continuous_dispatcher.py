@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from core.continuous_dispatcher import DispatchResult, _exclusive_lock, dispatch_once
+from core.goals import GoalManager
 from core.memory.task_queue import TaskQueueManager
 
 
@@ -127,3 +129,31 @@ def test_completed_candidate_skipped_for_next(tmp_path: Path) -> None:
     queue.add_task(source="anima", original_instruction="A", assignee="sofia", summary="A", task_id="task-a")
     queue.update_status("task-a", "done")
     assert dispatch_once(anima_dir).task_id == "task-b"
+
+
+def test_future_liveness_phase_does_not_block_due_safe_backlog(tmp_path: Path) -> None:
+    anima_dir = _setup(tmp_path, [_candidate("task-b")])
+    GoalManager(anima_dir).set_goal(
+        goal_id="future-goal",
+        objective="Run a later phase",
+        success_criteria=["phase completes"],
+    )
+    (anima_dir / "state" / "execution_liveness.json").write_text(
+        json.dumps(
+            {
+                "phases": [
+                    {
+                        "goal_id": "future-goal",
+                        "task_id": "future-task",
+                        "description": "Run later",
+                        "approved_safe": True,
+                        "capabilities": ["local_code"],
+                        "checkpoint_path": "state/future.checkpoint",
+                        "start_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert dispatch_once(anima_dir) == DispatchResult("dispatched", "task-b", "one safe candidate published")

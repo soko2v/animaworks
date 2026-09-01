@@ -187,10 +187,10 @@ def dispatch_once(
             "recovered",
             "runner_live",
             "external_runner_live",
-            "scheduled",
             "awaiting_progress",
             "progress_verified",
             "cooldown",
+            "invalid_config",
         }:
             return DispatchResult("no_op", liveness.task_id, f"execution liveness: {liveness.status}")
         if _active_runner_exists(anima_dir, queue):

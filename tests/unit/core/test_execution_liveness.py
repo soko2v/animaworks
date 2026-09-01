@@ -128,6 +128,25 @@ def test_scheduled_phase_waits_until_start_time(tmp_path: Path) -> None:
     assert due.status == "recovered"
 
 
+def test_invalid_schedule_and_external_probe_fail_closed(tmp_path: Path) -> None:
+    invalid_schedule = _setup(tmp_path / "schedule", _phase(start_at="tomorrow morning"))
+    assert reconcile_execution_once(invalid_schedule, now=NOW).status == "invalid_config"
+    assert not (invalid_schedule / "state" / "pending" / "docvault-review.json").exists()
+
+    invalid_runner = _setup(tmp_path / "runner", _phase(external_runner={"pid": "4242"}))
+    assert reconcile_execution_once(invalid_runner, now=NOW).status == "invalid_config"
+    assert not (invalid_runner / "state" / "pending" / "docvault-review.json").exists()
+
+
+def test_touching_progress_file_without_count_increase_is_not_progress(tmp_path: Path) -> None:
+    anima_dir = _setup(tmp_path, _phase())
+    progress = anima_dir / "state" / "docvault.count"
+    progress.write_text("41", encoding="utf-8")
+    assert reconcile_execution_once(anima_dir, now=NOW).status == "recovered"
+    progress.write_text("40", encoding="utf-8")
+    assert reconcile_execution_once(anima_dir, now=NOW + timedelta(minutes=1)).status == "awaiting_progress"
+
+
 def test_explicit_blocker_and_approval_boundary_are_not_recovered(tmp_path: Path) -> None:
     blocked = _setup(tmp_path / "blocked", _phase(blocker="waiting for operator"))
     assert reconcile_execution_once(blocked, now=NOW).status == "blocked"
