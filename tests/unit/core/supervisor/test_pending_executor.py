@@ -169,6 +169,36 @@ class TestContinuousDispatchHandoff:
 
         reconcile.assert_called_once_with(executor._anima_dir)
 
+    def test_generic_orphan_recovery_does_not_bypass_liveness_one_shot(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        queue = TaskQueueManager(executor._anima_dir)
+        queue.add_task(
+            source="anima",
+            original_instruction="resume review",
+            assignee=executor._anima_name,
+            summary="review",
+            task_id="guarded-task",
+            status="in_progress",
+        )
+        (executor._anima_dir / "state" / "execution_liveness.json").write_text(
+            json.dumps(
+                {
+                    "phases": [
+                        {
+                            "goal_id": "missing-goal",
+                            "task_id": "guarded-task",
+                            "description": "resume review",
+                            "approved_safe": True,
+                            "checkpoint_path": "state/review.checkpoint",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        executor._recover_blocked_and_orphaned_tasks()
+        assert not (executor._anima_dir / "state" / "pending" / "guarded-task.json").exists()
+
     @pytest.mark.asyncio
     async def test_blocked_checkpoint_is_preserved_before_next_dispatch(self, tmp_path):
         executor = _make_executor(tmp_path)

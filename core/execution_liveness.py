@@ -151,6 +151,21 @@ def _eligible_phase(phase: dict[str, Any]) -> bool:
     )
 
 
+def declared_task_ids(anima_dir: Path, *, config_path: Path | None = None) -> set[str]:
+    """Return stable task IDs governed by execution-liveness policy."""
+    config_file = config_path or anima_dir / "state" / "execution_liveness.json"
+    if not config_file.is_file():
+        return set()
+    phases = _read_json(config_file).get("phases", [])
+    if not isinstance(phases, list):
+        raise ValueError("phases must be a list")
+    return {
+        str(phase["task_id"])
+        for phase in phases[:MAX_PHASES]
+        if isinstance(phase, dict) and _eligible_phase(phase)
+    }
+
+
 def _invalid_phase_reason(anima_dir: Path, phase: dict[str, Any]) -> str | None:
     """Return why an otherwise eligible phase cannot be reconciled safely."""
     if "start_at" in phase and _parse_datetime(phase.get("start_at")) is None:

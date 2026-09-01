@@ -823,13 +823,17 @@ class PendingTaskExecutor:
     def _recover_blocked_and_orphaned_tasks(self) -> None:
         """Revalidate blocked tasks and restore missing pending descriptors."""
         from core.blocked_recovery import regenerate_pending_json, revalidate_blocked_tasks
-        from core.execution_liveness import reconcile_execution_once
+        from core.execution_liveness import declared_task_ids, reconcile_execution_once
         from core.memory.activity import ActivityLogger
         from core.memory.task_queue import TaskQueueManager
 
+        liveness_guard_unavailable = False
+        liveness_task_ids: set[str] = set()
         try:
+            liveness_task_ids = declared_task_ids(self._anima_dir)
             reconcile_execution_once(self._anima_dir)
         except Exception:
+            liveness_guard_unavailable = True
             logger.warning(
                 "[%s] Execution-liveness reconciliation failed",
                 self._anima_name,
@@ -844,6 +848,9 @@ class PendingTaskExecutor:
                 self._anima_name,
                 exc_info=True,
             )
+
+        if liveness_guard_unavailable:
+            return
 
         pending_dir = self._anima_dir / "state" / "pending"
         processing_dir = pending_dir / "processing"
@@ -869,6 +876,8 @@ class PendingTaskExecutor:
             return
 
         for entry in entries:
+            if entry.task_id in liveness_task_ids:
+                continue
             meta = entry.meta if isinstance(entry.meta, dict) else {}
             if entry.status == "delegated" or meta.get("delegated_to") or meta.get("delegated_task_id"):
                 continue

@@ -191,6 +191,7 @@ def dispatch_once(
             "progress_verified",
             "cooldown",
             "invalid_config",
+            "no_op",
         }:
             return DispatchResult("no_op", liveness.task_id, f"execution liveness: {liveness.status}")
         if _active_runner_exists(anima_dir, queue):
