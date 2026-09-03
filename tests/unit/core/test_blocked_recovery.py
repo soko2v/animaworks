@@ -212,9 +212,11 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     proc.pid = 4242
     proc.wait.side_effect = [subprocess.TimeoutExpired("sh", 60), -9]
 
+    # Pass 1 sees two descendants; pass 2 sees one more forked meanwhile; pass 3 is stable.
+    snapshots = [[4300, 4301], [4300, 4301, 4302], [4300, 4301, 4302]]
     with (
         patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen,
-        patch("core.blocked_recovery._descendant_pids", return_value=[4300, 4301]) as descendants,
+        patch("core.blocked_recovery._descendant_pids", side_effect=snapshots) as descendants,
         patch("core.blocked_recovery.os.kill") as kill,
         patch("core.blocked_recovery.os.killpg") as killpg,
         pytest.raises(subprocess.TimeoutExpired),
@@ -227,14 +229,46 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     assert kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["env"] == {}
-    descendants.assert_called_once_with(4242)
+    assert descendants.call_count == 3
+    stop, kill_sig = blocked_recovery.signal.SIGSTOP, blocked_recovery.signal.SIGKILL
     assert [c.args for c in kill.call_args_list] == [
-        (4300, blocked_recovery.signal.SIGKILL),
-        (4301, blocked_recovery.signal.SIGKILL),
+        (4300, stop),
+        (4301, stop),
+        (4302, stop),
+        (4300, kill_sig),
+        (4301, kill_sig),
+        (4302, kill_sig),
     ]
-    killpg.assert_called_once_with(4242, blocked_recovery.signal.SIGKILL)
+    assert [c.args for c in killpg.call_args_list] == [(4242, stop), (4242, kill_sig)]
     proc.kill.assert_called_once_with()
     assert proc.wait.call_count == 2
+
+
+def test_kill_tree_freezes_root_group_before_first_snapshot() -> None:
+    proc = Mock()
+    proc.pid = 77
+    order: list[str] = []
+    with (
+        patch("core.blocked_recovery._descendant_pids", side_effect=lambda _pid: order.append("snapshot") or []),
+        patch("core.blocked_recovery.os.killpg", side_effect=lambda _pid, sig: order.append(f"killpg:{int(sig)}")),
+    ):
+        blocked_recovery._kill_tree(proc)
+    stop, kill_sig = int(blocked_recovery.signal.SIGSTOP), int(blocked_recovery.signal.SIGKILL)
+    assert order == [f"killpg:{stop}", "snapshot", f"killpg:{kill_sig}"]
+
+
+def test_kill_tree_pass_limit_bounds_a_runaway_forker() -> None:
+    proc = Mock()
+    proc.pid = 1
+    counter = iter(range(10, 10_000))
+    with (
+        patch("core.blocked_recovery._descendant_pids", side_effect=lambda _pid: [next(counter)]) as descendants,
+        patch("core.blocked_recovery.os.kill"),
+        patch("core.blocked_recovery.os.killpg") as killpg,
+    ):
+        blocked_recovery._kill_tree(proc)
+    assert descendants.call_count == blocked_recovery._KILL_TREE_MAX_PASSES
+    assert killpg.call_count == 2
 
 
 def test_descendant_pids_walks_ps_tree() -> None:
@@ -253,6 +287,55 @@ def test_descendant_pids_returns_empty_when_ps_unavailable() -> None:
         assert blocked_recovery._descendant_pids(1) == []
 
 
+def _live_survivors(marker: str) -> list[str]:
+    """PIDs whose argv contains ``marker`` and that are not zombies (killed but not yet reaped)."""
+    import time
+
+    for _ in range(40):  # up to ~2s for PID 1 to reap zombies of killed parents
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,stat=,command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            text=True,
+        ).stdout
+        live = [
+            line.split()[0]
+            for line in listing.splitlines()
+            if marker in line and "python" in line and not line.split()[1].startswith("Z")
+        ]
+        zombies = [line for line in listing.splitlines() if marker in line and line.split()[1].startswith("Z")]
+        if not zombies:
+            return live
+        time.sleep(0.05)
+    return live
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_real_timeout_kills_continuously_forking_setsid_escapees() -> None:
+    """Integration: a parent that keeps forking setsid() children during cleanup leaves no survivor."""
+    marker = f"aw_unblock_forker_{os.getpid()}"
+    forker = (
+        "import os, time\n"
+        "while True:\n"
+        "    pid = os.fork()\n"
+        "    if pid == 0:\n"
+        "        os.setsid(); time.sleep(120); os._exit(0)\n"
+        "    time.sleep(0.005)\n"
+        f"# {marker}"
+    )
+    argv = ["/bin/sh", "-c", f"exec python3 -c '{forker}'"]
+    with pytest.raises(subprocess.TimeoutExpired):
+        blocked_recovery._run_sandboxed(argv, cwd=Path("/"), env={"PATH": os.environ.get("PATH", "")}, timeout=1)
+    survivors = _live_survivors(marker)
+    for pid in survivors:
+        try:
+            os.kill(int(pid), blocked_recovery.signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+    assert survivors == []
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 def test_real_timeout_kills_setsid_escapee() -> None:
     """Integration: a descendant that setsid()s out of the group must not survive the timeout."""
@@ -261,9 +344,7 @@ def test_real_timeout_kills_setsid_escapee() -> None:
     argv = ["/bin/sh", "-c", f"python3 -c '{escapee}' & sleep 120"]
     with pytest.raises(subprocess.TimeoutExpired):
         blocked_recovery._run_sandboxed(argv, cwd=Path("/"), env={"PATH": os.environ.get("PATH", "")}, timeout=2)
-    survivors = subprocess.run(
-        ["pgrep", "-f", marker], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, text=True
-    ).stdout.split()
+    survivors = _live_survivors(marker)
     for pid in survivors:  # never leave a stray sleeper behind even if the assertion fails
         try:
             os.kill(int(pid), blocked_recovery.signal.SIGKILL)

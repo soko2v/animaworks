@@ -233,9 +233,41 @@ def _descendant_pids(root_pid: int) -> list[int]:
     return found
 
 
+# Upper bound on freeze passes; each pass stops every newly seen descendant so
+# a stopped parent cannot fork again, and the tree converges quickly.
+_KILL_TREE_MAX_PASSES = 8
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """SIGKILL every descendant of ``proc`` (tree walk first), then its process group."""
-    for pid in _descendant_pids(proc.pid):
+    """Freeze, then SIGKILL, the whole descendant tree of ``proc`` and its process group.
+
+    A single ``ps`` snapshot is racy: a descendant may fork a child that
+    ``setsid()``s between the snapshot and the kill. So the root's process
+    group is SIGSTOPped first, then descendants that already left the group
+    are SIGSTOPped pass by pass (a stopped process cannot fork) until a pass
+    finds nothing new, and only then is everything SIGKILLed. Fully detached
+    double-fork daemons (already reparented to PID 1 before the timeout) remain
+    out of reach; that is the documented accepted residual.
+    """
+    # Freeze the root and everything still in its session first: the root is
+    # not part of its own descendant list, and an unfrozen root could keep
+    # forking new sessions between the last snapshot and the kill.
+    try:
+        os.killpg(proc.pid, signal.SIGSTOP)
+    except (ProcessLookupError, PermissionError):
+        pass
+    frozen: list[int] = []
+    for _ in range(_KILL_TREE_MAX_PASSES):
+        new_pids = [pid for pid in _descendant_pids(proc.pid) if pid not in frozen]
+        if not new_pids:
+            break
+        for pid in new_pids:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except (ProcessLookupError, PermissionError):
+                continue
+            frozen.append(pid)
+    for pid in frozen:
         try:
             os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
