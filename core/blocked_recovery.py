@@ -268,6 +268,22 @@ def _descendant_pids(root_pid: int) -> list[int]:
     return found
 
 
+def _process_group_pids(group_id: int) -> list[int]:
+    """Return live PIDs in a process group without trusting a dead group leader."""
+    pids: list[int] = []
+    for line in _ps_lines(["-axo", "pid=,pgid="]):
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, pgid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if pgid == group_id and pid != group_id:
+            pids.append(pid)
+    return pids
+
+
 def _marker_pids(marker: str) -> tuple[list[int], bool]:
     """Return ``(pids, complete)`` for live (non-zombie) processes whose environment carries ``marker``.
 
@@ -382,12 +398,19 @@ def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
 
 
 def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int, marker: str) -> int:
-    """Run ``argv`` with suppressed output and return its exit code.
+    """Run ``argv`` with suppressed output and return a fail-closed result.
 
     ``env`` must carry ``marker`` under ``_CHECK_MARKER_ENV``. The child is
     started in its own session; on timeout ``_kill_tree`` freezes and kills
     the whole tree (see there). Raises ``OSError`` when the sandbox binary
     cannot be started and ``subprocess.TimeoutExpired`` on timeout.
+
+    A check that emits stderr is never accepted as successful, even when its
+    shell syntax negates a failed command and therefore returns zero. stderr is
+    sampled non-blockingly after normal exit. A still-open pipe proves a child
+    retained it, so the process group and inherited marker are swept before
+    failing closed; any unavailable inspection also fails closed without
+    unbounded waiting or parent-memory accumulation.
     """
     proc = subprocess.Popen(
         argv,
@@ -395,15 +418,58 @@ def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: 
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    stderr = proc.stderr
     try:
-        return proc.wait(timeout=timeout)
+        returncode = proc.wait(timeout=timeout)
+        if returncode != 0:
+            return returncode
+        if stderr is None:
+            return 1
+        stderr_seen = False
+        stderr_inspectable = True
+        stderr_open = False
+        try:
+            os.set_blocking(stderr.fileno(), False)
+            if os.read(stderr.fileno(), 1):
+                stderr_seen = True
+        except BlockingIOError:
+            stderr_open = True
+        except (OSError, ValueError):
+            stderr_inspectable = False
+        if stderr_open:
+            group_pids: list[int] = []
+            marked: list[int] = []
+            group_ok = True
+            marker_ok = True
+            try:
+                group_pids = _process_group_pids(proc.pid)
+            except _ProcessListingUnavailable:
+                group_ok = False
+            try:
+                marked, marker_ok = _marker_pids(marker)
+            except _ProcessListingUnavailable:
+                marker_ok = False
+            strays = list(dict.fromkeys([*group_pids, *marked]))
+            if strays:
+                _signal_all(strays, signal.SIGKILL)
+            logger.warning(
+                "unblock_check completed with open stderr pipe; rejecting: group_ok=%s marker_ok=%s stray_pids=%s",
+                group_ok,
+                marker_ok,
+                strays,
+            )
+            return 1
+        return 0 if stderr_inspectable and not stderr_seen else 1
     except subprocess.TimeoutExpired:
         _kill_tree(proc, marker)
         proc.wait()
         raise
+    finally:
+        if stderr is not None:
+            stderr.close()
 
 
 def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
