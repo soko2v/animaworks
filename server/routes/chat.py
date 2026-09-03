@@ -81,6 +81,12 @@ def create_chat_router() -> APIRouter:
         )
         supervisor = request.app.state.supervisor
 
+        # Verify anima exists before validating or saving any attachment
+        if name not in supervisor.processes:
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail=f"Anima not found: {name}")
+
         # Guard: reject if anima is bootstrapping
         if supervisor.is_bootstrapping(name):
             return JSONResponse(

@@ -205,3 +205,36 @@ async def test_stream_endpoint_rejects_invalid_files_before_streaming(data_dir: 
         )
     assert resp.status_code == 413
     assert not (data_dir / "animas" / "alice" / "attachments").exists()
+
+
+async def test_unknown_anima_returns_404_before_saving_attachments(data_dir: Path, supervisor: MagicMock) -> None:
+    app = _make_app(supervisor)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/animas/bob/chat",
+            json={"message": "x", "files": [{"name": "n.txt", "media_type": "text/plain", "data": _b64(b"ok")}]},
+        )
+    assert resp.status_code == 404, resp.text
+    supervisor.send_request.assert_not_awaited()
+    assert not (data_dir / "animas" / "bob").exists()
+
+
+@pytest.mark.parametrize("raw_name", ["%2e%2e", "%2e%2e%2falice"])
+async def test_traversal_anima_name_never_reaches_attachment_dir(
+    data_dir: Path, supervisor: MagicMock, raw_name: str
+) -> None:
+    app = _make_app(supervisor)
+    before = sorted(p.relative_to(data_dir) for p in data_dir.rglob("*"))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            f"/api/animas/{raw_name}/chat",
+            json={"message": "x", "files": [{"name": "n.txt", "media_type": "text/plain", "data": _b64(b"ok")}]},
+        )
+    assert resp.status_code == 404, resp.text
+    supervisor.send_request.assert_not_awaited()
+    after = sorted(p.relative_to(data_dir) for p in data_dir.rglob("*"))
+    assert after == before
+    assert not (data_dir / "attachments").exists()
+    assert not (data_dir / "animas" / "alice" / "attachments").exists()

@@ -43,7 +43,7 @@ function _drainQueue(explicitAnima, explicitThread) {
   const next = mgr.dequeue(anima, thread);
   wsShowPendingIndicator();
   if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
-  setTimeout(() => _sendConversation(next.text, { images: next.images, displayImages: next.displayImages }), 150);
+  setTimeout(() => _sendConversation(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles }), 150);
 }
 
 function _baseCallbacks(streamingMsg) {

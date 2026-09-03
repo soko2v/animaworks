@@ -77,6 +77,8 @@ def save_files(anima_name: str, files: list[FileAttachment]) -> list[str]:
     """
     if not files:
         return []
+    if not anima_name or anima_name in {".", ".."} or Path(anima_name).name != anima_name:
+        raise ValueError(f"invalid anima name: {anima_name!r}")
     from core.paths import get_data_dir
 
     attachments_dir = get_data_dir() / "animas" / anima_name / "attachments"

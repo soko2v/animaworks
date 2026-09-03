@@ -113,6 +113,7 @@ class TestChat:
 
     async def test_chat_includes_images_from_cycle_result(self):
         supervisor = MagicMock()
+        supervisor.processes = {"alice"}
         supervisor.send_request = AsyncMock(return_value={
             "response": "ok",
             "replied_to": [],
@@ -158,6 +159,7 @@ class TestChat:
 
     async def test_chat_forwards_intent_to_supervisor(self):
         supervisor = MagicMock()
+        supervisor.processes = {"alice"}
         supervisor.send_request = AsyncMock(return_value={"response": "ok", "replied_to": []})
         app = _make_test_app(supervisor=supervisor)
         transport = ASGITransport(app=app)

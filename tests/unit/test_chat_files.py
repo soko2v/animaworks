@@ -193,3 +193,18 @@ def test_save_files_extracts_text_before_persisting(tmp_path: Path, monkeypatch:
         save_files("sofia", [_attachment("spec.docx", DOCX, make_docx(["x"]))])
     attachments = tmp_path / "animas" / "sofia" / "attachments"
     assert not attachments.exists() or list(attachments.iterdir()) == []
+
+
+@pytest.mark.parametrize("anima_name", ["", ".", "..", "../alice", "alice/../bob", "a/b"])
+def test_save_files_refuses_non_segment_anima_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, anima_name: str
+) -> None:
+    import core.paths as paths_module
+
+    monkeypatch.setattr(paths_module, "get_data_dir", lambda: tmp_path)
+    files = [FileAttachment(name="n.txt", media_type="text/plain", data=base64.b64encode(b"ok").decode())]
+    with pytest.raises(ValueError, match="invalid anima name"):
+        save_files(anima_name, files)
+    # Nothing may be written anywhere under the data dir for a rejected name.
+    assert not (tmp_path / "animas").exists()
+    assert not (tmp_path / "attachments").exists()

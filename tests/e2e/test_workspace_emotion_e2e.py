@@ -270,6 +270,7 @@ class TestWorkspaceStatusEventsE2E:
         """Non-streaming /chat endpoint should also emit thinking → idle."""
         app = _make_test_app()
 
+        app.state.supervisor.processes = {"sakura": True}
         app.state.supervisor.send_request = AsyncMock(return_value={
             "response": "Answer\n<!-- emotion: {\"emotion\": \"smile\"} -->"
         })
