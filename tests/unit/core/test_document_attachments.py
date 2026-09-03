@@ -81,22 +81,51 @@ def make_xlsx(rows: list[list[object]], *, sheet_name: str = "Data") -> bytes:
     )
 
 
-def make_xlsx_raw(sheet_xml: str, *, shared_strings: str = "<sst/>", sheet_name: str = "Data") -> bytes:
+def make_xlsx_raw(
+    sheet_xml: str,
+    *,
+    shared_strings: str = "<sst/>",
+    sheet_name: str = "Data",
+    workbook_xml: str | None = None,
+    rels_xml: str | None = None,
+    extra_parts: dict[str, str] | None = None,
+) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", CONTENT_TYPES.format(extra=""))
         zf.writestr(
             "xl/workbook.xml",
-            '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            workbook_xml
+            if workbook_xml is not None
+            else '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
             f'<sheets><sheet name="{sheet_name}" sheetId="1" r:id="rId1"/></sheets></workbook>',
         )
         zf.writestr(
             "xl/_rels/workbook.xml.rels",
-            '<Relationships><Relationship Id="rId1" Type="x" Target="worksheets/sheet1.xml"/></Relationships>',
+            rels_xml
+            if rels_xml is not None
+            else '<Relationships><Relationship Id="rId1" Type="x" Target="worksheets/sheet1.xml"/></Relationships>',
         )
         zf.writestr("xl/sharedStrings.xml", shared_strings)
         zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        for name, xml in (extra_parts or {}).items():
+            zf.writestr(name, xml)
     return buf.getvalue()
+
+
+def set_zip_entry_flag(data: bytes, name: str, flag: int) -> bytes:
+    """Return *data* with general-purpose *flag* bits set on entry *name* (local + central headers)."""
+    buf = bytearray(data)
+    encoded = name.encode()
+    for signature, flag_off, len_off, name_off in ((b"PK\x03\x04", 6, 26, 30), (b"PK\x01\x02", 8, 28, 46)):
+        pos = buf.find(signature)
+        while pos != -1:
+            (name_len,) = struct.unpack_from("<H", buf, pos + len_off)
+            if bytes(buf[pos + name_off : pos + name_off + name_len]) == encoded:
+                (flags,) = struct.unpack_from("<H", buf, pos + flag_off)
+                struct.pack_into("<H", buf, pos + flag_off, flags | flag)
+            pos = buf.find(signature, pos + 4)
+    return bytes(buf)
 
 
 FREESECT, ENDOFCHAIN, FATSECT, DIFSECT = 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC
@@ -661,3 +690,131 @@ def test_no_sidecar_text_for_non_ooxml(suffix: str) -> None:
 
 def test_text_sidecar_path() -> None:
     assert text_sidecar_path(Path("/x/attachments/r.docx")) == Path("/x/attachments/r.docx.txt")
+
+
+# ── r5: sheet fan-out, attribute scanner, ZIP entry flags, CFB directory count ──
+
+
+def test_encrypted_zip_entry_is_rejected_at_validation() -> None:
+    encrypted = set_zip_entry_flag(make_docx(["secret"]), "word/document.xml", 0x1)
+    with zipfile.ZipFile(io.BytesIO(encrypted)) as zf:
+        assert zf.getinfo("word/document.xml").flag_bits & 0x1, "fixture must mark the entry encrypted"
+    with pytest.raises(DocumentValidationError) as exc:
+        validate_document_bytes(encrypted, ".docx")
+    assert exc.value.code == "invalid"
+    # Extraction on the same bytes must degrade to "no sidecar", never RuntimeError.
+    assert extract_document_text(encrypted, ".docx") is None
+
+
+def test_unsupported_zip_compression_is_rejected() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml", CONTENT_TYPES.format(extra=""))
+        zf.writestr("word/document.xml", "<w:document/>", compress_type=zipfile.ZIP_BZIP2)
+    with pytest.raises(DocumentValidationError) as exc:
+        validate_document_bytes(buf.getvalue(), ".docx")
+    assert exc.value.code == "invalid"
+
+
+def test_cfb_directory_sector_count_is_validated() -> None:
+    v3 = bytearray(make_cfb(streams={"WordDocument": make_fib()}))
+    struct.pack_into("<I", v3, 40, 1)  # MS-CFB 2.2: MUST be zero for version 3
+    with pytest.raises(DocumentValidationError) as exc:
+        validate_document_bytes(bytes(v3), ".doc")
+    assert exc.value.code == "invalid"
+    for declared in (0, 2, 1 << 20):  # version 4: must equal the traversed chain (1 sector here)
+        v4 = bytearray(make_cfb(streams={"WordDocument": make_fib()}, sector_shift=12))
+        struct.pack_into("<I", v4, 40, declared)
+        with pytest.raises(DocumentValidationError) as exc:
+            validate_document_bytes(bytes(v4), ".doc")
+        assert exc.value.code == "invalid", declared
+
+
+def test_xlsx_repeated_sheet_references_read_each_part_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.document_attachments as mod
+
+    reads: list[str] = []
+    original = mod._read_part
+
+    def spying_read(archive: zipfile.ZipFile, name: str) -> bytes:
+        reads.append(name)
+        return original(archive, name)
+
+    monkeypatch.setattr(mod, "_read_part", spying_read)
+    workbook = (
+        '<workbook xmlns:r="x"><sheets>'
+        + '<sheet name="Data" sheetId="1" r:id="rId1"/>' * 5_000
+        + "</sheets></workbook>"
+    )
+    sheet = '<worksheet><sheetData><row r="1"><c><v>1</v></c></row></sheetData></worksheet>'
+    started = time.perf_counter()
+    text = extract_document_text(make_xlsx_raw(sheet, workbook_xml=workbook), ".xlsx")
+    assert time.perf_counter() - started < 2.0
+    assert text == "## Sheet: Data\n1"
+    assert reads.count("xl/worksheets/sheet1.xml") == 1
+
+
+def test_xlsx_sheet_count_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.document_attachments as mod
+
+    monkeypatch.setattr(mod, "_MAX_XLSX_SHEETS", 2)
+    parts = {
+        f"xl/worksheets/sheet{i}.xml": f'<worksheet><sheetData><row r="1"><c><v>{i}</v></c></row></sheetData></worksheet>'
+        for i in range(1, 6)
+    }
+    workbook = (
+        '<workbook xmlns:r="x"><sheets>'
+        + "".join(f'<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>' for i in range(1, 6))
+        + "</sheets></workbook>"
+    )
+    rels = (
+        "<Relationships>"
+        + "".join(f'<Relationship Id="rId{i}" Type="x" Target="worksheets/sheet{i}.xml"/>' for i in range(1, 6))
+        + "</Relationships>"
+    )
+    extra = {name: xml for name, xml in parts.items() if name != "xl/worksheets/sheet1.xml"}
+    data = make_xlsx_raw(parts["xl/worksheets/sheet1.xml"], workbook_xml=workbook, rels_xml=rels, extra_parts=extra)
+    assert extract_document_text(data, ".xlsx") == "## Sheet: S1\n1\n\n## Sheet: S2\n2"
+    # The fallback (no usable workbook.xml) is capped the same way.
+    data = make_xlsx_raw(
+        parts["xl/worksheets/sheet1.xml"], workbook_xml="<workbook/>", rels_xml=rels, extra_parts=extra
+    )
+    assert extract_document_text(data, ".xlsx") == "## Sheet: sheet1\n1\n\n## Sheet: sheet2\n2"
+
+
+def test_xlsx_huge_sheet_name_is_bounded_before_retention(monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.document_attachments as mod
+
+    committed: list[int] = []
+    original_add = mod._TextBudget.add
+
+    def spying_add(self: mod._TextBudget, line: str) -> bool:
+        committed.append(len(line))
+        return original_add(self, line)
+
+    monkeypatch.setattr(mod._TextBudget, "add", spying_add)
+    monkeypatch.setattr(mod, "_MAX_TEXT_CHARS", 300)
+    sheet = '<worksheet><sheetData><row r="1"><c><v>1</v></c></row></sheetData></worksheet>'
+    data = make_xlsx_raw(sheet, sheet_name="n" * 100_000)
+    text = extract_document_text(data, ".xlsx")
+    assert text == "## Sheet: " + "n" * mod._MAX_SHEET_NAME_CHARS + "\n1"
+    assert max(committed) <= len("## Sheet: ") + mod._MAX_SHEET_NAME_CHARS
+    # A budget smaller than the (bounded) header buffers nothing at all.
+    monkeypatch.setattr(mod, "_MAX_TEXT_CHARS", 100)
+    committed.clear()
+    text = extract_document_text(data, ".xlsx")
+    assert text is not None and "truncated" in text
+    assert committed == []
+
+
+def test_attribute_scanner_is_linear_on_long_attribute_runs() -> None:
+    run = "a" * 200_000
+    sheet = (
+        f'<worksheet><sheetData><row r="1"><c {run}><v>1</v></c><c r="{run}"><v>2</v></c></row></sheetData></worksheet>'
+    )
+    workbook = f'<workbook xmlns:r="x"><sheets><sheet {run} name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    started = time.perf_counter()
+    text = extract_document_text(make_xlsx_raw(sheet, workbook_xml=workbook), ".xlsx")
+    elapsed = time.perf_counter() - started
+    assert text == "## Sheet: Data\n1\t2"
+    assert elapsed < 1.0, f"attribute scan took {elapsed:.1f}s (quadratic backtracking?)"

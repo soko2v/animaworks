@@ -91,9 +91,11 @@ def save_files(anima_name: str, files: list[FileAttachment]) -> list[str]:
         filename = f"{timestamp}_{unique}_{index}_{_safe_stem(item.name)}{suffix}"
         destination = attachments_dir / filename
         decoded = base64.b64decode(item.data, validate=True)
-        destination.write_bytes(decoded)
-        paths.append(f"attachments/{filename}")
+        # Extract before persisting so a failure cannot leave a document on
+        # disk that the caller never learns about.
         text = extract_document_text(decoded, suffix)
+        destination.write_bytes(decoded)
         if text is not None:
             text_sidecar_path(destination).write_text(text, encoding="utf-8")
+        paths.append(f"attachments/{filename}")
     return paths

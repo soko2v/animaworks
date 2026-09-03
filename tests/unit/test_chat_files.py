@@ -171,3 +171,25 @@ def test_save_files_does_not_overwrite_same_name(tmp_path: Path, monkeypatch: py
     assert first != second
     assert (tmp_path / "animas" / "sofia" / first[0]).read_bytes() == b"first"
     assert (tmp_path / "animas" / "sofia" / second[0]).read_bytes() == b"second"
+
+
+def test_validate_files_rejects_encrypted_ooxml_entry() -> None:
+    from tests.unit.core.test_document_attachments import make_docx, set_zip_entry_flag
+
+    encrypted = set_zip_entry_flag(make_docx(["secret"]), "word/document.xml", 0x1)
+    assert _validate_files([_attachment("locked.docx", DOCX, encrypted)]) is not None
+
+
+def test_save_files_extracts_text_before_persisting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.unit.core.test_document_attachments import make_docx
+
+    monkeypatch.setattr("core.paths.get_data_dir", lambda: tmp_path)
+
+    def exploding(_data: bytes, _suffix: str) -> str | None:
+        raise RuntimeError("simulated extraction failure")
+
+    monkeypatch.setattr("server.routes.chat_files.extract_document_text", exploding)
+    with pytest.raises(RuntimeError):
+        save_files("sofia", [_attachment("spec.docx", DOCX, make_docx(["x"]))])
+    attachments = tmp_path / "animas" / "sofia" / "attachments"
+    assert not attachments.exists() or list(attachments.iterdir()) == []

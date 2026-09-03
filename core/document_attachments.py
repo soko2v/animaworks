@@ -22,6 +22,7 @@ import io
 import logging
 import re
 import zipfile
+import zlib
 from html import unescape
 from pathlib import Path
 
@@ -69,6 +70,10 @@ _MAX_ZIP_ENTRIES = 4096
 _MAX_ZIP_UNCOMPRESSED = 64 * 1024 * 1024  # zip-bomb guard (sum of declared sizes)
 _MAX_PART_BYTES = 32 * 1024 * 1024  # single XML part read cap
 _MAX_TEXT_CHARS = 200_000  # extracted sidecar cap
+_MAX_XLSX_SHEETS = 1024  # distinct worksheet parts read per workbook
+_MAX_SHEET_NAME_CHARS = 255  # Excel itself allows 31; anything longer is hostile
+_ZIP_FLAG_ENCRYPTED = 0x1  # general purpose bit 0: entry is password protected
+_ZIP_ALLOWED_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})  # all Office writes
 _TRUNCATION_MARK = "\n\n[... text truncated by AnimaWorks: document exceeds extraction limit ...]\n"
 
 
@@ -121,6 +126,13 @@ def _open_ooxml(data: bytes) -> zipfile.ZipFile:
         name = info.filename
         if name.startswith(("/", "\\")) or ".." in name.split("/") or ".." in name.split("\\"):
             raise DocumentValidationError("invalid", "unsafe ZIP entry name")
+        # Per-entry encryption / exotic compression would only surface as a
+        # RuntimeError / NotImplementedError at extraction time, after the
+        # file had been accepted; refuse them while validating instead.
+        if info.flag_bits & _ZIP_FLAG_ENCRYPTED:
+            raise DocumentValidationError("invalid", f"encrypted ZIP entry {name}")
+        if info.compress_type not in _ZIP_ALLOWED_COMPRESSION:
+            raise DocumentValidationError("invalid", f"unsupported compression for {name}")
         total += max(info.file_size, 0)
         if total > _MAX_ZIP_UNCOMPRESSED:
             raise DocumentValidationError("invalid", "ZIP expands beyond limit")
@@ -131,7 +143,9 @@ def _read_part(archive: zipfile.ZipFile, name: str) -> bytes:
     try:
         with archive.open(name) as fh:
             chunk = fh.read(_MAX_PART_BYTES + 1)
-    except (KeyError, zipfile.BadZipFile, OSError) as exc:
+    except (KeyError, zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError, zlib.error, EOFError) as exc:
+        # RuntimeError: encrypted entry; NotImplementedError: compression
+        # method; zlib.error / EOFError: corrupt deflate stream.
         raise DocumentValidationError("invalid", f"cannot read {name}") from exc
     if len(chunk) > _MAX_PART_BYTES:
         raise DocumentValidationError("invalid", f"{name} exceeds part limit")
@@ -325,6 +339,13 @@ class _CompoundFile:
     # ── directory ──
 
     def _load_directory(self) -> list[_CfbEntry]:
+        # MS-CFB 2.2: "Number of Directory Sectors" MUST be zero for version 3
+        # and, for version 4, MUST match the directory chain actually present.
+        declared_dir = _u32(self.data, 40)
+        if self.major == 3 and declared_dir != 0:
+            raise DocumentValidationError("invalid", "CFB v3 directory sector count must be zero")
+        if self.major == 4 and (declared_dir < 1 or declared_dir > min(_CFB_MAX_DIR_SECTORS, self.sector_count)):
+            raise DocumentValidationError("invalid", "CFB directory sector count inconsistent with file size")
         entries: list[_CfbEntry] = []
         seen: set[int] = set()
         cursor = _u32(self.data, 48)
@@ -349,6 +370,8 @@ class _CompoundFile:
                     raise DocumentValidationError("invalid", "CFB stream larger than file")
                 entries.append(_CfbEntry(name, etype, _u32(entry, 116), size))
             cursor = self._next(self.fat, cursor)
+        if self.major == 4 and declared_dir != len(seen):
+            raise DocumentValidationError("invalid", "CFB directory sector count does not match chain")
         if not entries or entries[0].object_type != _CFB_TYPE_ROOT:
             raise DocumentValidationError("invalid", "CFB root entry missing")
         return entries
@@ -490,11 +513,16 @@ def validate_document_bytes(data: bytes, suffix: str) -> None:
 # can never scan past the next "<": unclosed tags, long attribute lists and
 # repeated prefixes all cost time proportional to the distance to the next
 # tag, keeping the whole scan linear in the part size.
+#
+# The attribute scanner is anchored with "\b" so that a run of word characters
+# is attempted once from its first character only; without the anchor every
+# position inside the run restarts "\w+" and the scan is quadratic (a 32 MiB
+# attribute list would take hours).
 
 _DOCX_TOKEN_RE = re.compile(r"<w:t(?:\s[^<>]*)?>([^<]*)</w:t>|<w:tab/>|<w:br/>|<w:cr/>|</w:p>|<w:p/>")
 _SST_TOKEN_RE = re.compile(r"<si>|</si>|<t(?:\s[^<>]*)?>([^<]*)</t>")
 _SHEET_TOKEN_RE = re.compile(r"<c\b([^<>]*)>|</c>|</row>|<v>([^<]*)</v>|<t(?:\s[^<>]*)?>([^<]*)</t>")
-_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+_ATTR_RE = re.compile(r'\b(\w+)="([^"]*)"')
 _WB_SHEET_RE = re.compile(r"<sheet\b([^<>]*)>")
 _RELS_RE = re.compile(r"<Relationship\b([^<>]*)>")
 
@@ -615,18 +643,28 @@ def _xlsx_sheet_order(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
             if not target.startswith("xl/"):
                 target = f"xl/{target}"
             rels[attrs.get("Id", "")] = target
+    # Each worksheet part is read at most once (a workbook may repeat an r:id
+    # any number of times), the sheet count is capped and sheet names are
+    # bounded before they are retained, so extraction work stays proportional
+    # to the archive's distinct parts rather than to the workbook XML.
     sheets: list[tuple[str, str]] = []
+    seen_parts: set[str] = set()
     if "xl/workbook.xml" in names:
         wb_xml = _read_part(archive, "xl/workbook.xml").decode("utf-8", errors="replace")
         for m in _WB_SHEET_RE.finditer(wb_xml):
+            if len(sheets) >= _MAX_XLSX_SHEETS:
+                break
             attrs = dict(_ATTR_RE.findall(m.group(1)))
             rid = attrs.get("r:id") or attrs.get("id", "")
             part = rels.get(rid)
-            if part and part in names:
-                sheets.append((unescape(attrs.get("name", part)), part))
+            if not part or part not in names or part in seen_parts:
+                continue
+            seen_parts.add(part)
+            name = unescape(attrs.get("name", part)[:_MAX_SHEET_NAME_CHARS])[:_MAX_SHEET_NAME_CHARS]
+            sheets.append((name, part))
     if not sheets:
         fallback = sorted(n for n in names if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
-        sheets = [(Path(n).stem, n) for n in fallback]
+        sheets = [(Path(n).stem, n) for n in fallback[:_MAX_XLSX_SHEETS]]
     return sheets
 
 
@@ -650,8 +688,11 @@ def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
     budget = _TextBudget()
     budget.truncated = shared_truncated
     for sheet_name, part in _xlsx_sheet_order(archive):
+        header = f"## Sheet: {sheet_name}"
+        if not budget.reserve(len(header)):
+            return budget.render()
         xml = _read_part(archive, part).decode("utf-8", errors="replace")
-        if not budget.add(f"## Sheet: {sheet_name}"):
+        if not budget.add(header):
             return budget.render()
         row: list[str] = []
         kind = ""
@@ -714,7 +755,7 @@ def extract_document_text(data: bytes, suffix: str) -> str | None:
     try:
         with _open_ooxml(data) as archive:
             return _extract_docx_text(archive) if suffix == ".docx" else _extract_xlsx_text(archive)
-    except DocumentValidationError:
+    except (DocumentValidationError, zipfile.BadZipFile, OSError):
         logger.warning("document text extraction skipped for %s: container rejected", suffix)
         return None
 
