@@ -15,6 +15,7 @@ from server.routes.chat_models import (
     MIME_TO_EXT,
     SUPPORTED_IMAGE_TYPES,
     ImageAttachment,
+    require_plain_anima_name,
 )
 
 
@@ -60,6 +61,7 @@ def save_images(anima_name: str, images: list[ImageAttachment]) -> list[str]:
     """
     if not images:
         return []
+    require_plain_anima_name(anima_name)
     from core.paths import get_data_dir
 
     attachments_dir = get_data_dir() / "animas" / anima_name / "attachments"

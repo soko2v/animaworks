@@ -40,3 +40,27 @@ def test_workspace_enqueue_captures_files_and_display_files() -> None:
     )
     assert "files: im?.getPendingFiles() || []" in source
     assert "displayFiles: im?.getDisplayFiles() || []" in source
+
+
+QUEUE_EDIT_SITES = {
+    PROJECT_ROOT
+    / "server"
+    / "static"
+    / "workspace"
+    / "modules"
+    / "chat-streaming.js": "_getImageManager()?.restoreAttachments(removed)",
+    PROJECT_ROOT
+    / "server"
+    / "static"
+    / "pages"
+    / "chat"
+    / "streaming-controller.js": "state.imageInputManager?.restoreAttachments(removed)",
+}
+
+
+@pytest.mark.parametrize(("path", "call"), QUEUE_EDIT_SITES.items(), ids=[p.name for p in QUEUE_EDIT_SITES])
+def test_queue_edit_restores_attachments_not_only_text(path: Path, call: str) -> None:
+    """Clicking a queued item back into the composer must restore its files/images too."""
+    source = path.read_text(encoding="utf-8")
+    assert "removed.text" in source
+    assert call in source, f"{path.name} queue edit restores only text; queued attachments would be lost"

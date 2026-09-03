@@ -337,6 +337,60 @@ describe("image-input document drag & drop", () => {
     assert.equal(manager.prepareForSubmit(), false);
   });
 
+  it("restoreAttachments puts a queued entry's documents and images back and keeps de-duplication", async () => {
+    const file = makeFile("spec.docx", { size: 10, lastModified: 42 });
+    container.dispatch("drop", dropEvent([file, makeFile("data.csv")]));
+    await flush();
+    assert.equal(manager.getFileCount(), 2);
+    // Snapshot exactly what addToQueue() captures, then clear like enqueue does.
+    const entry = {
+      text: "later",
+      images: manager.getPendingImages(),
+      displayImages: manager.getDisplayImages(),
+      files: manager.getPendingFiles(),
+      displayFiles: manager.getDisplayFiles(),
+    };
+    manager.clearImages();
+    assert.equal(manager.getFileCount(), 0);
+
+    const before = changed;
+    assert.equal(manager.restoreAttachments(entry), 2);
+    assert.deepEqual(manager.getPendingFiles().map((f) => f.name), ["spec.docx", "data.csv"]);
+    assert.equal(manager.getPendingFiles()[0].data, entry.files[0].data, "payload survives the round trip");
+    assert.equal(changed, before + 1);
+    assert.match(preview.innerHTML, /spec\.docx/);
+
+    // The same entry restored twice, or the original file dropped again, is not duplicated.
+    assert.equal(manager.restoreAttachments(entry), 0);
+    container.dispatch("drop", dropEvent([file]));
+    await flush();
+    assert.equal(manager.getFileCount(), 2);
+    assert.match(manager.getStatus()?.message, /chat\.file_duplicate_client/);
+
+    // Images restore with their preview dataUrl; malformed/empty entries are ignored.
+    const img = { data: "aGVsbG8=", media_type: "image/png" };
+    assert.equal(manager.restoreAttachments({ images: [img], displayImages: [{ ...img, dataUrl: "data:x" }] }), 1);
+    assert.equal(manager.getImageCount(), 1);
+    assert.equal(manager.getDisplayImages()[0].dataUrl, "data:x");
+    assert.equal(manager.restoreAttachments(null), 0);
+    assert.equal(manager.restoreAttachments({ files: [{ name: "" }, { data: "" }] }), 0);
+  });
+
+  it("restoreAttachments enforces the per-message document count limit", async () => {
+    const files = Array.from({ length: 10 }, (_, i) => makeFile("f" + i + ".txt"));
+    container.dispatch("drop", dropEvent(files));
+    await flush();
+    assert.equal(manager.getFileCount(), 10);
+    const restored = manager.restoreAttachments({
+      files: [{ name: "extra.txt", media_type: "text/plain", data: "eA==" }],
+      displayFiles: [{ name: "extra.txt", media_type: "text/plain", key: "extra" }],
+    });
+    assert.equal(restored, 0);
+    assert.equal(manager.getFileCount(), 10);
+    assert.equal(manager.getStatus()?.kind, "error");
+    assert.match(manager.getStatus()?.message, /chat\.file_count_limit_client/);
+  });
+
   it("documentLabelFor maps extensions to short labels", () => {
     assert.equal(mod.documentLabelFor("a.docx"), "DOCX");
     assert.equal(mod.documentLabelFor("A.XLS"), "XLS");

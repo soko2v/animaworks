@@ -249,6 +249,28 @@ def create_chat_router() -> APIRouter:
 
             raise HTTPException(status_code=404, detail=f"Anima not found: {name}")
 
+        # Guard: return immediately if anima is bootstrapping
+        if supervisor.is_bootstrapping(name):
+
+            async def _bootstrap_busy() -> AsyncIterator[str]:
+                yield _format_sse(
+                    "bootstrap",
+                    {
+                        "status": "busy",
+                        "message": t("chat.bootstrap_error"),
+                    },
+                )
+
+            return StreamingResponse(
+                _bootstrap_busy(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
         # Guard: reject oversized messages
         message_size = len(body.message.encode("utf-8"))
         if message_size > MAX_CHAT_MESSAGE_SIZE:
@@ -274,7 +296,24 @@ def create_chat_router() -> APIRouter:
 
                 raise HTTPException(status_code=413, detail=file_error)
 
-        # Save validated attachments to disk
+        # ── StreamRegistry integration ────────────────────
+        registry: StreamRegistry = request.app.state.stream_registry
+
+        # Handle resume request before anything is persisted: a resume only
+        # replays an existing stream, so attachments could never reach the Anima.
+        if body.resume:
+            if body.images or body.files:
+                from fastapi import HTTPException
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Attachments cannot be sent with a stream resume request",
+                )
+            last_event_id = body.last_event_id or request.headers.get("Last-Event-ID", "")
+            return _handle_resume(registry, body.resume, last_event_id, name, from_person=body.from_person)
+
+        # Save validated attachments to disk (only once the request is known to
+        # reach a producer; bootstrap/resume branches above never persist).
         saved_paths = save_images(name, body.images) if body.images else []
         saved_paths.extend(save_files(name, body.files) if body.files else [])
         logger.info(
@@ -286,36 +325,6 @@ def create_chat_router() -> APIRouter:
             [image.media_type for image in body.images],
             [file.media_type for file in body.files],
         )
-
-        # Guard: return immediately if anima is bootstrapping
-        if supervisor.is_bootstrapping(name):
-
-            async def _bootstrap_busy() -> AsyncIterator[str]:
-                yield _format_sse(
-                    "bootstrap",
-                    {
-                        "status": "busy",
-                        "message": t("chat.bootstrap_error"),
-                    },
-                )
-
-            return StreamingResponse(
-                _bootstrap_busy(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-
-        # ── StreamRegistry integration ────────────────────
-        registry: StreamRegistry = request.app.state.stream_registry
-
-        # Handle resume request
-        if body.resume:
-            last_event_id = body.last_event_id or request.headers.get("Last-Event-ID", "")
-            return _handle_resume(registry, body.resume, last_event_id, name, from_person=body.from_person)
 
         stream = registry.register(
             name,

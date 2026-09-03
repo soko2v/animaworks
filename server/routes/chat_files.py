@@ -18,7 +18,13 @@ from core.document_attachments import (
 )
 from core.i18n import t
 from core.time_utils import now_local
-from server.routes.chat_models import MAX_FILE_COUNT, MAX_FILE_PAYLOAD_SIZE, MAX_FILE_SIZE, FileAttachment
+from server.routes.chat_models import (
+    MAX_FILE_COUNT,
+    MAX_FILE_PAYLOAD_SIZE,
+    MAX_FILE_SIZE,
+    FileAttachment,
+    require_plain_anima_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +83,7 @@ def save_files(anima_name: str, files: list[FileAttachment]) -> list[str]:
     """
     if not files:
         return []
-    if not anima_name or anima_name in {".", ".."} or Path(anima_name).name != anima_name:
-        raise ValueError(f"invalid anima name: {anima_name!r}")
+    require_plain_anima_name(anima_name)
     from core.paths import get_data_dir
 
     attachments_dir = get_data_dir() / "animas" / anima_name / "attachments"

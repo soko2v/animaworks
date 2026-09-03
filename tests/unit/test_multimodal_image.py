@@ -340,3 +340,19 @@ class TestChatRequest:
         )
         assert len(req.images) == 1
         assert req.images[0].media_type == "image/png"
+
+
+@pytest.mark.parametrize("anima_name", ["", ".", "..", "../alice", "alice/../bob", "a/b"])
+def test_save_images_refuses_non_segment_anima_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, anima_name: str
+) -> None:
+    """save_images composes animas/<name>/attachments and must reject any non-segment name."""
+    import core.paths as paths_module
+    from server.routes.chat_images import save_images
+
+    monkeypatch.setattr(paths_module, "get_data_dir", lambda: tmp_path)
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8).decode()
+    with pytest.raises(ValueError, match="invalid anima name"):
+        save_images(anima_name, [ImageAttachment(data=png, media_type="image/png")])
+    assert not (tmp_path / "animas").exists()
+    assert not (tmp_path / "attachments").exists()

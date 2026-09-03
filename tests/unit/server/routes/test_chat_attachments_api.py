@@ -238,3 +238,43 @@ async def test_traversal_anima_name_never_reaches_attachment_dir(
     assert after == before
     assert not (data_dir / "attachments").exists()
     assert not (data_dir / "animas" / "alice" / "attachments").exists()
+
+
+async def _post_stream(app, payload: dict):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post("/api/animas/alice/chat/stream", json=payload)
+
+
+_TXT_FILE = {"name": "n.txt", "media_type": "text/plain", "data": _b64(b"ok")}
+
+
+async def test_stream_bootstrapping_anima_persists_nothing(data_dir: Path, supervisor: MagicMock) -> None:
+    """A bootstrapping Anima answers 'busy' and must not keep an attachment it never receives."""
+    app = _make_app(supervisor)
+    supervisor.is_bootstrapping = MagicMock(return_value=True)
+    resp = await _post_stream(app, {"message": "x", "files": [_TXT_FILE]})
+    assert resp.status_code == 200, resp.text
+    assert "event: bootstrap" in resp.text
+    assert '"busy"' in resp.text
+    supervisor.send_request.assert_not_awaited()
+    assert not (data_dir / "animas" / "alice" / "attachments").exists()
+
+
+async def test_stream_resume_with_attachments_is_rejected_before_saving(data_dir: Path, supervisor: MagicMock) -> None:
+    """A resume replays an existing stream; attachments on it can never reach the Anima."""
+    app = _make_app(supervisor)
+    resp = await _post_stream(app, {"message": "", "resume": "stream-1", "files": [_TXT_FILE]})
+    assert resp.status_code == 400, resp.text
+    supervisor.send_request.assert_not_awaited()
+    assert not (data_dir / "animas" / "alice" / "attachments").exists()
+
+
+async def test_stream_resume_without_attachments_still_reaches_resume_handler(
+    data_dir: Path, supervisor: MagicMock
+) -> None:
+    app = _make_app(supervisor)
+    resp = await _post_stream(app, {"message": "", "resume": "unknown-stream"})
+    assert resp.status_code == 200, resp.text
+    assert "STREAM_NOT_FOUND" in resp.text
+    assert not (data_dir / "animas" / "alice" / "attachments").exists()

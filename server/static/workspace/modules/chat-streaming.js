@@ -501,6 +501,9 @@ export function wsShowPendingIndicator() {
       dom.convInput.style.height = Math.min(dom.convInput.scrollHeight, isMobileView() ? 100 : 120) + "px";
       dom.convInput.focus();
     }
+    // Queued attachments were cleared from the composer when enqueued;
+    // put them back so editing does not silently drop documents/images.
+    if (removed) _getImageManager()?.restoreAttachments(removed);
     wsShowPendingIndicator(); wsUpdateSendButton(mgr.isStreamingFor(anima, thread));
   };
 }

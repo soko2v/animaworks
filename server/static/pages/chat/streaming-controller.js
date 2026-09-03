@@ -155,6 +155,9 @@ export function createStreamingController(ctx) {
             input.style.height = Math.min(input.scrollHeight, chatInputMaxHeight()) + "px";
             input.focus();
           }
+          // Queued attachments were cleared from the composer when enqueued;
+          // put them back so editing does not silently drop documents/images.
+          state.imageInputManager?.restoreAttachments(removed);
         }
         showPendingIndicator();
         updateSendButton();

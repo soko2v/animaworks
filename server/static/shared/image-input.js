@@ -409,7 +409,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
 
     /** Get pending images with dataUrl for display in chat history. */
     getDisplayImages() {
-      return pendingImages.map(({ data, media_type, dataUrl }) => ({ data, media_type, dataUrl }));
+      return pendingImages.map(({ data, media_type, dataUrl, key }) => ({ data, media_type, dataUrl, key }));
     },
 
     getPendingFiles() {
@@ -417,7 +417,55 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     },
 
     getDisplayFiles() {
-      return pendingFiles.map(({ media_type, name }) => ({ media_type, name }));
+      return pendingFiles.map(({ media_type, name, key }) => ({ media_type, name, key }));
+    },
+
+    /**
+     * Re-attach a queued entry ({images, displayImages, files, displayFiles})
+     * so editing a queued message restores its attachments, not only its text.
+     * Identities are taken from the display snapshots so the original file
+     * cannot be attached a second time; entries already present are skipped.
+     * Returns the number of attachments restored.
+     */
+    restoreAttachments(entry) {
+      const images = Array.isArray(entry?.images) ? entry.images : [];
+      const displayImages = Array.isArray(entry?.displayImages) ? entry.displayImages : [];
+      const files = Array.isArray(entry?.files) ? entry.files : [];
+      const displayFiles = Array.isArray(entry?.displayFiles) ? entry.displayFiles : [];
+      let restored = 0;
+      images.forEach((img, index) => {
+        if (!img?.data || !img?.media_type) return;
+        const shown = displayImages[index] || {};
+        const key = shown.key || `restored|image|${img.media_type}|${img.data.length}`;
+        if (queuedIdentities.has(key)) return;
+        queuedIdentities.add(key);
+        pendingImages.push({
+          data: img.data,
+          media_type: img.media_type,
+          dataUrl: shown.dataUrl || `data:${img.media_type};base64,${img.data}`,
+          key,
+        });
+        restored += 1;
+      });
+      files.forEach((file, index) => {
+        if (!file?.data || !file?.name) return;
+        if (pendingFiles.length >= MAX_FILE_COUNT) {
+          setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: file.name }));
+          return;
+        }
+        const shown = displayFiles[index] || {};
+        const key = shown.key || `restored|file|${file.name}|${file.data.length}`;
+        if (queuedIdentities.has(key)) return;
+        queuedIdentities.add(key);
+        pendingFiles.push({ data: file.data, media_type: file.media_type || "", name: file.name, key });
+        restored += 1;
+      });
+      if (restored > 0) {
+        rejectedSinceLastSubmit = false;
+        onImagesChanged?.();
+      }
+      renderPreviews();
+      return restored;
     },
 
     /** Clear all pending images and documents. */
