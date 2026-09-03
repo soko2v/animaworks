@@ -6,6 +6,8 @@ from __future__ import annotations
 
 """Heartbeat-driven recovery for blocked TaskExec tasks."""
 
+import ctypes
+import errno
 import json
 import logging
 import os
@@ -19,7 +21,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import IO
+from typing import IO, NamedTuple
 
 from core.i18n import t
 from core.memory._io import atomic_write_text
@@ -194,10 +196,19 @@ _SH_WRAPPER = 'ulimit -t "$1" 2>/dev/null; exec /bin/sh -c "$2"'
 # a stopped parent cannot fork again, and the set converges quickly.
 _KILL_TREE_MAX_PASSES = 8
 _PS_RETRIES = 3
+_WAITID_POLL_SECONDS = 0.01
 
 
 class _ProcessListingUnavailable(RuntimeError):
     """``ps`` (or /proc) could not be consulted; cleanup cannot enumerate strays."""
+
+
+class _ProcessIdentity(NamedTuple):
+    """Durable-enough process identity available on both Linux and macOS."""
+
+    pid: int
+    pgid: int
+    started: str
 
 
 def _sandbox_route() -> str | None:
@@ -223,7 +234,7 @@ def _sandbox_argv(route: str, check: str, *, cpu_seconds: int) -> list[str]:
     raise ValueError(f"unknown sandbox route: {route}")
 
 
-def _ps_lines(args: list[str]) -> list[str]:
+def _ps_lines(args: list[str], *, empty_returncodes: tuple[int, ...] = ()) -> list[str]:
     """Run ``ps`` with retries; raise ``_ProcessListingUnavailable`` if it cannot be consulted."""
     last: BaseException | None = None
     for attempt in range(_PS_RETRIES):
@@ -242,6 +253,8 @@ def _ps_lines(args: list[str]) -> list[str]:
         else:
             if result.returncode == 0:
                 return result.stdout.splitlines()
+            if result.returncode in empty_returncodes:
+                return []
             last = RuntimeError(f"ps exited {result.returncode}")
         if attempt + 1 < _PS_RETRIES:
             time.sleep(0.1)
@@ -271,20 +284,39 @@ def _descendant_pids(root_pid: int) -> list[int]:
     return found
 
 
-def _process_group_pids(group_id: int) -> list[int]:
-    """Return live (non-zombie) PIDs in a process group without trusting a dead group leader."""
-    pids: list[int] = []
-    for line in _ps_lines(["-axo", "pid=,pgid=,stat="]):
-        parts = line.split()
-        if len(parts) != 3 or parts[2].startswith("Z"):
-            continue
-        try:
-            pid, pgid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        if pgid == group_id and pid != group_id:
-            pids.append(pid)
-    return pids
+def _parse_process_identity(line: str) -> _ProcessIdentity | None:
+    """Parse one ``pid,pgid,lstart,stat`` line, excluding zombies."""
+    parts = line.split()
+    if len(parts) < 8 or parts[7].startswith("Z"):
+        return None
+    try:
+        pid, pgid = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    return _ProcessIdentity(pid, pgid, " ".join(parts[2:7]))
+
+
+def _process_identities() -> dict[int, _ProcessIdentity]:
+    """Return live process identities keyed by PID.
+
+    ``lstart`` is deliberately obtained from ``ps`` on every snapshot. A PID
+    alone is not an identity once an earlier process has exited.
+    """
+    identities: dict[int, _ProcessIdentity] = {}
+    for line in _ps_lines(["-axo", "pid=,pgid=,lstart=,stat="]):
+        identity = _parse_process_identity(line)
+        if identity is not None:
+            identities[identity.pid] = identity
+    return identities
+
+
+def _process_group_pids(group_id: int) -> list[_ProcessIdentity]:
+    """Return live identities in a process group, excluding its leader."""
+    return [
+        identity
+        for identity in _process_identities().values()
+        if identity.pgid == group_id and identity.pid != group_id
+    ]
 
 
 def _marker_pids(marker: str) -> tuple[list[int], bool]:
@@ -330,12 +362,95 @@ def _marker_pids(marker: str) -> tuple[list[int], bool]:
     return pids, complete
 
 
-def _signal_all(pids: list[int], sig: signal.Signals) -> None:
-    for pid in pids:
+def _pid_has_marker(pid: int, marker: str) -> tuple[bool, bool]:
+    """Return whether ``pid`` currently carries ``marker`` and whether inspection succeeded."""
+    needle = f"{_CHECK_MARKER_ENV}={marker}"
+    if sys.platform == "darwin":
+        for line in _ps_lines(["-E", "-p", str(pid), "-o", "command="], empty_returncodes=(1,)):
+            if needle in line:
+                return True, True
+        return False, True
+    try:
+        environ = (Path("/proc") / str(pid) / "environ").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return False, True
+    except OSError:
+        return False, False
+    return needle.encode() + b"\0" in environ, True
+
+
+def _current_identity(pid: int) -> _ProcessIdentity | None:
+    """Return the current live identity for ``pid``, if any."""
+    lines = _ps_lines(
+        ["-o", "pid=,pgid=,lstart=,stat=", "-p", str(pid)],
+        empty_returncodes=(1,),
+    )
+    return next((identity for line in lines if (identity := _parse_process_identity(line)) is not None), None)
+
+
+def _signal_owned(
+    identity: _ProcessIdentity,
+    root_pgid: int,
+    marker: str,
+    sig: signal.Signals,
+) -> tuple[bool, bool]:
+    """Signal only the same process while it remains in the group or carries the marker.
+
+    Returns ``(signalled, inspection_complete)``. A changed start time is a
+    reused PID and is never signalled.
+    """
+    try:
+        current = _current_identity(identity.pid)
+    except _ProcessListingUnavailable:
+        return False, False
+    if current is None or current.started != identity.started:
+        return False, True
+    if current.pgid != root_pgid:
         try:
-            os.kill(pid, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
+            marked, complete = _pid_has_marker(identity.pid, marker)
+        except _ProcessListingUnavailable:
+            return False, False
+        if not complete:
+            return False, False
+        if not marked:
+            return False, True
+    try:
+        os.kill(identity.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        return False, True
+    return True, True
+
+
+def _continue_same_identity(identity: _ProcessIdentity) -> tuple[bool, bool]:
+    """Continue ``identity`` only if it still matches, returning signal and inspection status."""
+    try:
+        current = _current_identity(identity.pid)
+    except _ProcessListingUnavailable:
+        return False, False
+    if current != identity:
+        return False, True
+    try:
+        os.kill(identity.pid, signal.SIGCONT)
+    except (ProcessLookupError, PermissionError):
+        return False, True
+    return True, True
+
+
+def _signal_owned_all(
+    identities: list[_ProcessIdentity],
+    root_pgid: int,
+    marker: str,
+    sig: signal.Signals,
+) -> tuple[list[_ProcessIdentity], bool]:
+    """Revalidate and signal each identity, returning successful signals and completeness."""
+    signalled: list[_ProcessIdentity] = []
+    complete = True
+    for identity in identities:
+        sent, inspected = _signal_owned(identity, root_pgid, marker, sig)
+        complete = complete and inspected
+        if sent:
+            signalled.append(identity)
+    return signalled, complete
 
 
 def _signal_group(pgid: int, sig: signal.Signals) -> None:
@@ -359,31 +474,32 @@ def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
     Residual (documented): processes that scrubbed the inherited marker
     environment before detaching.
     """
-    try:
-        os.killpg(proc.pid, signal.SIGSTOP)
-    except (ProcessLookupError, PermissionError):
-        pass
-    frozen: list[int] = []
+    _signal_group(proc.pid, signal.SIGSTOP)
+    frozen: dict[int, _ProcessIdentity] = {}
     enumeration_ok = True
     for _ in range(_KILL_TREE_MAX_PASSES):
         try:
             marked, complete = _marker_pids(marker)
-            seen = [*_descendant_pids(proc.pid), *marked]
+            seen_pids = [*_descendant_pids(proc.pid), *marked]
+            identities = _process_identities()
         except _ProcessListingUnavailable:
             enumeration_ok = False
             break
         if not complete:
             enumeration_ok = False
-        new_pids = [pid for pid in dict.fromkeys(seen) if pid not in frozen and pid != proc.pid]
-        if not new_pids:
+        new_identities = [
+            identities[pid]
+            for pid in dict.fromkeys(seen_pids)
+            if pid != proc.pid and pid in identities and identities[pid] != frozen.get(pid)
+        ]
+        if not new_identities:
             break
-        _signal_all(new_pids, signal.SIGSTOP)
-        frozen.extend(new_pids)
-    _signal_all(frozen, signal.SIGKILL)
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+        stopped, inspected = _signal_owned_all(new_identities, proc.pid, marker, signal.SIGSTOP)
+        enumeration_ok = enumeration_ok and inspected
+        frozen.update((identity.pid, identity) for identity in stopped)
+    _, inspected = _signal_owned_all(list(frozen.values()), proc.pid, marker, signal.SIGKILL)
+    enumeration_ok = enumeration_ok and inspected
+    _signal_group(proc.pid, signal.SIGKILL)
     try:
         proc.kill()
     except ProcessLookupError:
@@ -391,13 +507,17 @@ def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
     strays: list[int] = []
     try:
         marked, complete = _marker_pids(marker)
-        strays = [pid for pid in marked if pid != proc.pid]
+        identities = _process_identities()
+        stray_identities = [identities[pid] for pid in marked if pid != proc.pid and pid in identities]
+        strays = [identity.pid for identity in stray_identities]
         if not complete:
             enumeration_ok = False
     except _ProcessListingUnavailable:
         enumeration_ok = False
-    if strays:
-        _signal_all(strays, signal.SIGKILL)
+        stray_identities = []
+    if stray_identities:
+        _, inspected = _signal_owned_all(stray_identities, proc.pid, marker, signal.SIGKILL)
+        enumeration_ok = enumeration_ok and inspected
     if strays or not enumeration_ok:
         logger.warning(
             "unblock_check timeout cleanup incomplete for marker %s: enumeration_ok=%s stray_pids=%s",
@@ -411,7 +531,7 @@ def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
 # stderr pipe to reach EOF before a still-open pipe is treated as a stray holder.
 _STDERR_EOF_GRACE_SECONDS = 1.0
 # Poll tick of the stderr reader thread; bounds how long a stop request takes to land.
-_STDERR_POLL_SECONDS = 0.1
+_STDERR_POLL_SECONDS = 0.05
 # Pause between post-kill re-sweeps so ``ps`` can observe delivered SIGKILLs.
 _RESWEEP_PAUSE_SECONDS = 0.05
 
@@ -432,10 +552,11 @@ class _StderrDrain:
     Draining concurrently with ``Popen.wait`` keeps a chatty child from
     blocking on a full pipe until the timeout. Nothing is accumulated, so
     parent memory stays flat regardless of output volume. The reader waits
-    with a bounded poll so that ``close()`` can always retire it: after a stop
-    request it never reads again, and the descriptor is closed only once the
-    thread has finished (or was never started), so a reused descriptor number
-    is never touched.
+    with a bounded poll so that ``close()`` can normally retire it promptly.
+    The descriptor is closed only after the thread has finished (or was never
+    started), so a reused descriptor number is never touched. If the bounded
+    join unexpectedly expires, the reader and descriptor are left alive and
+    a warning is logged.
     """
 
     def __init__(self, stream: IO[bytes]) -> None:
@@ -457,6 +578,8 @@ class _StderrDrain:
             while not self._stop.is_set():
                 if not _wait_readable(self._fd, _STDERR_POLL_SECONDS):
                     continue
+                if self._stop.is_set():
+                    return
                 chunk = os.read(self._fd, 65536)
                 if not chunk:
                     self.eof = True
@@ -466,14 +589,14 @@ class _StderrDrain:
             self.failed = True
 
     def finished(self, timeout: float) -> bool:
-        """Wait up to ``timeout`` seconds for EOF or failure; False means the pipe is still open."""
+        """Wait up to ``timeout`` seconds and return True only for confirmed EOF."""
         if not self._started:
             return False
         self._thread.join(timeout)
-        return not self._thread.is_alive()
+        return self.eof
 
     def close(self) -> None:
-        """Retire the reader, then close the stream. Safe on every path, including a failed start."""
+        """Request reader retirement and close the stream if the bounded join succeeds."""
         self._stop.set()
         if self._started:
             self._thread.join(_STDERR_POLL_SECONDS * 20)
@@ -483,32 +606,34 @@ class _StderrDrain:
         self._stream.close()
 
 
-def _open_stderr_holders(root_pid: int, marker: str) -> tuple[list[int], bool]:
-    """PIDs still in the check's process group or carrying its marker, and whether enumeration was complete."""
+def _open_stderr_holders(root_pid: int, marker: str) -> tuple[list[_ProcessIdentity], bool]:
+    """Live identities in the check's group or carrying its marker, plus completeness."""
     marked, complete = _marker_pids(marker)
     group = _process_group_pids(root_pid)
-    return [pid for pid in dict.fromkeys([*group, *marked]) if pid != root_pid], complete
+    identities = _process_identities()
+    holders = {identity.pid: identity for identity in group}
+    holders.update((pid, identities[pid]) for pid in marked if pid != root_pid and pid in identities)
+    return list(holders.values()), complete
 
 
 def _reject_open_stderr(root_pid: int, marker: str, drain: _StderrDrain) -> None:
     """Contain and kill whatever still holds the check's stderr after the root exited.
 
-    The root has been reaped, but its process group survives while any member
-    does and a PID cannot be reused while it names a live group, so group
-    signals stay bound to the check's own processes. Order: SIGSTOP the group
-    (a stopped process cannot fork); pass by pass, SIGSTOP every newly listed
-    group member or marker carrier (an out-of-group escapee) until a pass
-    lists nothing new; SIGKILL only PIDs still listed as ours, and SIGCONT a
-    frozen PID that dropped out of the listing (it exited or was reused, so it
-    must not be killed); SIGKILL the group; then re-sweep and kill until
+    The exited root remains unreaped, so its PID and process-group ID cannot be
+    reused and group signals stay bound to the check's own processes. Order:
+    SIGSTOP the group (a stopped process cannot fork); pass by pass, SIGSTOP
+    every newly listed group member or marker carrier (an out-of-group
+    escapee) until a pass lists nothing new; SIGKILL only identities still
+    listed as ours, and SIGCONT a frozen process only while its recorded
+    identity still matches; SIGKILL the group; then re-sweep and kill until
     nothing is listed. Finally require the reader to reach EOF, the only proof
     that no unlisted holder (e.g. one that scrubbed the marker and left the
     group) survived. Every shortfall is logged; the caller rejects the check
     regardless.
     """
     _signal_group(root_pid, signal.SIGSTOP)
-    frozen: list[int] = []
-    targets: list[int] = []
+    frozen: dict[int, _ProcessIdentity] = {}
+    targets: list[_ProcessIdentity] = []
     enumeration_ok = True
     converged = False
     for _ in range(_KILL_TREE_MAX_PASSES):
@@ -518,20 +643,26 @@ def _reject_open_stderr(root_pid: int, marker: str, drain: _StderrDrain) -> None
             enumeration_ok = False
             break
         enumeration_ok = enumeration_ok and complete
-        new_pids = [pid for pid in holders if pid not in frozen]
-        if not new_pids:
+        holder_map = {identity.pid: identity for identity in holders}
+        new_identities = [identity for identity in holders if identity != frozen.get(identity.pid)]
+        if not new_identities:
             converged = True
-            targets = holders
-            released = [pid for pid in frozen if pid not in holders]
-            if released:
-                _signal_all(released, signal.SIGCONT)
+            targets = list(frozen.values())
+            released = [identity for pid, identity in frozen.items() if holder_map.get(pid) != identity]
+            for identity in released:
+                _, inspected = _continue_same_identity(identity)
+                enumeration_ok = enumeration_ok and inspected
+                frozen.pop(identity.pid, None)
+            targets = list(frozen.values())
             break
-        _signal_all(new_pids, signal.SIGSTOP)
-        frozen.extend(new_pids)
+        stopped, inspected = _signal_owned_all(new_identities, root_pid, marker, signal.SIGSTOP)
+        enumeration_ok = enumeration_ok and inspected
+        frozen.update((identity.pid, identity) for identity in stopped)
     if not converged:
-        targets = frozen  # enumeration failed or a runaway forker: kill everything we froze
+        targets = list(frozen.values())  # enumeration failed or a runaway forker: revalidate the frozen set
     if targets:
-        _signal_all(targets, signal.SIGKILL)
+        _, inspected = _signal_owned_all(targets, root_pid, marker, signal.SIGKILL)
+        enumeration_ok = enumeration_ok and inspected
     _signal_group(root_pid, signal.SIGKILL)
     strays: list[int] = []
     settled = False
@@ -545,21 +676,61 @@ def _reject_open_stderr(root_pid: int, marker: str, drain: _StderrDrain) -> None
         if not holders:
             settled = True
             break
-        strays.extend(pid for pid in holders if pid not in targets and pid not in strays)
-        _signal_all(holders, signal.SIGKILL)
+        target_pids = {identity.pid for identity in targets}
+        strays.extend(
+            identity.pid for identity in holders if identity.pid not in target_pids and identity.pid not in strays
+        )
+        _, inspected = _signal_owned_all(holders, root_pid, marker, signal.SIGKILL)
+        enumeration_ok = enumeration_ok and inspected
         _signal_group(root_pid, signal.SIGKILL)
         time.sleep(_RESWEEP_PAUSE_SECONDS)
     reader_eof = drain.finished(_STDERR_EOF_GRACE_SECONDS)
     logger.warning(
         "unblock_check completed with open stderr pipe; rejecting: killed_pids=%s stray_pids=%s "
         "enumeration_ok=%s converged=%s settled=%s reader_eof=%s",
-        targets,
+        [identity.pid for identity in targets],
         strays,
         enumeration_ok,
         converged,
         settled,
         reader_eof,
     )
+
+
+def _wait_unreaped(proc: subprocess.Popen, timeout: float) -> None:
+    """Wait for ``proc`` to exit without reaping it, bounded by ``timeout``."""
+    deadline = time.monotonic() + timeout
+    flags = os.WEXITED | os.WNOWAIT | os.WNOHANG
+    while True:
+        waitid = getattr(os, "waitid", None)
+        if waitid is not None:
+            try:
+                result = waitid(os.P_PID, proc.pid, flags)
+            except InterruptedError:
+                exited = False
+            else:
+                exited = result is not None and result.si_pid != 0
+        elif sys.platform == "darwin":
+            # Some otherwise supported CPython macOS builds omit os.waitid().
+            # Darwin's siginfo_t stores si_pid at byte offset 12.
+            info = ctypes.create_string_buffer(128)
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.waitid(os.P_PID, proc.pid, ctypes.byref(info), flags) != 0:
+                error = ctypes.get_errno()
+                if error == errno.EINTR:
+                    exited = False
+                else:
+                    raise OSError(error, os.strerror(error))
+            else:
+                exited = ctypes.c_int.from_buffer(info, 12).value != 0
+        else:
+            raise NotImplementedError("waitid with WNOWAIT is required")
+        if exited:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        time.sleep(min(_WAITID_POLL_SECONDS, remaining))
 
 
 def _run_sandboxed(
@@ -588,9 +759,10 @@ def _run_sandboxed(
     means a child retained it, so the process group and inherited marker are
     frozen, killed and re-swept (see ``_reject_open_stderr``) before failing
     closed; an uninspectable pipe also fails closed. On every exit path the
-    reader thread is retired and the pipe closed, and a child left running by
-    a failure before ``wait`` returned is killed and reaped. Checks on that
-    route must be stderr-silent and must never negate an observation command.
+    reader is asked to retire and its pipe is closed when the bounded join
+    succeeds. A child left running by a failure before exit observation is
+    killed and reaped. Checks on that route must be stderr-silent and must
+    never negate an observation command.
     """
     proc = subprocess.Popen(
         argv,
@@ -607,23 +779,25 @@ def _run_sandboxed(
             if reject_stderr and proc.stderr is not None:
                 drain = _StderrDrain(proc.stderr)
                 drain.start()
-            returncode = proc.wait(timeout=timeout)
+            if not reject_stderr:
+                return proc.wait(timeout=timeout)
+            _wait_unreaped(proc, timeout)
         except subprocess.TimeoutExpired:
             _kill_tree(proc, marker)
             proc.wait()
             raise
         except BaseException:
-            if proc.poll() is None:  # e.g. the reader thread could not be started
+            if reject_stderr or proc.poll() is None:
                 _kill_tree(proc, marker)
                 proc.wait()
             raise
-        if not reject_stderr:
-            return returncode
         if drain is None:
+            proc.wait()
             return 1
         settled = drain.finished(_STDERR_EOF_GRACE_SECONDS)
         if not settled:
             _reject_open_stderr(proc.pid, marker, drain)
+        returncode = proc.wait()
         if returncode != 0:
             return returncode
         if not settled:
