@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import IO
 from unittest.mock import Mock, patch
 
 import pytest
@@ -46,6 +47,18 @@ def _blocked_task(anima_dir: Path, *, task_id: str, meta: dict) -> TaskQueueMana
     )
     manager.update_status(task_id, "blocked", summary="waiting")
     return manager
+
+
+def _stderr_pipe(data: bytes = b"", *, hold: bool = False) -> tuple[IO[bytes], int | None]:
+    """A real stderr pipe for a mocked Popen: ``data`` then EOF, or kept open (writer fd returned) when ``hold``."""
+    reader, writer = os.pipe()
+    if data:
+        os.write(writer, data)
+    stream = open(reader, "rb", buffering=0)  # noqa: SIM115 - closed by _run_sandboxed
+    if hold:
+        return stream, writer
+    os.close(writer)
+    return stream, None
 
 
 def _heartbeat(anima_dir: Path) -> HeartbeatMixin:
@@ -223,8 +236,7 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     proc = Mock()
     proc.pid = 4242
     proc.wait.side_effect = [subprocess.TimeoutExpired("sh", 60), -9]
-    proc.stderr = Mock()
-    proc.stderr.raw.read.side_effect = [b""]
+    proc.stderr, _ = _stderr_pipe()
 
     # Pass 1 sees two descendants; pass 2 sees one more forked meanwhile; pass 3 is stable.
     snapshots = [[4300, 4301], [4300, 4301, 4302], [4300, 4301, 4302]]
@@ -259,6 +271,8 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     assert [c.args for c in killpg.call_args_list] == [(4242, stop), (4242, kill_sig)]
     proc.kill.assert_called_once_with()
     assert proc.wait.call_count == 2
+    assert proc.stderr.closed
+    assert not any(t.name == "unblock-check-stderr" for t in threading.enumerate())
 
 
 def test_kill_tree_freezes_root_group_before_first_snapshot() -> None:
@@ -542,8 +556,7 @@ def test_run_sandboxed_default_route_keeps_exit_status_contract() -> None:
 def test_run_sandboxed_fails_closed_when_zero_exit_writes_stderr() -> None:
     proc = Mock()
     proc.wait.return_value = 0
-    proc.stderr = Mock()
-    proc.stderr.raw.read.side_effect = [b"Operation not permitted", b""]
+    proc.stderr, _ = _stderr_pipe(b"Operation not permitted")
     with patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen:
         assert (
             blocked_recovery._run_sandboxed(
@@ -552,14 +565,13 @@ def test_run_sandboxed_fails_closed_when_zero_exit_writes_stderr() -> None:
             == 1
         )
     assert popen.call_args.kwargs["stderr"] is subprocess.PIPE
-    proc.stderr.close.assert_called_once()
+    assert proc.stderr.closed
 
 
 def test_run_sandboxed_accepts_quiet_zero_exit_without_marked_child() -> None:
     proc = Mock()
     proc.wait.return_value = 0
-    proc.stderr = Mock()
-    proc.stderr.raw.read.side_effect = [b""]
+    proc.stderr, _ = _stderr_pipe()
     with patch("core.blocked_recovery.subprocess.Popen", return_value=proc):
         assert (
             blocked_recovery._run_sandboxed(
@@ -567,15 +579,17 @@ def test_run_sandboxed_accepts_quiet_zero_exit_without_marked_child() -> None:
             )
             == 0
         )
-    proc.stderr.close.assert_called_once()
+    assert proc.stderr.closed
 
 
 def test_run_sandboxed_fails_closed_when_stderr_read_fails() -> None:
     proc = Mock()
     proc.wait.return_value = 0
-    proc.stderr = Mock()
-    proc.stderr.raw.read.side_effect = OSError("bad pipe")
-    with patch("core.blocked_recovery.subprocess.Popen", return_value=proc):
+    proc.stderr, _ = _stderr_pipe(b"x")
+    with (
+        patch("core.blocked_recovery.subprocess.Popen", return_value=proc),
+        patch("core.blocked_recovery.os.read", side_effect=OSError("bad pipe")),
+    ):
         assert (
             blocked_recovery._run_sandboxed(
                 ["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True
@@ -584,26 +598,23 @@ def test_run_sandboxed_fails_closed_when_stderr_read_fails() -> None:
         )
 
 
-def test_run_sandboxed_sweeps_and_rejects_when_pipe_stays_open_after_zero_exit() -> None:
-    """A stray holding stderr past the grace period is swept (group + marker) and the check is rejected."""
+def test_run_sandboxed_sweeps_and_rejects_when_pipe_stays_open_after_zero_exit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stray holding stderr past the grace period is frozen, killed (group + marker) and the check is rejected."""
     proc = Mock()
     proc.pid = 4242
     proc.wait.return_value = 0
-    proc.stderr = Mock()
-    release = threading.Event()
-
-    def _held_read(_size: int) -> bytes:
-        release.wait(5)
-        return b""
-
-    proc.stderr.raw.read.side_effect = _held_read
+    proc.stderr, writer = _stderr_pipe(hold=True)
     try:
         with (
             patch("core.blocked_recovery.subprocess.Popen", return_value=proc),
             patch("core.blocked_recovery._STDERR_EOF_GRACE_SECONDS", 0.05),
-            patch("core.blocked_recovery._process_group_pids", return_value=[4300]) as group,
-            patch("core.blocked_recovery._marker_pids", return_value=([4300, 4301], True)),
+            patch("core.blocked_recovery._process_group_pids", side_effect=[[4300], [4300], []]) as group,
+            patch("core.blocked_recovery._marker_pids", side_effect=[([4301], True), ([4301], True), ([], True)]),
             patch("core.blocked_recovery._signal_all") as signal_all,
+            patch("core.blocked_recovery.os.killpg") as killpg,
+            caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
         ):
             assert (
                 blocked_recovery._run_sandboxed(
@@ -612,15 +623,154 @@ def test_run_sandboxed_sweeps_and_rejects_when_pipe_stays_open_after_zero_exit()
                 == 1
             )
     finally:
-        release.set()
-    group.assert_called_once_with(4242)
-    signal_all.assert_called_once_with([4300, 4301], blocked_recovery.signal.SIGKILL)
-    proc.stderr.close.assert_called_once()
+        os.close(writer)
+    stop, kill_sig = blocked_recovery.signal.SIGSTOP, blocked_recovery.signal.SIGKILL
+    assert group.call_args_list[0].args == (4242,)
+    assert [c.args for c in signal_all.call_args_list] == [([4300, 4301], stop), ([4300, 4301], kill_sig)]
+    assert [c.args for c in killpg.call_args_list] == [(4242, stop), (4242, kill_sig)]
+    assert "open stderr pipe" in caplog.text
+    assert "reader_eof=False" in caplog.text  # the test itself still held the writer
+    assert proc.stderr.closed
+    assert not any(t.name == "unblock-check-stderr" for t in threading.enumerate())
+
+
+def test_reject_open_stderr_freezes_group_first_and_resweeps_fork_race(caplog: pytest.LogCaptureFixture) -> None:
+    """Group SIGSTOP precedes any listing; a carrier forked meanwhile is frozen; a post-kill survivor is re-swept."""
+    order: list[object] = []
+    stream, writer = _stderr_pipe(hold=True)
+    drain = blocked_recovery._StderrDrain(stream)
+    drain.start()
+    group_snapshots = iter([[4300], [4300], [4300], [], []])
+    marker_snapshots = iter([([4301], True), ([4301, 4302], True), ([4301, 4302], True), ([4303], True), ([], True)])
+
+    def _list_group(_pid: int) -> list[int]:
+        order.append("list")
+        return next(group_snapshots)
+
+    def _signal_all(pids: list[int], sig: int) -> None:
+        order.append((tuple(pids), int(sig)))
+        if int(sig) == int(blocked_recovery.signal.SIGKILL) and 4303 in pids:
+            os.close(writer)  # the last holder died: the pipe reaches EOF
+
+    try:
+        with (
+            patch("core.blocked_recovery._process_group_pids", side_effect=_list_group),
+            patch("core.blocked_recovery._marker_pids", side_effect=lambda _m: next(marker_snapshots)),
+            patch("core.blocked_recovery._signal_all", side_effect=_signal_all),
+            patch("core.blocked_recovery.os.killpg", side_effect=lambda pid, sig: order.append(f"killpg:{int(sig)}")),
+            patch("core.blocked_recovery._RESWEEP_PAUSE_SECONDS", 0.0),
+            caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
+        ):
+            blocked_recovery._reject_open_stderr(4242, "m", drain)
+    finally:
+        drain.close()
+    stop, kill_sig = int(blocked_recovery.signal.SIGSTOP), int(blocked_recovery.signal.SIGKILL)
+    assert order == [
+        f"killpg:{stop}",
+        "list",
+        ((4300, 4301), stop),
+        "list",
+        ((4302,), stop),
+        "list",
+        ((4300, 4301, 4302), kill_sig),
+        f"killpg:{kill_sig}",
+        "list",
+        ((4303,), kill_sig),
+        f"killpg:{kill_sig}",
+        "list",
+    ]
+    assert "stray_pids=[4303]" in caplog.text
+    assert "converged=True settled=True reader_eof=True" in caplog.text
+    assert drain.eof
+
+
+def test_reject_open_stderr_does_not_kill_a_frozen_pid_that_left_the_listing() -> None:
+    """A PID that vanished between listing and freeze (exited or reused) is continued, never killed."""
+    stream, _ = _stderr_pipe()
+    drain = blocked_recovery._StderrDrain(stream)
+    drain.start()
+    try:
+        with (
+            patch("core.blocked_recovery._process_group_pids", side_effect=[[4300, 4301], [4300], []]),
+            patch("core.blocked_recovery._marker_pids", return_value=([], True)),
+            patch("core.blocked_recovery._signal_all") as signal_all,
+            patch("core.blocked_recovery.os.killpg"),
+        ):
+            blocked_recovery._reject_open_stderr(4242, "m", drain)
+    finally:
+        drain.close()
+    stop, cont, kill_sig = (
+        blocked_recovery.signal.SIGSTOP,
+        blocked_recovery.signal.SIGCONT,
+        blocked_recovery.signal.SIGKILL,
+    )
+    assert [c.args for c in signal_all.call_args_list] == [([4300, 4301], stop), ([4301], cont), ([4300], kill_sig)]
+
+
+def test_reject_open_stderr_ps_unavailable_still_kills_frozen_and_group_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stream, _ = _stderr_pipe()
+    drain = blocked_recovery._StderrDrain(stream)
+    drain.start()
+    try:
+        with (
+            patch(
+                "core.blocked_recovery._process_group_pids",
+                side_effect=[[4300], *([blocked_recovery._ProcessListingUnavailable("ps")] * 2)],
+            ),
+            patch("core.blocked_recovery._marker_pids", return_value=([], True)),
+            patch("core.blocked_recovery._signal_all") as signal_all,
+            patch("core.blocked_recovery.os.killpg") as killpg,
+            caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
+        ):
+            blocked_recovery._reject_open_stderr(4242, "m", drain)
+    finally:
+        drain.close()
+    stop, kill_sig = blocked_recovery.signal.SIGSTOP, blocked_recovery.signal.SIGKILL
+    assert [c.args for c in signal_all.call_args_list] == [([4300], stop), ([4300], kill_sig)]
+    assert [c.args for c in killpg.call_args_list] == [(4242, stop), (4242, kill_sig)]
+    assert "enumeration_ok=False converged=False" in caplog.text
+
+
+def test_run_sandboxed_reaps_child_when_stderr_reader_cannot_start() -> None:
+    """Thread.start failure after Popen must not leave the child running or the pipe open."""
+    proc = Mock()
+    proc.pid = 4242
+    proc.poll.return_value = None
+    proc.stderr, _ = _stderr_pipe()
+    with (
+        patch("core.blocked_recovery.subprocess.Popen", return_value=proc),
+        patch("core.blocked_recovery._kill_tree") as kill_tree,
+        patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")),
+        pytest.raises(RuntimeError, match="start new thread"),
+    ):
+        blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
+    kill_tree.assert_called_once_with(proc, "m")
+    proc.wait.assert_called_once_with()
+    assert proc.stderr.closed
+
+
+def test_stderr_drain_close_retires_reader_while_pipe_is_still_held() -> None:
+    """close() stops the reader without waiting for EOF and only then closes the descriptor."""
+    stream, writer = _stderr_pipe(hold=True)
+    drain = blocked_recovery._StderrDrain(stream)
+    drain.start()
+    try:
+        assert not drain.finished(0.05)
+        drain.close()
+        assert not any(t.name == "unblock-check-stderr" for t in threading.enumerate())
+        assert stream.closed
+        assert not drain.eof and not drain.failed
+    finally:
+        os.close(writer)
 
 
 def test_process_group_pids_selects_only_the_requested_group() -> None:
-    with patch("core.blocked_recovery._ps_lines", return_value=["41 12", "42 77", "43 77", "bad", "44 nope"]):
-        assert blocked_recovery._process_group_pids(77) == [42, 43]
+    listing = ["41 12 S", "42 77 S", "43 77 Z", "44 77 R+", "bad", "45 nope S", "77 77 S"]
+    with patch("core.blocked_recovery._ps_lines", return_value=listing) as ps:
+        assert blocked_recovery._process_group_pids(77) == [42, 44]
+    ps.assert_called_once_with(["-axo", "pid=,pgid=,stat="])
 
 
 @pytest.mark.skipif(
@@ -723,6 +873,89 @@ def test_run_sandboxed_fails_closed_and_kills_background_stderr_holder_after_dir
             time.sleep(0.05)
         else:
             pytest.fail(f"background child {child_pid} survived")
+
+
+def _wait_group_empty(root_pid: int) -> list[int]:
+    for _ in range(40):
+        left = blocked_recovery._process_group_pids(root_pid)
+        if not left:
+            return []
+        time.sleep(0.05)
+    return left
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_run_sandboxed_nonzero_exit_with_silent_stderr_holder_leaves_no_reader_or_child(tmp_path: Path) -> None:
+    """A failing check with a silent background stderr holder must not leak the reader thread or the holder."""
+    marker = f"stderr-holder-nonzero-{os.getpid()}"
+    env = {"PATH": os.environ.get("PATH", ""), blocked_recovery._CHECK_MARKER_ENV: marker}
+    roots: list[int] = []
+    real_popen = subprocess.Popen
+
+    def _capture(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        roots.append(proc.pid)
+        return proc
+
+    started = time.monotonic()
+    try:
+        with patch("core.blocked_recovery.subprocess.Popen", side_effect=_capture):
+            code = blocked_recovery._run_sandboxed(
+                ["/bin/sh", "-c", "sleep 120 & exit 3"],
+                cwd=tmp_path,
+                env=env,
+                timeout=10,
+                marker=marker,
+                reject_stderr=True,
+            )
+        elapsed = time.monotonic() - started
+        assert code == 3
+        assert elapsed < 8, f"nonzero exit with holder took {elapsed:.1f}s"
+        assert not any(t.name == "unblock-check-stderr" for t in threading.enumerate())
+        assert _wait_group_empty(roots[0]) == []
+    finally:
+        for root in roots:
+            try:
+                os.killpg(root, blocked_recovery.signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_run_sandboxed_kills_forking_stderr_holder_group_after_zero_exit(tmp_path: Path) -> None:
+    """A holder that keeps forking new stderr holders during cleanup is frozen first, so none survives."""
+    marker = f"stderr-forker-{os.getpid()}"
+    env = {"PATH": os.environ.get("PATH", ""), blocked_recovery._CHECK_MARKER_ENV: marker}
+    roots: list[int] = []
+    real_popen = subprocess.Popen
+
+    def _capture(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        roots.append(proc.pid)
+        return proc
+
+    started = time.monotonic()
+    try:
+        with patch("core.blocked_recovery.subprocess.Popen", side_effect=_capture):
+            code = blocked_recovery._run_sandboxed(
+                ["/bin/sh", "-c", "( while :; do sleep 60 & sleep 0.01; done ) & exit 0"],
+                cwd=tmp_path,
+                env=env,
+                timeout=15,
+                marker=marker,
+                reject_stderr=True,
+            )
+        elapsed = time.monotonic() - started
+        assert code == 1
+        assert elapsed < 10, f"forking holder cleanup took {elapsed:.1f}s"
+        assert _wait_group_empty(roots[0]) == []
+        assert not any(t.name == "unblock-check-stderr" for t in threading.enumerate())
+    finally:
+        for root in roots:
+            try:
+                os.killpg(root, blocked_recovery.signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")

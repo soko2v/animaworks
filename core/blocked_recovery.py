@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -271,11 +272,11 @@ def _descendant_pids(root_pid: int) -> list[int]:
 
 
 def _process_group_pids(group_id: int) -> list[int]:
-    """Return live PIDs in a process group without trusting a dead group leader."""
+    """Return live (non-zombie) PIDs in a process group without trusting a dead group leader."""
     pids: list[int] = []
-    for line in _ps_lines(["-axo", "pid=,pgid="]):
+    for line in _ps_lines(["-axo", "pid=,pgid=,stat="]):
         parts = line.split()
-        if len(parts) != 2:
+        if len(parts) != 3 or parts[2].startswith("Z"):
             continue
         try:
             pid, pgid = int(parts[0]), int(parts[1])
@@ -335,6 +336,13 @@ def _signal_all(pids: list[int], sig: signal.Signals) -> None:
             os.kill(pid, sig)
         except (ProcessLookupError, PermissionError):
             pass
+
+
+def _signal_group(pgid: int, sig: signal.Signals) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
@@ -402,6 +410,20 @@ def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
 # After a zero exit on a stderr-rejecting route, how long to wait for the child's
 # stderr pipe to reach EOF before a still-open pipe is treated as a stray holder.
 _STDERR_EOF_GRACE_SECONDS = 1.0
+# Poll tick of the stderr reader thread; bounds how long a stop request takes to land.
+_STDERR_POLL_SECONDS = 0.1
+# Pause between post-kill re-sweeps so ``ps`` can observe delivered SIGKILLs.
+_RESWEEP_PAUSE_SECONDS = 0.05
+
+
+def _wait_readable(fd: int, timeout: float) -> bool:
+    """Block up to ``timeout`` seconds until ``fd`` is readable (data, EOF or error)."""
+    if hasattr(select, "poll"):  # no FD_SETSIZE limit, unlike select() in a descriptor-rich runner
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        return bool(poller.poll(int(timeout * 1000)))
+    ready, _, _ = select.select([fd], [], [], timeout)
+    return bool(ready)
 
 
 class _StderrDrain:
@@ -409,23 +431,33 @@ class _StderrDrain:
 
     Draining concurrently with ``Popen.wait`` keeps a chatty child from
     blocking on a full pipe until the timeout. Nothing is accumulated, so
-    parent memory stays flat regardless of output volume. Reads go through
-    the raw file object: once the parent closes it, any further read raises
-    ``ValueError`` instead of touching a possibly reused descriptor number.
+    parent memory stays flat regardless of output volume. The reader waits
+    with a bounded poll so that ``close()`` can always retire it: after a stop
+    request it never reads again, and the descriptor is closed only once the
+    thread has finished (or was never started), so a reused descriptor number
+    is never touched.
     """
 
     def __init__(self, stream: IO[bytes]) -> None:
-        self._raw = getattr(stream, "raw", stream)
+        self._stream = stream
+        self._fd = stream.fileno()
         self.seen = False
         self.eof = False
         self.failed = False
+        self._stop = threading.Event()
+        self._started = False
         self._thread = threading.Thread(target=self._run, name="unblock-check-stderr", daemon=True)
+
+    def start(self) -> None:
         self._thread.start()
+        self._started = True
 
     def _run(self) -> None:
         try:
-            while True:
-                chunk = self._raw.read(65536)
+            while not self._stop.is_set():
+                if not _wait_readable(self._fd, _STDERR_POLL_SECONDS):
+                    continue
+                chunk = os.read(self._fd, 65536)
                 if not chunk:
                     self.eof = True
                     return
@@ -435,32 +467,98 @@ class _StderrDrain:
 
     def finished(self, timeout: float) -> bool:
         """Wait up to ``timeout`` seconds for EOF or failure; False means the pipe is still open."""
+        if not self._started:
+            return False
         self._thread.join(timeout)
         return not self._thread.is_alive()
 
+    def close(self) -> None:
+        """Retire the reader, then close the stream. Safe on every path, including a failed start."""
+        self._stop.set()
+        if self._started:
+            self._thread.join(_STDERR_POLL_SECONDS * 20)
+            if self._thread.is_alive():
+                logger.warning("unblock_check stderr reader did not stop; leaving its descriptor open")
+                return
+        self._stream.close()
 
-def _reject_open_stderr(root_pid: int, marker: str) -> None:
-    """Sweep and kill whatever still holds the check's stderr after the root exited."""
-    group_pids: list[int] = []
-    marked: list[int] = []
-    group_ok = True
-    marker_ok = True
-    try:
-        group_pids = _process_group_pids(root_pid)
-    except _ProcessListingUnavailable:
-        group_ok = False
-    try:
-        marked, marker_ok = _marker_pids(marker)
-    except _ProcessListingUnavailable:
-        marker_ok = False
-    strays = list(dict.fromkeys([*group_pids, *marked]))
-    if strays:
-        _signal_all(strays, signal.SIGKILL)
+
+def _open_stderr_holders(root_pid: int, marker: str) -> tuple[list[int], bool]:
+    """PIDs still in the check's process group or carrying its marker, and whether enumeration was complete."""
+    marked, complete = _marker_pids(marker)
+    group = _process_group_pids(root_pid)
+    return [pid for pid in dict.fromkeys([*group, *marked]) if pid != root_pid], complete
+
+
+def _reject_open_stderr(root_pid: int, marker: str, drain: _StderrDrain) -> None:
+    """Contain and kill whatever still holds the check's stderr after the root exited.
+
+    The root has been reaped, but its process group survives while any member
+    does and a PID cannot be reused while it names a live group, so group
+    signals stay bound to the check's own processes. Order: SIGSTOP the group
+    (a stopped process cannot fork); pass by pass, SIGSTOP every newly listed
+    group member or marker carrier (an out-of-group escapee) until a pass
+    lists nothing new; SIGKILL only PIDs still listed as ours, and SIGCONT a
+    frozen PID that dropped out of the listing (it exited or was reused, so it
+    must not be killed); SIGKILL the group; then re-sweep and kill until
+    nothing is listed. Finally require the reader to reach EOF, the only proof
+    that no unlisted holder (e.g. one that scrubbed the marker and left the
+    group) survived. Every shortfall is logged; the caller rejects the check
+    regardless.
+    """
+    _signal_group(root_pid, signal.SIGSTOP)
+    frozen: list[int] = []
+    targets: list[int] = []
+    enumeration_ok = True
+    converged = False
+    for _ in range(_KILL_TREE_MAX_PASSES):
+        try:
+            holders, complete = _open_stderr_holders(root_pid, marker)
+        except _ProcessListingUnavailable:
+            enumeration_ok = False
+            break
+        enumeration_ok = enumeration_ok and complete
+        new_pids = [pid for pid in holders if pid not in frozen]
+        if not new_pids:
+            converged = True
+            targets = holders
+            released = [pid for pid in frozen if pid not in holders]
+            if released:
+                _signal_all(released, signal.SIGCONT)
+            break
+        _signal_all(new_pids, signal.SIGSTOP)
+        frozen.extend(new_pids)
+    if not converged:
+        targets = frozen  # enumeration failed or a runaway forker: kill everything we froze
+    if targets:
+        _signal_all(targets, signal.SIGKILL)
+    _signal_group(root_pid, signal.SIGKILL)
+    strays: list[int] = []
+    settled = False
+    for _ in range(_KILL_TREE_MAX_PASSES):
+        try:
+            holders, complete = _open_stderr_holders(root_pid, marker)
+        except _ProcessListingUnavailable:
+            enumeration_ok = False
+            break
+        enumeration_ok = enumeration_ok and complete
+        if not holders:
+            settled = True
+            break
+        strays.extend(pid for pid in holders if pid not in targets and pid not in strays)
+        _signal_all(holders, signal.SIGKILL)
+        _signal_group(root_pid, signal.SIGKILL)
+        time.sleep(_RESWEEP_PAUSE_SECONDS)
+    reader_eof = drain.finished(_STDERR_EOF_GRACE_SECONDS)
     logger.warning(
-        "unblock_check completed with open stderr pipe; rejecting: group_ok=%s marker_ok=%s stray_pids=%s",
-        group_ok,
-        marker_ok,
+        "unblock_check completed with open stderr pipe; rejecting: killed_pids=%s stray_pids=%s "
+        "enumeration_ok=%s converged=%s settled=%s reader_eof=%s",
+        targets,
         strays,
+        enumeration_ok,
+        converged,
+        settled,
+        reader_eof,
     )
 
 
@@ -486,10 +584,13 @@ def _run_sandboxed(
     reports a denied operation only through the child's stderr, and a check
     such as ``! ps ... | grep -q .`` would negate that denial into exit 0. On
     that route stderr is drained concurrently and any output rejects a zero
-    exit. A pipe still open shortly after exit means a child retained it, so
-    the process group and inherited marker are swept before failing closed;
-    an uninspectable pipe also fails closed. Checks on that route must be
-    stderr-silent and must never negate an observation command.
+    exit. A pipe still open shortly after exit (whatever the exit status)
+    means a child retained it, so the process group and inherited marker are
+    frozen, killed and re-swept (see ``_reject_open_stderr``) before failing
+    closed; an uninspectable pipe also fails closed. On every exit path the
+    reader thread is retired and the pipe closed, and a child left running by
+    a failure before ``wait`` returned is killed and reaped. Checks on that
+    route must be stderr-silent and must never negate an observation command.
     """
     proc = subprocess.Popen(
         argv,
@@ -500,25 +601,39 @@ def _run_sandboxed(
         stderr=subprocess.PIPE if reject_stderr else subprocess.DEVNULL,
         start_new_session=True,
     )
-    stderr = proc.stderr
-    drain = _StderrDrain(stderr) if reject_stderr and stderr is not None else None
+    drain: _StderrDrain | None = None
     try:
-        returncode = proc.wait(timeout=timeout)
-        if not reject_stderr or returncode != 0:
+        try:
+            if reject_stderr and proc.stderr is not None:
+                drain = _StderrDrain(proc.stderr)
+                drain.start()
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc, marker)
+            proc.wait()
+            raise
+        except BaseException:
+            if proc.poll() is None:  # e.g. the reader thread could not be started
+                _kill_tree(proc, marker)
+                proc.wait()
+            raise
+        if not reject_stderr:
             return returncode
         if drain is None:
             return 1
-        if not drain.finished(_STDERR_EOF_GRACE_SECONDS):
-            _reject_open_stderr(proc.pid, marker)
+        settled = drain.finished(_STDERR_EOF_GRACE_SECONDS)
+        if not settled:
+            _reject_open_stderr(proc.pid, marker, drain)
+        if returncode != 0:
+            return returncode
+        if not settled:
             return 1
         return 0 if drain.eof and not drain.seen else 1
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc, marker)
-        proc.wait()
-        raise
     finally:
-        if stderr is not None:
-            stderr.close()
+        if drain is not None:
+            drain.close()
+        elif proc.stderr is not None:
+            proc.stderr.close()
 
 
 def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
