@@ -268,12 +268,15 @@ def _descendant_pids(root_pid: int) -> list[int]:
     return found
 
 
-def _marker_pids(marker: str) -> list[int]:
-    """Return live (non-zombie) PIDs whose environment carries ``marker``.
+def _marker_pids(marker: str) -> tuple[list[int], bool]:
+    """Return ``(pids, complete)`` for live (non-zombie) processes whose environment carries ``marker``.
 
     Independent of the parent chain: a double-forked daemon reparented to
-    PID 1 still inherits the environment. Processes that scrub or replace
-    their environment are the documented residual.
+    PID 1 still inherits the environment. ``complete`` is False when at least
+    one process's environment could not be inspected (e.g. Linux denies
+    ``/proc/<pid>/environ`` for a non-dumpable process); callers must then
+    treat enumeration as incomplete rather than as "no marker". Processes
+    that scrub or replace their environment are the documented residual.
     """
     needle = f"{_CHECK_MARKER_ENV}={marker}"
     own = os.getpid()
@@ -289,20 +292,23 @@ def _marker_pids(marker: str) -> list[int]:
                 continue
             if pid != own:
                 pids.append(pid)
-        return pids
+        return pids, True
     proc_root = Path("/proc")
     if not proc_root.is_dir():
         raise _ProcessListingUnavailable("/proc unavailable")
     needle_b = needle.encode() + b"\0"
+    complete = True
     for entry in proc_root.iterdir():
         if not entry.name.isdigit() or int(entry.name) == own:
             continue
         try:
             if needle_b in (entry / "environ").read_bytes():
                 pids.append(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # exited between listing and read
         except OSError:
-            continue
-    return pids
+            complete = False  # EACCES/EPERM (non-dumpable) or transient I/O error: cannot rule out a marker
+    return pids, complete
 
 
 def _signal_all(pids: list[int], sig: signal.Signals) -> None:
@@ -335,10 +341,13 @@ def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
     enumeration_ok = True
     for _ in range(_KILL_TREE_MAX_PASSES):
         try:
-            seen = [*_descendant_pids(proc.pid), *_marker_pids(marker)]
+            marked, complete = _marker_pids(marker)
+            seen = [*_descendant_pids(proc.pid), *marked]
         except _ProcessListingUnavailable:
             enumeration_ok = False
             break
+        if not complete:
+            enumeration_ok = False
         new_pids = [pid for pid in dict.fromkeys(seen) if pid not in frozen and pid != proc.pid]
         if not new_pids:
             break
@@ -355,7 +364,10 @@ def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
         pass
     strays: list[int] = []
     try:
-        strays = [pid for pid in _marker_pids(marker) if pid != proc.pid]
+        marked, complete = _marker_pids(marker)
+        strays = [pid for pid in marked if pid != proc.pid]
+        if not complete:
+            enumeration_ok = False
     except _ProcessListingUnavailable:
         enumeration_ok = False
     if strays:

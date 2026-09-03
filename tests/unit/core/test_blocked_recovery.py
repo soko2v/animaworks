@@ -225,7 +225,7 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     with (
         patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen,
         patch("core.blocked_recovery._descendant_pids", side_effect=snapshots) as descendants,
-        patch("core.blocked_recovery._marker_pids", return_value=[]),
+        patch("core.blocked_recovery._marker_pids", return_value=([], True)),
         patch("core.blocked_recovery.os.kill") as kill,
         patch("core.blocked_recovery.os.killpg") as killpg,
         pytest.raises(subprocess.TimeoutExpired),
@@ -259,19 +259,19 @@ def test_kill_tree_freezes_root_group_before_first_snapshot() -> None:
     order: list[str] = []
     with (
         patch("core.blocked_recovery._descendant_pids", side_effect=lambda _pid: order.append("snapshot") or []),
-        patch("core.blocked_recovery._marker_pids", side_effect=lambda _m: order.append("marker") or []),
+        patch("core.blocked_recovery._marker_pids", side_effect=lambda _m: order.append("marker") or ([], True)),
         patch("core.blocked_recovery.os.killpg", side_effect=lambda _pid, sig: order.append(f"killpg:{int(sig)}")),
     ):
         blocked_recovery._kill_tree(proc, "m")
     stop, kill_sig = int(blocked_recovery.signal.SIGSTOP), int(blocked_recovery.signal.SIGKILL)
-    assert order == [f"killpg:{stop}", "snapshot", "marker", f"killpg:{kill_sig}", "marker"]
+    assert order == [f"killpg:{stop}", "marker", "snapshot", f"killpg:{kill_sig}", "marker"]
 
 
 def test_kill_tree_marker_sweep_catches_reparented_daemon() -> None:
     """A daemon that left the tree (not a descendant) but carries the marker is frozen and killed."""
     proc = Mock()
     proc.pid = 77
-    marker_snapshots = [[900], [900], []]
+    marker_snapshots = [([900], True), ([900], True), ([], True)]
     with (
         patch("core.blocked_recovery._descendant_pids", return_value=[]),
         patch("core.blocked_recovery._marker_pids", side_effect=marker_snapshots),
@@ -288,7 +288,7 @@ def test_kill_tree_post_kill_sweep_kills_and_warns_on_strays(caplog: pytest.LogC
     proc.pid = 77
     with (
         patch("core.blocked_recovery._descendant_pids", return_value=[]),
-        patch("core.blocked_recovery._marker_pids", side_effect=[[], [901]]),
+        patch("core.blocked_recovery._marker_pids", side_effect=[([], True), ([901], True)]),
         patch("core.blocked_recovery.os.kill") as kill,
         patch("core.blocked_recovery.os.killpg"),
         caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
@@ -340,8 +340,46 @@ def test_marker_pids_parses_ps_env_output_and_skips_zombies_and_self() -> None:
         patch("core.blocked_recovery.sys.platform", "darwin"),
         patch("core.blocked_recovery._ps_lines", return_value=listing.splitlines()) as ps,
     ):
-        assert blocked_recovery._marker_pids("m1") == [500]
+        assert blocked_recovery._marker_pids("m1") == ([500], True)
     ps.assert_called_once_with(["-axEo", "pid=,stat=,command="])
+
+
+def test_marker_pids_linux_reports_incomplete_when_environ_unreadable(tmp_path: Path) -> None:
+    """A non-dumpable daemon hides its environ (EACCES); that must count as incomplete, not 'no marker'."""
+    fake_proc = tmp_path / "proc"
+    (fake_proc / "600").mkdir(parents=True)
+    (fake_proc / "600" / "environ").write_bytes(b"ANIMAWORKS_UNBLOCK_CHECK_ID=m1\0PATH=/bin\0")
+    (fake_proc / "601").mkdir()
+    (fake_proc / "601" / "environ").write_bytes(b"OTHER=1\0")
+    (fake_proc / "602").mkdir()  # environ unreadable
+    (fake_proc / "notapid").mkdir()
+    real_read_bytes = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self.parent.name == "602":
+            raise PermissionError(13, "Permission denied")
+        return real_read_bytes(self)
+
+    with (
+        patch("core.blocked_recovery.sys.platform", "linux"),
+        patch("core.blocked_recovery.Path", side_effect=lambda p: fake_proc if p == "/proc" else Path(p)),
+        patch.object(Path, "read_bytes", read_bytes),
+    ):
+        assert blocked_recovery._marker_pids("m1") == ([600], False)
+
+
+def test_kill_tree_incomplete_marker_enumeration_warns(caplog: pytest.LogCaptureFixture) -> None:
+    proc = Mock()
+    proc.pid = 77
+    with (
+        patch("core.blocked_recovery._descendant_pids", return_value=[]),
+        patch("core.blocked_recovery._marker_pids", return_value=([], False)),
+        patch("core.blocked_recovery.os.killpg"),
+        caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
+    ):
+        blocked_recovery._kill_tree(proc, "m")
+    assert "cleanup incomplete" in caplog.text
+    assert "enumeration_ok=False" in caplog.text
 
 
 def test_kill_tree_pass_limit_bounds_a_runaway_forker() -> None:
@@ -350,7 +388,7 @@ def test_kill_tree_pass_limit_bounds_a_runaway_forker() -> None:
     counter = iter(range(10, 10_000))
     with (
         patch("core.blocked_recovery._descendant_pids", side_effect=lambda _pid: [next(counter)]) as descendants,
-        patch("core.blocked_recovery._marker_pids", return_value=[]),
+        patch("core.blocked_recovery._marker_pids", return_value=([], True)),
         patch("core.blocked_recovery.os.kill"),
         patch("core.blocked_recovery.os.killpg") as killpg,
     ):
