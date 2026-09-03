@@ -289,6 +289,26 @@ describe("image-input document drag & drop", () => {
     assert.equal(manager.getFileCount(), 1, "a failed read must not poison de-duplication");
   });
 
+  it("keeps an image conversion failure sticky so a bare submit is blocked", async () => {
+    // The mock <canvas> has no getContext(), so decoding succeeds but conversion throws.
+    const OriginalImage = globalThis.Image;
+    globalThis.Image = class { set src(_value) { queueMicrotask(() => this.onload?.()); } };
+    try {
+      container.dispatch("drop", dropEvent([makeFile("photo.png", { type: "image/png" })]));
+      await flush();
+    } finally {
+      globalThis.Image = OriginalImage;
+    }
+    assert.equal(manager.getImageCount(), 0);
+    assert.equal(manager.isProcessing(), false);
+    assert.equal(manager.getStatus()?.kind, "error");
+    assert.equal(manager.prepareForSubmit(), false, "a rejected image must not degrade into a text-only send");
+    // A later successful document in the same batch must not hide the conversion error.
+    container.dispatch("drop", dropEvent([makeFile("ok.pdf")]));
+    await flush();
+    assert.equal(manager.getFileCount(), 1);
+  });
+
   it("blocks submit while a document is still being read", () => {
     container.dispatch("drop", dropEvent([makeFile("slow.pdf")]));
     assert.equal(manager.isProcessing(), true);

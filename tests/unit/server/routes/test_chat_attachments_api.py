@@ -10,7 +10,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from server.stream_registry import StreamRegistry
-from tests.unit.core.test_document_attachments import make_cfb, make_docx, make_xlsx
+from tests.unit.core.test_document_attachments import make_cfb, make_docx, make_fib, make_workbook, make_xlsx
 
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -166,12 +166,12 @@ async def test_legacy_office_formats_are_stored_without_sidecar(data_dir: Path, 
                 {
                     "name": "old.doc",
                     "media_type": "application/msword",
-                    "data": _b64(make_cfb([("WordDocument", 2)])),
+                    "data": _b64(make_cfb(streams={"WordDocument": make_fib()})),
                 },
                 {
                     "name": "old.xls",
                     "media_type": "application/vnd.ms-excel",
-                    "data": _b64(make_cfb([("Workbook", 2)])),
+                    "data": _b64(make_cfb(streams={"Workbook": make_workbook([0x00])})),
                 },
                 {"name": "win.csv", "media_type": "application/vnd.ms-excel", "data": _b64(b"a,b\n1,2\n")},
             ],

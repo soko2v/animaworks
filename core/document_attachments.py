@@ -156,13 +156,35 @@ def _validate_ooxml(data: bytes, suffix: str) -> None:
 
 
 # ── Validation: OLE2 / Compound File Binary (.doc/.xls) ────
+#
+# A minimal MS-CFB reader: header -> DIFAT -> FAT -> directory, plus the mini
+# FAT / mini stream for streams below the cutoff.  Every count the file
+# declares is checked against the physical file size, every chain is
+# loop-guarded and every sector id is bounds-checked before it is dereferenced,
+# so a hostile container cannot make the reader allocate more than a small
+# multiple of the upload size.  Any inconsistency raises ``invalid``.
 
-_CFB_MAX_REGULAR_SECTOR = 0xFFFFFFFA  # sector ids >= this are markers (DIFSECT/FATSECT/ENDOFCHAIN/FREESECT)
+_CFB_MAX_REGULAR_SECTOR = 0xFFFFFFFA  # ids >= this are markers (DIFSECT/FATSECT/ENDOFCHAIN/FREESECT)
+_CFB_DIFSECT = 0xFFFFFFFC
+_CFB_FATSECT = 0xFFFFFFFD
 _CFB_MAX_DIR_SECTORS = 4096
 _CFB_MAX_DIFAT_SECTORS = 1024
 _CFB_DIR_ENTRY = 128
+_CFB_HEADER_DIFAT_SLOTS = 109
+_CFB_MINI_SECTOR = 64
 _CFB_TYPE_STORAGE, _CFB_TYPE_STREAM, _CFB_TYPE_ROOT = 1, 2, 5
 _OLE_MACRO_NAMES = frozenset({"macros", "vba", "_vba_project_cur", "_vba_project"})
+
+# Excel binary workbook (BIFF5/BIFF8) records that reveal macro sheets even
+# when no VBA storage exists (Excel 4.0 / XLM macros live in the Workbook stream).
+_BIFF_BOF = 0x0809
+_BIFF_BOUNDSHEET = 0x0085
+_BIFF_BOF_MACRO_TYPES = frozenset({0x0006, 0x0040})  # VB module, Excel 4.0 macro sheet
+_BIFF_BOUNDSHEET_MACRO_TYPES = frozenset({0x01, 0x06})  # macro sheet, VB module
+# Word binary File Information Block: Word 6/95 files carry WordBasic macros
+# outside any VBA storage, so only Word 97+ (nFib >= 0x00C1) is accepted.
+_WORD_FIB_IDENT = 0xA5EC
+_WORD_FIB_MIN_NFIB = 0x00C1
 
 
 def _u16(buf: bytes, offset: int) -> int:
@@ -173,84 +195,247 @@ def _u32(buf: bytes, offset: int) -> int:
     return int.from_bytes(buf[offset : offset + 4], "little")
 
 
-def _cfb_sector(data: bytes, index: int, sector_size: int) -> bytes:
-    if index >= _CFB_MAX_REGULAR_SECTOR:
-        raise DocumentValidationError("invalid", "CFB sector id is a marker")
-    start = (index + 1) * sector_size
-    end = start + sector_size
-    if end > len(data):
-        raise DocumentValidationError("invalid", "CFB sector beyond end of file")
-    return data[start:end]
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return -(-numerator // denominator)
 
 
-def _cfb_directory_entries(data: bytes) -> list[tuple[str, int]]:
-    """Return ``[(name, object_type), ...]`` for every used directory entry.
+class _CfbEntry:
+    __slots__ = ("name", "object_type", "size", "start")
 
-    Walks the header -> DIFAT -> FAT -> directory chain of a Compound File
-    (MS-CFB).  Any structural inconsistency raises ``invalid`` so a payload
-    that merely starts with the OLE magic is not accepted.
-    """
-    if len(data) < 512 or not data.startswith(_OLE_MAGIC):
-        raise DocumentValidationError("invalid", "not an OLE2 compound file")
-    major, byte_order, shift = _u16(data, 26), _u16(data, 28), _u16(data, 30)
-    if byte_order != 0xFFFE or (major, shift) not in {(3, 9), (4, 12)}:
-        raise DocumentValidationError("invalid", "unsupported CFB header")
-    sector_size = 1 << shift
-    num_fat, first_dir = _u32(data, 44), _u32(data, 48)
-    first_difat, num_difat = _u32(data, 68), _u32(data, 72)
+    def __init__(self, name: str, object_type: int, start: int, size: int) -> None:
+        self.name = name
+        self.object_type = object_type
+        self.start = start
+        self.size = size
 
-    fat_sectors = [s for s in (_u32(data, 76 + 4 * i) for i in range(109)) if s < _CFB_MAX_REGULAR_SECTOR]
-    seen: set[int] = set()
-    cursor = first_difat
-    while cursor < _CFB_MAX_REGULAR_SECTOR:
-        if cursor in seen or len(seen) >= min(num_difat, _CFB_MAX_DIFAT_SECTORS):
-            raise DocumentValidationError("invalid", "CFB DIFAT chain")
-        seen.add(cursor)
-        sec = _cfb_sector(data, cursor, sector_size)
-        fat_sectors.extend(
-            e for e in (_u32(sec, 4 * i) for i in range(sector_size // 4 - 1)) if e < _CFB_MAX_REGULAR_SECTOR
-        )
-        cursor = _u32(sec, sector_size - 4)
-    fat_sectors = fat_sectors[:num_fat]
-    if not fat_sectors:
-        raise DocumentValidationError("invalid", "CFB has no FAT")
-    fat: list[int] = []
-    for s in fat_sectors:
-        sec = _cfb_sector(data, s, sector_size)
-        fat.extend(_u32(sec, 4 * i) for i in range(sector_size // 4))
 
-    entries: list[tuple[str, int]] = []
-    seen = set()
-    cursor = first_dir
-    while cursor < _CFB_MAX_REGULAR_SECTOR:
-        if cursor in seen or len(seen) >= _CFB_MAX_DIR_SECTORS:
-            raise DocumentValidationError("invalid", "CFB directory chain")
-        seen.add(cursor)
-        sec = _cfb_sector(data, cursor, sector_size)
-        for off in range(0, sector_size, _CFB_DIR_ENTRY):
-            entry = sec[off : off + _CFB_DIR_ENTRY]
-            etype = entry[66]
-            if etype == 0:
-                continue
-            if etype not in (_CFB_TYPE_STORAGE, _CFB_TYPE_STREAM, _CFB_TYPE_ROOT):
-                raise DocumentValidationError("invalid", "CFB directory entry type")
-            name_len = _u16(entry, 64)
-            if name_len < 2 or name_len > 64 or name_len % 2:
-                raise DocumentValidationError("invalid", "CFB directory entry name")
-            entries.append((entry[: name_len - 2].decode("utf-16-le", errors="replace"), etype))
-        if cursor >= len(fat):
+class _CompoundFile:
+    """Read-only, bounds-checked view of a Compound File Binary payload."""
+
+    def __init__(self, data: bytes) -> None:
+        if len(data) < 512 or not data.startswith(_OLE_MAGIC):
+            raise DocumentValidationError("invalid", "not an OLE2 compound file")
+        major, byte_order = _u16(data, 26), _u16(data, 28)
+        shift, mini_shift = _u16(data, 30), _u16(data, 32)
+        if byte_order != 0xFFFE or (major, shift) not in {(3, 9), (4, 12)} or mini_shift != 6:
+            raise DocumentValidationError("invalid", "unsupported CFB header")
+        self.data = data
+        self.sector_size = 1 << shift
+        # Sectors physically present after the header sector; every sector id
+        # used anywhere in the file must be below this.
+        self.sector_count = len(data) // self.sector_size - 1
+        if self.sector_count < 1:
+            raise DocumentValidationError("invalid", "CFB has no sectors")
+        self.mini_cutoff = _u32(data, 56)
+        self.fat = self._load_fat()
+        self.entries = self._load_directory()
+        self._mini_fat: list[int] | None = None
+        self._mini_stream: bytes | None = None
+
+    # ── sectors / chains ──
+
+    def _sector(self, index: int) -> bytes:
+        if index >= self.sector_count:  # also rejects marker values
+            raise DocumentValidationError("invalid", "CFB sector beyond end of file")
+        start = (index + 1) * self.sector_size
+        return self.data[start : start + self.sector_size]
+
+    @staticmethod
+    def _next(fat: list[int], index: int) -> int:
+        if index >= len(fat):
             raise DocumentValidationError("invalid", "CFB FAT truncated")
-        cursor = fat[cursor]
-    if not entries or entries[0][1] != _CFB_TYPE_ROOT:
-        raise DocumentValidationError("invalid", "CFB root entry missing")
-    return entries
+        return fat[index]
+
+    def _read_chain(self, fat: list[int], start: int, size: int, sector_fn, sector_size: int) -> bytes:
+        """Return the first *size* bytes of the chain beginning at *start*."""
+        if size <= 0:
+            return b""
+        needed = _ceil_div(size, sector_size)
+        out = bytearray()
+        seen: set[int] = set()
+        cursor = start
+        while True:
+            if cursor >= _CFB_MAX_REGULAR_SECTOR:
+                raise DocumentValidationError("invalid", "CFB chain shorter than stream size")
+            if cursor in seen or len(seen) >= needed:
+                raise DocumentValidationError("invalid", "CFB chain loop")
+            seen.add(cursor)
+            out += sector_fn(cursor)
+            if len(out) >= size:
+                return bytes(out[:size])
+            cursor = self._next(fat, cursor)
+
+    # ── FAT / DIFAT ──
+
+    def _load_fat(self) -> list[int]:
+        data, sector_size = self.data, self.sector_size
+        per_sector = sector_size // 4
+        num_fat, first_difat, num_difat = _u32(data, 44), _u32(data, 68), _u32(data, 72)
+        # One FAT sector describes `per_sector` sectors; allow one spare sector
+        # for writers that pre-allocate, nothing beyond what the file could hold.
+        max_fat = _ceil_div(self.sector_count, per_sector) + 1
+        if num_fat < 1 or num_fat > max_fat:
+            raise DocumentValidationError("invalid", "CFB FAT count inconsistent with file size")
+        needed_difat = _ceil_div(max(num_fat - _CFB_HEADER_DIFAT_SLOTS, 0), per_sector - 1)
+        max_difat = min(needed_difat + 1, _CFB_MAX_DIFAT_SECTORS, self.sector_count)
+        if num_difat < needed_difat or num_difat > max_difat:
+            raise DocumentValidationError("invalid", "CFB DIFAT count inconsistent with FAT count")
+
+        fat_sectors = [
+            s for s in (_u32(data, 76 + 4 * i) for i in range(_CFB_HEADER_DIFAT_SLOTS)) if s < _CFB_MAX_REGULAR_SECTOR
+        ]
+        difat_sectors: list[int] = []
+        difat_seen: set[int] = set()
+        cursor = first_difat
+        while cursor < _CFB_MAX_REGULAR_SECTOR:
+            if cursor in difat_seen or len(difat_sectors) >= num_difat:
+                raise DocumentValidationError("invalid", "CFB DIFAT chain longer than declared")
+            difat_seen.add(cursor)
+            difat_sectors.append(cursor)
+            sec = self._sector(cursor)
+            fat_sectors.extend(
+                e for e in (_u32(sec, 4 * i) for i in range(per_sector - 1)) if e < _CFB_MAX_REGULAR_SECTOR
+            )
+            cursor = _u32(sec, sector_size - 4)
+        if len(difat_sectors) != num_difat:
+            raise DocumentValidationError("invalid", "CFB DIFAT chain shorter than declared")
+        if len(fat_sectors) < num_fat:
+            raise DocumentValidationError("invalid", "CFB DIFAT lists fewer FAT sectors than declared")
+        fat_sectors = fat_sectors[:num_fat]
+        fat_set = set(fat_sectors)
+        if len(fat_set) != num_fat or fat_set & difat_seen:
+            raise DocumentValidationError("invalid", "CFB FAT/DIFAT sector ids repeat")
+
+        fat: list[int] = []
+        for s in fat_sectors:
+            sec = self._sector(s)
+            fat.extend(_u32(sec, 4 * i) for i in range(per_sector))
+        # Sector roles: FAT sectors are marked FATSECT and DIFAT sectors DIFSECT.
+        for s in fat_sectors:
+            if self._next(fat, s) != _CFB_FATSECT:
+                raise DocumentValidationError("invalid", "CFB FAT sector not marked FATSECT")
+        for s in difat_sectors:
+            if self._next(fat, s) != _CFB_DIFSECT:
+                raise DocumentValidationError("invalid", "CFB DIFAT sector not marked DIFSECT")
+        return fat
+
+    # ── directory ──
+
+    def _load_directory(self) -> list[_CfbEntry]:
+        entries: list[_CfbEntry] = []
+        seen: set[int] = set()
+        cursor = _u32(self.data, 48)
+        while cursor < _CFB_MAX_REGULAR_SECTOR:
+            if cursor in seen or len(seen) >= _CFB_MAX_DIR_SECTORS:
+                raise DocumentValidationError("invalid", "CFB directory chain")
+            seen.add(cursor)
+            sec = self._sector(cursor)
+            for off in range(0, self.sector_size, _CFB_DIR_ENTRY):
+                entry = sec[off : off + _CFB_DIR_ENTRY]
+                etype = entry[66]
+                if etype == 0:
+                    continue
+                if etype not in (_CFB_TYPE_STORAGE, _CFB_TYPE_STREAM, _CFB_TYPE_ROOT):
+                    raise DocumentValidationError("invalid", "CFB directory entry type")
+                name_len = _u16(entry, 64)
+                if name_len < 2 or name_len > 64 or name_len % 2:
+                    raise DocumentValidationError("invalid", "CFB directory entry name")
+                name = entry[: name_len - 2].decode("utf-16-le", errors="replace")
+                size = _u32(entry, 120)
+                if etype == _CFB_TYPE_STREAM and size > len(self.data):
+                    raise DocumentValidationError("invalid", "CFB stream larger than file")
+                entries.append(_CfbEntry(name, etype, _u32(entry, 116), size))
+            cursor = self._next(self.fat, cursor)
+        if not entries or entries[0].object_type != _CFB_TYPE_ROOT:
+            raise DocumentValidationError("invalid", "CFB root entry missing")
+        return entries
+
+    # ── streams ──
+
+    def find_stream(self, *names: str) -> _CfbEntry | None:
+        wanted = {n.lower() for n in names}
+        for entry in self.entries:
+            if entry.object_type == _CFB_TYPE_STREAM and entry.name.lower() in wanted:
+                return entry
+        return None
+
+    def _load_mini_stream(self) -> bytes:
+        if self._mini_stream is None:
+            root = self.entries[0]
+            size = min(root.size, len(self.data))
+            self._mini_stream = self._read_chain(self.fat, root.start, size, self._sector, self.sector_size)
+        return self._mini_stream
+
+    def _load_mini_fat(self) -> list[int]:
+        if self._mini_fat is None:
+            first, count = _u32(self.data, 60), _u32(self.data, 64)
+            if count > self.sector_count:
+                raise DocumentValidationError("invalid", "CFB mini FAT count inconsistent with file size")
+            raw = self._read_chain(self.fat, first, count * self.sector_size, self._sector, self.sector_size)
+            self._mini_fat = [_u32(raw, 4 * i) for i in range(len(raw) // 4)]
+        return self._mini_fat
+
+    def read_stream(self, entry: _CfbEntry, limit: int) -> bytes:
+        """Return the first ``min(entry.size, limit)`` bytes of *entry*."""
+        size = min(entry.size, limit)
+        if entry.size >= self.mini_cutoff:
+            return self._read_chain(self.fat, entry.start, size, self._sector, self.sector_size)
+        mini_stream = self._load_mini_stream()
+
+        def mini_sector(index: int) -> bytes:
+            start = index * _CFB_MINI_SECTOR
+            if start + _CFB_MINI_SECTOR > len(mini_stream):
+                raise DocumentValidationError("invalid", "CFB mini sector beyond mini stream")
+            return mini_stream[start : start + _CFB_MINI_SECTOR]
+
+        return self._read_chain(self._load_mini_fat(), entry.start, size, mini_sector, _CFB_MINI_SECTOR)
 
 
-def _validate_ole(data: bytes) -> None:
-    for name, _etype in _cfb_directory_entries(data):
-        lowered = name.lower()
+def _scan_biff_for_macros(stream: bytes) -> None:
+    """Walk the BIFF record stream and reject macro sheets / VB modules."""
+    if len(stream) < 4 or _u16(stream, 0) != _BIFF_BOF:
+        raise DocumentValidationError("invalid", "Workbook stream does not start with BOF")
+    offset = 0
+    while offset + 4 <= len(stream):
+        rid, rlen = _u16(stream, offset), _u16(stream, offset + 2)
+        body = offset + 4
+        if body + rlen > len(stream):
+            raise DocumentValidationError("invalid", "truncated BIFF record")
+        if rid == _BIFF_BOF and rlen >= 4 and _u16(stream, body + 2) in _BIFF_BOF_MACRO_TYPES:
+            raise DocumentValidationError("macro", "Excel macro sheet / VB module substream")
+        if rid == _BIFF_BOUNDSHEET and rlen >= 6 and stream[body + 5] in _BIFF_BOUNDSHEET_MACRO_TYPES:
+            raise DocumentValidationError("macro", "Excel macro sheet in BOUNDSHEET")
+        offset = body + rlen
+
+
+def _validate_xls(cfb: _CompoundFile) -> None:
+    entry = cfb.find_stream("Workbook") or cfb.find_stream("Book")
+    if entry is None:
+        raise DocumentValidationError("invalid", "no Workbook stream")
+    _scan_biff_for_macros(cfb.read_stream(entry, len(cfb.data)))
+
+
+def _validate_doc(cfb: _CompoundFile) -> None:
+    entry = cfb.find_stream("WordDocument")
+    if entry is None:
+        raise DocumentValidationError("invalid", "no WordDocument stream")
+    fib = cfb.read_stream(entry, 32)
+    if len(fib) < 4 or _u16(fib, 0) != _WORD_FIB_IDENT:
+        raise DocumentValidationError("invalid", "WordDocument stream has no FIB")
+    if _u16(fib, 2) < _WORD_FIB_MIN_NFIB:
+        raise DocumentValidationError("unsupported", "Word 6/95 binary documents are not accepted")
+
+
+def _validate_ole(data: bytes, suffix: str) -> None:
+    cfb = _CompoundFile(data)
+    for entry in cfb.entries:
+        lowered = entry.name.lower()
         if lowered in _OLE_MACRO_NAMES or lowered.startswith("_vba_project"):
-            raise DocumentValidationError("macro", f"VBA storage present: {name}")
+            raise DocumentValidationError("macro", f"VBA storage present: {entry.name}")
+    if suffix == ".xls":
+        _validate_xls(cfb)
+    else:
+        _validate_doc(cfb)
 
 
 def validate_document_bytes(data: bytes, suffix: str) -> None:
@@ -273,36 +458,52 @@ def validate_document_bytes(data: bytes, suffix: str) -> None:
         _validate_ooxml(data, suffix)
         return
     if suffix in OLE_SUFFIXES:
-        _validate_ole(data)
+        _validate_ole(data, suffix)
         return
     raise DocumentValidationError("unsupported", f"no validator for {suffix!r}")
 
 
 # ── Text extraction (single pass over bounded tokens) ──────
 #
-# Every alternative below starts with a literal "<" and is bounded by "[^<>]*"
-# / "[^>]*" character classes, so the scanner never re-reads input for an
-# unclosed tag: cost is proportional to the XML size regardless of nesting.
+# Every alternative below starts with a literal "<" and its attribute / text
+# portion is a "[^<>]*" or "[^<]*" class, so an attempt that starts at one "<"
+# can never scan past the next "<": unclosed tags, long attribute lists and
+# repeated prefixes all cost time proportional to the distance to the next
+# tag, keeping the whole scan linear in the part size.
 
-_DOCX_TOKEN_RE = re.compile(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>|<w:tab/>|<w:br/>|<w:cr/>|</w:p>|<w:p/>")
-_SST_TOKEN_RE = re.compile(r"<si>|</si>|<t(?:\s[^>]*)?>([^<]*)</t>")
-_SHEET_TOKEN_RE = re.compile(
-    r"<c\b([^>]*?)/>|<c\b([^>]*)>|</c>|</row>|<v>([^<]*)</v>|<t(?:\s[^>]*)?>([^<]*)</t>",
-)
+_DOCX_TOKEN_RE = re.compile(r"<w:t(?:\s[^<>]*)?>([^<]*)</w:t>|<w:tab/>|<w:br/>|<w:cr/>|</w:p>|<w:p/>")
+_SST_TOKEN_RE = re.compile(r"<si>|</si>|<t(?:\s[^<>]*)?>([^<]*)</t>")
+_SHEET_TOKEN_RE = re.compile(r"<c\b([^<>]*)>|</c>|</row>|<v>([^<]*)</v>|<t(?:\s[^<>]*)?>([^<]*)</t>")
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
-_WB_SHEET_RE = re.compile(r"<sheet\b([^>]*)/?>")
-_RELS_RE = re.compile(r"<Relationship\b([^>]*)/?>")
+_WB_SHEET_RE = re.compile(r"<sheet\b([^<>]*)>")
+_RELS_RE = re.compile(r"<Relationship\b([^<>]*)>")
+
+_MAX_SHARED_STRINGS = _MAX_TEXT_CHARS  # more strings than output chars can never all be rendered
 
 
 class _TextBudget:
-    """Accumulate output lines while enforcing ``_MAX_TEXT_CHARS``."""
+    """Accumulate output lines while enforcing ``_MAX_TEXT_CHARS``.
+
+    ``reserve`` accounts for characters buffered for the line under
+    construction so an unclosed paragraph/row cannot grow without bound before
+    it is flushed; ``add`` commits a line.
+    """
 
     def __init__(self) -> None:
         self.lines: list[str] = []
         self.size = 0
+        self.pending = 0
         self.truncated = False
 
+    def reserve(self, chars: int) -> bool:
+        self.pending += chars
+        if self.size + self.pending > _MAX_TEXT_CHARS:
+            self.truncated = True
+            return False
+        return True
+
     def add(self, line: str) -> bool:
+        self.pending = 0
         self.lines.append(line)
         self.size += len(line) + 1
         if self.size > _MAX_TEXT_CHARS:
@@ -324,7 +525,10 @@ def _extract_docx_text(archive: zipfile.ZipFile) -> str:
     for m in _DOCX_TOKEN_RE.finditer(xml):
         text = m.group(1)
         if text is not None:
-            parts.append(unescape(text))
+            text = unescape(text)
+            parts.append(text)
+            if not budget.reserve(len(text)):
+                break
             continue
         token = m.group(0)
         if token == "<w:tab/>":
@@ -335,17 +539,22 @@ def _extract_docx_text(archive: zipfile.ZipFile) -> str:
             if not budget.add("".join(parts)):
                 return budget.render()
             parts = []
+            continue
+        if not budget.reserve(1):
+            break
     if parts:
         budget.add("".join(parts))
     return budget.render()
 
 
-def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+def _xlsx_shared_strings(archive: zipfile.ZipFile) -> tuple[list[str], bool]:
+    """Return ``(strings, truncated)``; parsing stops once the table exceeds the output budget."""
     if "xl/sharedStrings.xml" not in archive.namelist():
-        return []
+        return [], False
     xml = _read_part(archive, "xl/sharedStrings.xml").decode("utf-8", errors="replace")
     strings: list[str] = []
     current: list[str] | None = None
+    stored = 0
     for m in _SST_TOKEN_RE.finditer(xml):
         token = m.group(0)
         if token == "<si>":
@@ -353,9 +562,15 @@ def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
         elif token == "</si>":
             strings.append("".join(current or []))
             current = None
+            if len(strings) >= _MAX_SHARED_STRINGS:
+                return strings, True
         elif current is not None:
-            current.append(unescape(m.group(1) or ""))
-    return strings
+            text = unescape(m.group(1) or "")
+            current.append(text)
+            stored += len(text)
+            if stored > _MAX_TEXT_CHARS:
+                return strings, True
+    return strings, False
 
 
 def _xlsx_sheet_order(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
@@ -404,8 +619,9 @@ def _xlsx_cell_value(kind: str, raw: str | None, inline: list[str], shared: list
 
 
 def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
-    shared = _xlsx_shared_strings(archive)
+    shared, shared_truncated = _xlsx_shared_strings(archive)
     budget = _TextBudget()
+    budget.truncated = shared_truncated
     for sheet_name, part in _xlsx_sheet_order(archive):
         xml = _read_part(archive, part).decode("utf-8", errors="replace")
         if not budget.add(f"## Sheet: {sheet_name}"):
@@ -417,26 +633,40 @@ def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
         in_cell = False
         for m in _SHEET_TOKEN_RE.finditer(xml):
             token = m.group(0)
-            if m.group(1) is not None:  # <c .../> empty cell
-                row.append("")
-            elif m.group(2) is not None:  # <c ...>
-                kind = dict(_ATTR_RE.findall(m.group(2))).get("t", "")
+            attrs = m.group(1)
+            if attrs is not None:  # <c ...> or <c .../>
+                if attrs.rstrip().endswith("/"):
+                    row.append("")
+                    in_cell = False
+                    if not budget.reserve(1):
+                        break
+                    continue
+                kind = dict(_ATTR_RE.findall(attrs)).get("t", "")
                 raw, inline, in_cell = None, [], True
             elif token == "</c>":
                 if in_cell:
                     value = _xlsx_cell_value(kind, raw, inline, shared)
                     row.append(value.replace("\t", " ").replace("\n", " "))
-                in_cell = False
+                    in_cell = False
+                    if not budget.reserve(len(value) + 1):
+                        break
             elif token == "</row>":
                 if not budget.add("\t".join(row).rstrip("\t")):
                     return budget.render()
                 row = []
-            elif m.group(3) is not None:  # <v>
+            elif m.group(2) is not None:  # <v>
                 if in_cell:
-                    raw = unescape(m.group(3))
+                    raw = unescape(m.group(2))
+                    if not budget.reserve(len(raw)):
+                        break
             elif in_cell:  # <t> inside <is>
-                inline.append(unescape(m.group(4) or ""))
-        if row and not budget.add("\t".join(row).rstrip("\t")):
+                text = unescape(m.group(3) or "")
+                inline.append(text)
+                if not budget.reserve(len(text)):
+                    break
+        if row:
+            budget.add("\t".join(row).rstrip("\t"))
+        if budget.truncated:
             return budget.render()
         budget.add("")
     return budget.render()

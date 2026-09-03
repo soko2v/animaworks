@@ -201,7 +201,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         onImagesChanged?.();
       } catch (error) {
         releaseIdentity(identity);
-        status = { kind: "error", message: error?.message || t("chat.image_decode_failed") };
+        setStatus("error", error?.message || t("chat.image_decode_failed"));
       } finally {
         processingCount -= 1;
         URL.revokeObjectURL(img.src);

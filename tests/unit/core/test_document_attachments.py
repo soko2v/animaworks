@@ -99,39 +99,117 @@ def make_xlsx_raw(sheet_xml: str, *, shared_strings: str = "<sst/>", sheet_name:
     return buf.getvalue()
 
 
-def make_cfb(entries: list[tuple[str, int]] | None = None) -> bytes:
-    """Minimal valid MS-CFB v3 file: sector 0 = FAT, sector 1 = directory (root + up to 3 entries)."""
-    sector = 512
+FREESECT, ENDOFCHAIN, FATSECT, DIFSECT = 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC
+
+
+def make_cfb(
+    entries: list[tuple[str, int]] | None = None,
+    *,
+    streams: dict[str, bytes] | None = None,
+    sector_shift: int = 9,
+) -> bytes:
+    """Spec-conformant MS-CFB (v3 for shift 9, v4 for shift 12) with optional stream content.
+
+    Layout: sector 0 = FAT, 1 = directory, 2 = mini FAT, 3.. = stream chains
+    (mini stream container first).  ``entries`` are content-less directory
+    entries ``(name, object_type)``; ``streams`` maps names to bytes and are
+    placed in the mini stream when shorter than the 4096-byte cutoff.
+    """
+    sector = 1 << sector_shift
+    per_sector = sector // 4
+    fat: list[int] = [FATSECT, ENDOFCHAIN, ENDOFCHAIN]  # FAT, directory, mini FAT
+    payloads: dict[int, bytes] = {}
+    mini_fat: list[int] = []
+    mini_container = bytearray()
+
+    def alloc(payload: bytes) -> int:
+        count = max(1, -(-len(payload) // sector))
+        first = len(fat)
+        for i in range(count):
+            fat.append(first + i + 1 if i < count - 1 else ENDOFCHAIN)
+            payloads[first + i] = payload[i * sector : (i + 1) * sector].ljust(sector, b"\0")
+        return first
+
+    directory: list[tuple[str, int, int, int]] = [(name, etype, ENDOFCHAIN, 0) for name, etype in entries or []]
+    for name, payload in (streams or {}).items():
+        if not payload:
+            directory.append((name, 2, ENDOFCHAIN, 0))
+        elif len(payload) < 4096:
+            count = -(-len(payload) // 64)
+            first = len(mini_fat)
+            for i in range(count):
+                mini_fat.append(first + i + 1 if i < count - 1 else ENDOFCHAIN)
+                mini_container += payload[i * 64 : (i + 1) * 64].ljust(64, b"\0")
+            directory.append((name, 2, first, len(payload)))
+        else:
+            directory.append((name, 2, alloc(payload), len(payload)))
+    root_start = alloc(bytes(mini_container)) if mini_container else ENDOFCHAIN
+    assert len(fat) <= per_sector and len(mini_fat) <= per_sector and len(directory) < sector // 128
+
     header = bytearray(sector)
     header[0:8] = OLE_MAGIC
     struct.pack_into("<H", header, 24, 0x003E)  # minor version
-    struct.pack_into("<H", header, 26, 3)  # major version
+    struct.pack_into("<H", header, 26, 4 if sector_shift == 12 else 3)  # major version
     struct.pack_into("<H", header, 28, 0xFFFE)  # byte order
-    struct.pack_into("<H", header, 30, 9)  # sector shift (512)
+    struct.pack_into("<H", header, 30, sector_shift)
     struct.pack_into("<H", header, 32, 6)  # mini sector shift
+    struct.pack_into("<I", header, 40, 1 if sector_shift == 12 else 0)  # directory sectors (v4 only)
     struct.pack_into("<I", header, 44, 1)  # number of FAT sectors
     struct.pack_into("<I", header, 48, 1)  # first directory sector
     struct.pack_into("<I", header, 56, 4096)  # mini stream cutoff
-    struct.pack_into("<I", header, 60, 0xFFFFFFFE)  # first mini FAT sector
-    struct.pack_into("<I", header, 68, 0xFFFFFFFE)  # first DIFAT sector
+    struct.pack_into("<I", header, 60, 2 if mini_fat else ENDOFCHAIN)  # first mini FAT sector
+    struct.pack_into("<I", header, 64, 1 if mini_fat else 0)  # number of mini FAT sectors
+    struct.pack_into("<I", header, 68, ENDOFCHAIN)  # first DIFAT sector
     struct.pack_into("<I", header, 72, 0)  # number of DIFAT sectors
     for i in range(109):
-        struct.pack_into("<I", header, 76 + 4 * i, 0xFFFFFFFF)
+        struct.pack_into("<I", header, 76 + 4 * i, FREESECT)
     struct.pack_into("<I", header, 76, 0)  # DIFAT[0] -> FAT sector 0
-    fat = bytearray(b"\xff" * sector)
-    struct.pack_into("<I", fat, 0, 0xFFFFFFFD)  # sector 0 is a FAT sector
-    struct.pack_into("<I", fat, 4, 0xFFFFFFFE)  # sector 1 (directory) ends the chain
-    directory = bytearray(sector)
-    for i, (name, etype) in enumerate([("Root Entry", 5)] + list(entries or [])):
+
+    def table(values: list[int]) -> bytes:
+        return b"".join(struct.pack("<I", v) for v in values).ljust(sector, b"\xff")
+
+    dir_sector = bytearray(sector)
+    rows = [("Root Entry", 5, root_start, len(mini_container))] + directory
+    for i, (name, etype, start, size) in enumerate(rows):
         off = i * 128
         encoded = name.encode("utf-16-le") + b"\x00\x00"
-        directory[off : off + len(encoded)] = encoded
-        struct.pack_into("<H", directory, off + 64, len(encoded))
-        directory[off + 66] = etype
-        directory[off + 67] = 1
+        dir_sector[off : off + len(encoded)] = encoded
+        struct.pack_into("<H", dir_sector, off + 64, len(encoded))
+        dir_sector[off + 66] = etype
+        dir_sector[off + 67] = 1
         for sibling in (68, 72, 76):
-            struct.pack_into("<I", directory, off + sibling, 0xFFFFFFFF)
-    return bytes(header + fat + directory)
+            struct.pack_into("<I", dir_sector, off + sibling, FREESECT)
+        struct.pack_into("<I", dir_sector, off + 116, start)
+        struct.pack_into("<I", dir_sector, off + 120, size)
+    body = header + table(fat) + dir_sector + table(mini_fat)
+    for index in range(3, len(fat)):
+        body += payloads[index]
+    return bytes(body)
+
+
+def biff(rid: int, body: bytes) -> bytes:
+    return struct.pack("<HH", rid, len(body)) + body
+
+
+def biff_bof(dt: int) -> bytes:
+    return biff(0x0809, struct.pack("<HHHHII", 0x0600, dt, 0x0DBB, 0x07CC, 0, 0x0006))
+
+
+def make_workbook(sheet_types: list[int], *, bof_types: list[int] | None = None) -> bytes:
+    """BIFF8 Workbook stream: globals BOF, one BOUNDSHEET per sheet, EOF, then one substream per sheet."""
+    out = biff_bof(0x0005)
+    for i, dt in enumerate(sheet_types):
+        name = f"Sheet{i + 1}".encode()
+        out += biff(0x0085, struct.pack("<IBB", 0, 0, dt) + bytes([len(name), 0]) + name)
+    out += biff(0x000A, b"")
+    for dt in bof_types if bof_types is not None else [0x0010] * len(sheet_types):
+        out += biff_bof(dt) + biff(0x000A, b"")
+    return out
+
+
+def make_fib(nfib: int = 0x00C1) -> bytes:
+    """Word binary File Information Block header (wIdent + nFib)."""
+    return struct.pack("<HH", 0xA5EC, nfib) + b"\x00" * 28
 
 
 # ── allowlists ────────────────────────────────────────────
@@ -236,9 +314,57 @@ def test_zip_bomb_declared_size_is_rejected(monkeypatch: pytest.MonkeyPatch) -> 
 # ── OLE2 / CFB ────────────────────────────────────────────
 
 
-def test_cfb_documents_without_vba_are_valid() -> None:
-    validate_document_bytes(make_cfb([("WordDocument", 2), ("1Table", 2)]), ".doc")
-    validate_document_bytes(make_cfb([("Workbook", 2), ("\x05SummaryInformation", 2)]), ".xls")
+@pytest.mark.parametrize("sector_shift", [9, 12], ids=["v3-512", "v4-4096"])
+@pytest.mark.parametrize("sheets", [1, 400], ids=["mini-stream", "regular-sectors"])
+def test_xls_without_macros_is_valid(sector_shift: int, sheets: int) -> None:
+    workbook = make_workbook([0x00] * sheets)
+    assert (len(workbook) < 4096) == (sheets == 1), "both mini-stream and regular placement must be exercised"
+    payload = make_cfb(streams={"Workbook": workbook, "\x05SummaryInformation": b"\x00" * 8}, sector_shift=sector_shift)
+    validate_document_bytes(payload, ".xls")
+
+
+def test_xls_excel95_book_stream_is_accepted() -> None:
+    validate_document_bytes(make_cfb(streams={"Book": make_workbook([0x00, 0x02])}), ".xls")
+
+
+@pytest.mark.parametrize(
+    "workbook",
+    [
+        make_workbook([0x00, 0x01]),
+        make_workbook([0x06]),
+        make_workbook([0x00], bof_types=[0x0040]),
+        make_workbook([0x00], bof_types=[0x0006]),
+    ],
+    ids=["boundsheet-xlm-macro-sheet", "boundsheet-vb-module", "bof-macro-sheet", "bof-vb-module"],
+)
+def test_xls_macro_sheets_are_rejected_without_any_vba_storage(workbook: bytes) -> None:
+    with pytest.raises(DocumentValidationError) as exc:
+        validate_document_bytes(make_cfb(streams={"Workbook": workbook}), ".xls")
+    assert exc.value.code == "macro"
+
+
+def test_xls_requires_well_formed_workbook_stream() -> None:
+    cases = {
+        "no-workbook": {"Other": make_workbook([0x00])},
+        "no-bof": {"Workbook": b"\x00" * 64},
+        "truncated-record": {"Workbook": make_workbook([0x00])[:-10]},
+    }
+    for label, streams in cases.items():
+        with pytest.raises(DocumentValidationError) as exc:
+            validate_document_bytes(make_cfb(streams=streams), ".xls")
+        assert exc.value.code == "invalid", label
+
+
+def test_doc_requires_word97_fib() -> None:
+    validate_document_bytes(make_cfb(streams={"WordDocument": make_fib(0x00C1), "1Table": b"\x00" * 16}), ".doc")
+    validate_document_bytes(make_cfb(streams={"WordDocument": make_fib(0x0112)}, sector_shift=12), ".doc")
+    with pytest.raises(DocumentValidationError) as legacy:
+        validate_document_bytes(make_cfb(streams={"WordDocument": make_fib(0x0068)}), ".doc")
+    assert legacy.value.code == "unsupported"
+    for streams in ({"1Table": b"\x00" * 16}, {"WordDocument": b"\x00" * 32}):
+        with pytest.raises(DocumentValidationError) as exc:
+            validate_document_bytes(make_cfb(streams=streams), ".doc")
+        assert exc.value.code == "invalid"
 
 
 @pytest.mark.parametrize(
@@ -251,7 +377,7 @@ def test_cfb_documents_without_vba_are_valid() -> None:
 )
 def test_cfb_vba_storages_are_rejected(entries: list[tuple[str, int]]) -> None:
     with pytest.raises(DocumentValidationError) as exc:
-        validate_document_bytes(make_cfb(entries), ".doc")
+        validate_document_bytes(make_cfb(entries, streams={"WordDocument": make_fib()}), ".doc")
     assert exc.value.code == "macro"
 
 
@@ -263,7 +389,8 @@ def test_ole_magic_alone_is_not_enough() -> None:
 
 
 def test_cfb_structural_corruption_is_rejected() -> None:
-    base = make_cfb([("WordDocument", 2)])
+    base = make_cfb(streams={"WordDocument": make_fib()})
+    validate_document_bytes(base, ".doc")
     # Truncated after the header: directory sector beyond EOF.
     with pytest.raises(DocumentValidationError):
         validate_document_bytes(base[:512], ".doc")
@@ -284,6 +411,39 @@ def test_cfb_structural_corruption_is_rejected() -> None:
     no_root[1024 + 66] = 2
     with pytest.raises(DocumentValidationError):
         validate_document_bytes(bytes(no_root), ".doc")
+    # Stream chain ends before the declared size.
+    short_chain = bytearray(base)
+    struct.pack_into("<I", short_chain, 1024 + 120, 1 << 20)  # root (mini stream) claims 1 MiB
+    with pytest.raises(DocumentValidationError) as chain:
+        validate_document_bytes(bytes(short_chain), ".doc")
+    assert chain.value.code == "invalid"
+
+
+def test_cfb_declared_counts_are_bounded_by_file_size() -> None:
+    base = make_cfb(streams={"WordDocument": make_fib()})
+    validate_document_bytes(base, ".doc")
+
+    def mutated(*writes: tuple[int, int]) -> bytes:
+        buf = bytearray(base)
+        for offset, value in writes:
+            struct.pack_into("<I", buf, offset, value)
+        return bytes(buf)
+
+    cases = {
+        # A million FAT sectors declared through 1024 DIFAT sectors that all point at sector 0.
+        "difat-fat-explosion": mutated((44, 1_000_000), (68, 0), (72, 1024)),
+        "fat-count-beyond-file": mutated((44, 3)),
+        "difat-count-without-chain": mutated((72, 1)),
+        "duplicate-fat-sector": mutated((44, 2), (80, 0)),
+        "fat-sector-not-marked-fatsect": mutated((512, ENDOFCHAIN)),
+        "mini-fat-count-beyond-file": mutated((64, 4096)),
+    }
+    started = time.perf_counter()
+    for label, payload in cases.items():
+        with pytest.raises(DocumentValidationError) as exc:
+            validate_document_bytes(payload, ".doc")
+        assert exc.value.code == "invalid", label
+    assert time.perf_counter() - started < 1.0, "malformed counts must be rejected before any large allocation"
 
 
 def test_unknown_suffix_is_unsupported() -> None:
@@ -324,13 +484,28 @@ def test_docx_extraction_does_not_expand_entities() -> None:
     [
         (".docx", make_docx_raw("<w:document><w:body>" + "<w:p><w:r><w:t>x" * 60_000 + "</w:body></w:document>")),
         (".docx", make_docx_raw("<w:document>" + "<w:p>" * 120_000 + "</w:document>")),
+        (".docx", make_docx_raw("<w:document><w:body><w:p>" + "<w:t " * 200_000 + "</w:p></w:body></w:document>")),
+        (".docx", make_docx_raw("<w:document><w:body><w:p>" + '<w:t xml:space="preserve" ' * 100_000 + "</w:body>")),
         (".xlsx", make_xlsx_raw("<worksheet><sheetData>" + '<row r="1"><c t="s"><v>0' * 60_000 + "</sheetData>")),
+        (".xlsx", make_xlsx_raw("<worksheet><sheetData><row>" + "<c " * 200_000 + "</row></sheetData></worksheet>")),
+        (".xlsx", make_xlsx_raw("<worksheet><sheetData><row>" + '<c r="A1" t="s" ' * 100_000 + "</sheetData>")),
         (".xlsx", make_xlsx_raw("<worksheet/>", shared_strings="<sst>" + "<si><t>x" * 120_000 + "</sst>")),
+        (".xlsx", make_xlsx_raw("<worksheet/>", shared_strings="<sst>" + "<si><t " * 100_000 + "</sst>")),
     ],
-    ids=["docx-unclosed-w:t", "docx-unclosed-w:p", "xlsx-unclosed-row", "xlsx-unclosed-si"],
+    ids=[
+        "docx-unclosed-w:t",
+        "docx-unclosed-w:p",
+        "docx-unclosed-w:t-prefix",
+        "docx-unclosed-w:t-attrs",
+        "xlsx-unclosed-row",
+        "xlsx-unclosed-c-prefix",
+        "xlsx-unclosed-c-attrs",
+        "xlsx-unclosed-si",
+        "xlsx-unclosed-t-prefix",
+    ],
 )
 def test_extraction_is_linear_on_unclosed_tags(suffix: str, payload: bytes) -> None:
-    """Adversarial unclosed tags must not trigger quadratic scanning."""
+    """Adversarial unclosed tags / repeated prefixes must not trigger quadratic scanning."""
     validate_document_bytes(payload, suffix)
     started = time.perf_counter()
     text = extract_document_text(payload, suffix)
@@ -365,6 +540,31 @@ def test_extraction_truncates_large_documents(monkeypatch: pytest.MonkeyPatch) -
     assert text is not None
     assert "truncated" in text
     assert len(text) < 200
+
+
+def test_unclosed_paragraph_is_bounded_by_output_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.document_attachments as mod
+
+    monkeypatch.setattr(mod, "_MAX_TEXT_CHARS", 100)
+    xml = "<w:document><w:body><w:p>" + "<w:r><w:t>abcdefghij</w:t></w:r>" * 5_000 + "</w:body></w:document>"
+    text = extract_document_text(make_docx_raw(xml), ".docx")
+    assert text is not None
+    assert "truncated" in text
+    assert len(text) <= 100 + len(mod._TRUNCATION_MARK)
+
+
+def test_shared_strings_and_unterminated_row_are_bounded_by_output_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.document_attachments as mod
+
+    monkeypatch.setattr(mod, "_MAX_TEXT_CHARS", 100)
+    monkeypatch.setattr(mod, "_MAX_SHARED_STRINGS", 100)
+    sst = "<sst>" + "<si><t>abc</t></si>" * 5_000 + "</sst>"
+    sheet = '<worksheet><sheetData><row r="1"><c t="s"><v>4999</v></c><c t="s"><v>0</v></c></row>' + "<c/>" * 5_000
+    text = extract_document_text(make_xlsx_raw(sheet + "</sheetData></worksheet>", shared_strings=sst), ".xlsx")
+    assert text is not None
+    assert "truncated" in text
+    assert "\tabc" in text, "strings inside the retained table resolve; those beyond it render empty"
+    assert len(text) <= 100 + len(mod._TRUNCATION_MARK)
 
 
 @pytest.mark.parametrize("suffix", [".pdf", ".doc", ".xls", ".txt", ".csv", ".md"])
