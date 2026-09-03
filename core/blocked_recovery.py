@@ -733,6 +733,36 @@ def _wait_unreaped(proc: subprocess.Popen, timeout: float) -> None:
         time.sleep(min(_WAITID_POLL_SECONDS, remaining))
 
 
+def _owns_unreaped_root(proc: subprocess.Popen) -> bool:
+    """Return whether ``proc`` is still our unreaped child without consuming its status.
+
+    ``Popen.returncode`` is only CPython-side state.  In particular, a signal
+    can interrupt ``Popen.wait()`` after its ``waitpid()`` has reaped the
+    child but before that cache has been published.  A successful non-reaping
+    ``waitid`` is the required proof here: it either observes an unreaped
+    zombie or a still-live child, both of which pin the PID and session PGID.
+    Any inability to make that proof deliberately leaves the process alone.
+    """
+    if proc.returncode is not None:
+        return False
+    try:
+        flags = os.WEXITED | os.WNOWAIT | os.WNOHANG
+        waitid = getattr(os, "waitid", None)
+        if waitid is not None:
+            waitid(os.P_PID, proc.pid, flags)
+            return True
+        if sys.platform != "darwin":
+            return False
+        # Some otherwise supported CPython macOS builds omit os.waitid().
+        libc = ctypes.CDLL(None, use_errno=True)
+        info = ctypes.create_string_buffer(128)
+        if libc.waitid(os.P_PID, proc.pid, ctypes.byref(info), flags) != 0:
+            return False
+    except (AttributeError, NotImplementedError, OSError, TypeError, ValueError):
+        return False
+    return True
+
+
 _REAP_ATTEMPTS = 5
 _REAP_WAIT_SECONDS = 2.0
 
@@ -850,13 +880,10 @@ def _run_sandboxed(
             _contain_and_reap(proc, marker)
             raise
         except BaseException:
-            # Signal only while the root is still our unreaped child: an
-            # unreaped root pins its PID and (as session leader) its process
-            # group id, so nothing unrelated can be hit. Once the final
-            # ``wait`` has reaped it -- CPython may reap inside ``wait`` and
-            # still re-raise a KeyboardInterrupt -- those ids may already
-            # belong to another process, so no group signal is sent.
-            if proc.returncode is None and (reject_stderr or proc.poll() is None):
+            # Signal only after a non-reaping OS check proves the root is
+            # still our child. ``returncode`` alone can be stale when
+            # ``wait`` re-raises KeyboardInterrupt after waitpid reaped it.
+            if _owns_unreaped_root(proc):
                 _contain_and_reap(proc, marker)
             raise
     finally:

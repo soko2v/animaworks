@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -316,15 +317,22 @@ def test_run_sandboxed_contains_and_reaps_when_drain_finished_raises(
     drain = Mock()
     drain.finished.side_effect = RuntimeError("reader join failed")
     kill_tree = Mock()
+    waitid = Mock(return_value=None)
     monkeypatch.setattr(blocked_recovery.subprocess, "Popen", lambda *_args, **_kwargs: proc)
     monkeypatch.setattr(blocked_recovery, "_StderrDrain", lambda _stream: drain)
     monkeypatch.setattr(blocked_recovery, "_wait_unreaped", Mock())
     monkeypatch.setattr(blocked_recovery, "_kill_tree", kill_tree)
+    monkeypatch.setattr(blocked_recovery.os, "P_PID", 1, raising=False)
+    monkeypatch.setattr(blocked_recovery.os, "WEXITED", 2, raising=False)
+    monkeypatch.setattr(blocked_recovery.os, "WNOWAIT", 4, raising=False)
+    monkeypatch.setattr(blocked_recovery.os, "WNOHANG", 8, raising=False)
+    monkeypatch.setattr(blocked_recovery.os, "waitid", waitid, raising=False)
 
     with pytest.raises(RuntimeError, match="reader join failed"):
         blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
 
     kill_tree.assert_called_once_with(proc, "m")
+    waitid.assert_called_once_with(1, proc.pid, 14)
     proc.wait.assert_called_once_with(timeout=blocked_recovery._REAP_WAIT_SECONDS)
     assert proc.returncode is not None
 
@@ -339,6 +347,8 @@ def test_run_sandboxed_contains_and_reaps_when_reject_open_stderr_raises(
     monkeypatch.setattr(blocked_recovery.subprocess, "Popen", lambda *_args, **_kwargs: proc)
     monkeypatch.setattr(blocked_recovery, "_StderrDrain", lambda _stream: drain)
     monkeypatch.setattr(blocked_recovery, "_wait_unreaped", Mock())
+    owns_root = Mock(return_value=True)
+    monkeypatch.setattr(blocked_recovery, "_owns_unreaped_root", owns_root)
     monkeypatch.setattr(blocked_recovery, "_kill_tree", kill_tree)
     monkeypatch.setattr(
         blocked_recovery,
@@ -350,6 +360,7 @@ def test_run_sandboxed_contains_and_reaps_when_reject_open_stderr_raises(
         blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
 
     kill_tree.assert_called_once_with(proc, "m")
+    owns_root.assert_called_once_with(proc)
     proc.wait.assert_called_once_with(timeout=blocked_recovery._REAP_WAIT_SECONDS)
     assert proc.returncode is not None
 
@@ -386,7 +397,7 @@ def test_run_sandboxed_reaps_when_kill_tree_raises_after_timeout(
 def test_run_sandboxed_does_not_signal_after_root_reaped_on_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Once the final wait has reaped the root its PID/PGID may be recycled: never signal them."""
+    """A reaped root with an unpublished returncode must never have its PID/PGID signalled."""
     proc = _mock_reaped_process()
     drain = Mock()
     drain.finished.return_value = True
@@ -394,17 +405,22 @@ def test_run_sandboxed_does_not_signal_after_root_reaped_on_interrupt(
     drain.seen = False
 
     def _wait_then_interrupt(*_args, **_kwargs) -> int:
-        proc.returncode = 0
         raise KeyboardInterrupt
 
     proc.wait.side_effect = _wait_then_interrupt
     kill_tree = Mock()
     signal_group = Mock()
+    waitid = Mock(side_effect=ChildProcessError(errno.ECHILD, "no child"))
     monkeypatch.setattr(blocked_recovery.subprocess, "Popen", lambda *_args, **_kwargs: proc)
     monkeypatch.setattr(blocked_recovery, "_StderrDrain", lambda _stream: drain)
     monkeypatch.setattr(blocked_recovery, "_wait_unreaped", Mock())
     monkeypatch.setattr(blocked_recovery, "_kill_tree", kill_tree)
     monkeypatch.setattr(blocked_recovery, "_signal_group", signal_group)
+    monkeypatch.setattr(blocked_recovery.os, "P_PID", 1, raising=False)
+    monkeypatch.setattr(blocked_recovery.os, "WEXITED", 2, raising=False)
+    monkeypatch.setattr(blocked_recovery.os, "WNOWAIT", 4, raising=False)
+    monkeypatch.setattr(blocked_recovery.os, "WNOHANG", 8, raising=False)
+    monkeypatch.setattr(blocked_recovery.os, "waitid", waitid, raising=False)
 
     with pytest.raises(KeyboardInterrupt):
         blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
@@ -412,6 +428,7 @@ def test_run_sandboxed_does_not_signal_after_root_reaped_on_interrupt(
     kill_tree.assert_not_called()
     signal_group.assert_not_called()
     proc.kill.assert_not_called()
+    waitid.assert_called_once_with(1, proc.pid, 14)
 
 
 def test_reap_root_rekills_and_retries_when_wait_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1048,6 +1065,7 @@ def test_run_sandboxed_reaps_child_when_stderr_reader_cannot_start() -> None:
     with (
         patch("core.blocked_recovery.subprocess.Popen", return_value=proc),
         patch("core.blocked_recovery._kill_tree") as kill_tree,
+        patch("core.blocked_recovery._owns_unreaped_root", return_value=True),
         patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")),
         pytest.raises(RuntimeError, match="start new thread"),
     ):
