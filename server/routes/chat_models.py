@@ -14,6 +14,7 @@ MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB decoded per image
 MAX_IMAGE_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB total base64
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB decoded per file
 MAX_FILE_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB total base64
+MAX_FILE_COUNT = 10  # document attachments per message (enforced server-side)
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 MIME_TO_EXT = {

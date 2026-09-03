@@ -10,12 +10,25 @@ const logger = createLogger("image-input");
 
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB per image
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per document
+const MAX_FILE_COUNT = 10; // documents per message (server enforces the same limit)
 const MAX_DIMENSION = 1568; // Max pixel dimension (Anthropic recommendation)
 const SUPPORTED_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const HEIC_TYPES = new Set(["image/heic", "image/heif"]);
+// Extension -> canonical media type sent to the server. The server re-validates
+// bytes, so the browser-declared type is never trusted; we always send this one.
 const DOCUMENT_TYPES = new Map([
   ["pdf", "application/pdf"],
   ["csv", "text/csv"],
+  ["txt", "text/plain"],
+  ["md", "text/markdown"],
+  ["docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+  ["doc", "application/msword"],
+  ["xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+  ["xls", "application/vnd.ms-excel"],
+]);
+const DOCUMENT_LABELS = new Map([
+  ["pdf", "PDF"], ["csv", "CSV"], ["txt", "TXT"], ["md", "MD"],
+  ["docx", "DOCX"], ["doc", "DOC"], ["xlsx", "XLSX"], ["xls", "XLS"],
 ]);
 const TYPE_BY_EXTENSION = new Map([
   ["jpg", "image/jpeg"], ["jpeg", "image/jpeg"], ["png", "image/png"],
@@ -23,11 +36,55 @@ const TYPE_BY_EXTENSION = new Map([
   ["heif", "image/heif"],
 ]);
 
+function fileExtension(name) {
+  const value = String(name || "");
+  const dot = value.lastIndexOf(".");
+  return dot === -1 ? "" : value.slice(dot + 1).toLowerCase();
+}
+
 function resolvedFileType(file) {
   const declared = (file?.type || "").toLowerCase();
   if (declared) return declared;
-  const extension = (file?.name || "").split(".").pop()?.toLowerCase();
-  return TYPE_BY_EXTENSION.get(extension) || "";
+  return TYPE_BY_EXTENSION.get(fileExtension(file?.name)) || "";
+}
+
+/** Stable identity used to prevent the same file from being attached twice. */
+function fileIdentity(file) {
+  return `${file?.name || ""}|${file?.size ?? ""}|${file?.lastModified ?? ""}`;
+}
+
+/** Return the short label ("PDF", "DOCX", ...) for a document file name. */
+export function documentLabelFor(name) {
+  return DOCUMENT_LABELS.get(fileExtension(name)) || "FILE";
+}
+
+/** True when a drag/drop event carries OS files (not text/links). */
+export function hasFilePayload(event) {
+  const dt = event?.dataTransfer;
+  if (!dt) return false;
+  if (dt.files && dt.files.length > 0) return true;
+  return Array.from(dt.types || []).includes("Files");
+}
+
+// The browser default for a file dropped outside a drop zone is to navigate
+// away and display the file, losing the chat. Block that once per page; the
+// managers below still receive drops inside their container.
+let _windowDropGuardInstalled = false;
+
+export function installWindowDropGuard(target = globalThis.window) {
+  if (_windowDropGuardInstalled || typeof target?.addEventListener !== "function") return false;
+  _windowDropGuardInstalled = true;
+  const block = (event) => {
+    if (hasFilePayload(event)) event.preventDefault();
+  };
+  target.addEventListener("dragover", block);
+  target.addEventListener("drop", block);
+  return true;
+}
+
+/** Test hook: allow re-installing the guard on a fresh window object. */
+export function _resetWindowDropGuardForTests() {
+  _windowDropGuardInstalled = false;
 }
 
 /**
@@ -42,15 +99,27 @@ function resolvedFileType(file) {
  */
 export function createImageInput({ container, inputArea, previewContainer, onImagesChanged }) {
   const pendingImages = []; // Array of { data: base64String, media_type: string, dataUrl: string }
-  const pendingFiles = []; // Array of { data: base64String, media_type: string, name: string }
+  const pendingFiles = []; // Array of { data: base64String, media_type: string, name: string, key: string }
+  const queuedIdentities = new Set(); // fileIdentity() of every attached or in-flight file
+  let pendingDocumentReads = 0;
   let processingCount = 0;
   let status = null;
   let rejectedSinceLastSubmit = false;
+  // A rejection inside a batch must stay visible even after the accepted files
+  // in the same batch finish reading; it is cleared when the next batch starts.
+  let stickyError = null;
 
   function setStatus(kind, message) {
     status = message ? { kind, message } : null;
-    if (kind === "error") rejectedSinceLastSubmit = true;
+    if (kind === "error") {
+      rejectedSinceLastSubmit = true;
+      stickyError = message || null;
+    }
     renderPreviews();
+  }
+
+  function successStatus(message) {
+    return stickyError ? { kind: "error", message: stickyError } : { kind: "success", message };
   }
 
   function renderedPreviewCount() {
@@ -59,7 +128,11 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
 
   // ── File Processing Pipeline ──────────────────────
 
-  function processImageFile(file) {
+  function releaseIdentity(identity) {
+    if (identity) queuedIdentities.delete(identity);
+  }
+
+  function processImageFile(file, identity = "") {
     if (!file) return;
     const inputType = resolvedFileType(file);
     const isHeic = HEIC_TYPES.has(inputType);
@@ -74,6 +147,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       return;
     }
 
+    if (identity) queuedIdentities.add(identity);
     processingCount += 1;
     setStatus("info", isHeic ? t("chat.image_converting_heic") : t("chat.image_processing"));
     const img = new Image();
@@ -113,6 +187,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
           data: base64Data,
           media_type: outputType,
           dataUrl, // Keep for preview display
+          key: identity,
         });
 
         logger.info("[IMAGE-SEND] image ready", {
@@ -122,9 +197,10 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         });
 
         rejectedSinceLastSubmit = false;
-        status = { kind: "success", message: t("chat.image_ready", { count: pendingImages.length }) };
+        status = successStatus(t("chat.image_ready", { count: pendingImages.length }));
         onImagesChanged?.();
       } catch (error) {
+        releaseIdentity(identity);
         status = { kind: "error", message: error?.message || t("chat.image_decode_failed") };
       } finally {
         processingCount -= 1;
@@ -133,6 +209,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       }
     };
     img.onerror = () => {
+      releaseIdentity(identity);
       processingCount -= 1;
       URL.revokeObjectURL(img.src);
       setStatus("error", isHeic ? t("chat.image_heic_conversion_failed") : t("chat.image_decode_failed"));
@@ -140,22 +217,42 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     img.src = URL.createObjectURL(file);
   }
 
+  // Shared entry point for the file picker button and drag & drop, so both
+  // paths get identical validation, de-duplication and limits.
   function processImageFiles(files) {
-    for (const file of files) {
-      const extension = (file?.name || "").split(".").pop()?.toLowerCase();
-      if (DOCUMENT_TYPES.has(extension)) processDocumentFile(file, extension);
-      else processImageFile(file);
+    stickyError = null;
+    for (const file of Array.from(files || [])) {
+      if (!file) continue;
+      const identity = fileIdentity(file);
+      if (queuedIdentities.has(identity)) {
+        setStatus("info", t("chat.file_duplicate_client", { name: file.name || "" }));
+        continue;
+      }
+      const extension = fileExtension(file.name);
+      if (DOCUMENT_TYPES.has(extension)) {
+        processDocumentFile(file, extension, identity);
+      } else if (resolvedFileType(file).startsWith("image/")) {
+        processImageFile(file, identity);
+      } else {
+        setStatus("error", t("chat.file_unsupported_client", { name: file.name || "" }));
+      }
     }
   }
 
-  function processDocumentFile(file, extension) {
+  function processDocumentFile(file, extension, identity = "") {
     if (file.size > MAX_FILE_SIZE) {
       setStatus("error", t("chat.file_too_large_client", {
         size: (file.size / 1024 / 1024).toFixed(1),
       }));
       return;
     }
+    if (pendingFiles.length + pendingDocumentReads >= MAX_FILE_COUNT) {
+      setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: file.name || "" }));
+      return;
+    }
     const mediaType = DOCUMENT_TYPES.get(extension);
+    if (identity) queuedIdentities.add(identity);
+    pendingDocumentReads += 1;
     processingCount += 1;
     setStatus("info", t("chat.file_processing"));
     const reader = new FileReader();
@@ -164,22 +261,44 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         const result = String(reader.result || "");
         const base64Data = result.split(",")[1];
         if (!base64Data) throw new Error(t("chat.file_read_failed"));
-        pendingFiles.push({ data: base64Data, media_type: mediaType, name: file.name });
+        pendingFiles.push({ data: base64Data, media_type: mediaType, name: file.name, key: identity });
         rejectedSinceLastSubmit = false;
-        status = { kind: "success", message: t("chat.file_ready", { count: pendingFiles.length }) };
+        status = successStatus(t("chat.file_ready", { count: pendingFiles.length }));
         onImagesChanged?.();
       } catch (error) {
+        releaseIdentity(identity);
         status = { kind: "error", message: error?.message || t("chat.file_read_failed") };
       } finally {
+        pendingDocumentReads -= 1;
         processingCount -= 1;
         renderPreviews();
       }
     };
     reader.onerror = () => {
+      releaseIdentity(identity);
+      pendingDocumentReads -= 1;
       processingCount -= 1;
       setStatus("error", t("chat.file_read_failed"));
     };
     reader.readAsDataURL(file);
+  }
+
+  function removeImageAt(index) {
+    const [removed] = pendingImages.splice(index, 1);
+    if (!removed) return false;
+    releaseIdentity(removed.key);
+    renderPreviews();
+    onImagesChanged?.();
+    return true;
+  }
+
+  function removeFileAt(index) {
+    const [removed] = pendingFiles.splice(index, 1);
+    if (!removed) return false;
+    releaseIdentity(removed.key);
+    renderPreviews();
+    onImagesChanged?.();
+    return true;
   }
 
   // ── Preview Rendering ─────────────────────────────
@@ -202,7 +321,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     `).join("");
     const filePreviews = pendingFiles.map((file, i) => `
       <div class="file-preview-item">
-        <span class="file-preview-icon" aria-hidden="true">${file.media_type === "application/pdf" ? "PDF" : "CSV"}</span>
+        <span class="file-preview-icon" aria-hidden="true">${documentLabelFor(file.name)}</span>
         <span class="file-preview-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
         <button class="file-preview-remove" data-index="${i}" title="${t("assets.delete")}">&times;</button>
       </div>
@@ -217,19 +336,14 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       btn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        const idx = parseInt(btn.dataset.index, 10);
-        pendingImages.splice(idx, 1);
-        renderPreviews();
-        onImagesChanged?.();
+        removeImageAt(parseInt(btn.dataset.index, 10));
       });
     });
     previewContainer.querySelectorAll(".file-preview-remove").forEach((btn) => {
       btn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        pendingFiles.splice(parseInt(btn.dataset.index, 10), 1);
-        renderPreviews();
-        onImagesChanged?.();
+        removeFileAt(parseInt(btn.dataset.index, 10));
       });
     });
   }
@@ -248,9 +362,20 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     }
   });
 
-  // Drag & drop on container
-  container.addEventListener("dragover", (e) => {
+  // Drag & drop on container. Only OS file drags are intercepted so plain
+  // text drags into the textarea keep their native behaviour.
+  installWindowDropGuard();
+
+  container.addEventListener("dragenter", (e) => {
+    if (!hasFilePayload(e)) return;
     e.preventDefault();
+    container.classList.add("image-drag-over");
+  });
+
+  container.addEventListener("dragover", (e) => {
+    if (!hasFilePayload(e)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
     container.classList.add("image-drag-over");
   });
 
@@ -262,11 +387,10 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
   });
 
   container.addEventListener("drop", (e) => {
+    if (!hasFilePayload(e)) return;
     e.preventDefault();
     container.classList.remove("image-drag-over");
-    if (e.dataTransfer?.files) {
-      processImageFiles(e.dataTransfer.files);
-    }
+    processImageFiles(e.dataTransfer?.files || []);
   });
 
   // ── Public API ────────────────────────────────────
@@ -296,13 +420,30 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       return pendingFiles.map(({ media_type, name }) => ({ media_type, name }));
     },
 
-    /** Clear all pending images. */
+    /** Clear all pending images and documents. */
     clearImages() {
       pendingImages.length = 0;
       pendingFiles.length = 0;
+      queuedIdentities.clear();
       status = null;
+      stickyError = null;
       rejectedSinceLastSubmit = false;
       renderPreviews();
+    },
+
+    /** Remove one pending image by index (same path as the preview "x" button). */
+    removeImage(index) {
+      return removeImageAt(index);
+    },
+
+    /** Remove one pending document by index (same path as the preview "x" button). */
+    removeFile(index) {
+      return removeFileAt(index);
+    },
+
+    /** Current status line shown under the previews ({kind, message} or null). */
+    getStatus() {
+      return status ? { ...status } : null;
     },
 
     /** Get current image count. */

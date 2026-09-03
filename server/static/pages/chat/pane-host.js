@@ -116,7 +116,7 @@ function paneHtml() {
             </button>
           </div>
         </div>
-        <input type="file" data-chat-id="chatPageFileInput" accept="image/jpeg,image/png,image/gif,image/webp,image/heic,image/heif,.heic,.heif,application/pdf,text/csv,.pdf,.csv" multiple style="display:none" />
+        <input type="file" data-chat-id="chatPageFileInput" accept="image/jpeg,image/png,image/gif,image/webp,image/heic,image/heif,.heic,.heif,application/pdf,text/csv,text/plain,text/markdown,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.pdf,.csv,.txt,.md,.doc,.docx,.xls,.xlsx" multiple style="display:none" />
       </form>
     </div>
   `;

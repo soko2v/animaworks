@@ -7,11 +7,17 @@ import { t } from "../i18n.js";
 const _THINK_CLOSE_RE = /<\/think>\s*/;
 const _THINK_CLOSE_GLOBAL_RE = /<\/think>\s*/g;
 
+const _FILE_KIND_LABELS = new Map([
+  ["pdf", "PDF"], ["csv", "CSV"], ["txt", "TXT"], ["md", "MD"],
+  ["docx", "DOCX"], ["doc", "DOC"], ["xlsx", "XLSX"], ["xls", "XLS"],
+]);
+
 function _renderFiles(files, escapeHtml) {
   if (!Array.isArray(files) || files.length === 0) return "";
   return `<div class="chat-attached-files">${files.map(file => {
     const name = typeof file === "string" ? file.split("/").pop() : file?.name;
-    const kind = String(name || "").toLowerCase().endsWith(".pdf") ? "PDF" : "CSV";
+    const extension = String(name || "").split(".").pop()?.toLowerCase() || "";
+    const kind = _FILE_KIND_LABELS.get(extension) || "FILE";
     return `<span class="chat-attached-file"><b>${kind}</b> ${escapeHtml(name || t("chat.file_attachment"))}</span>`;
   }).join("")}</div>`;
 }

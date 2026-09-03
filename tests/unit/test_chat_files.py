@@ -45,9 +45,7 @@ def test_invalid_base64_is_rejected() -> None:
     assert _validate_files([item]) is not None
 
 
-def test_save_files_controls_path_and_preserves_suffix(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_save_files_controls_path_and_preserves_suffix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import core.paths as paths_module
 
     monkeypatch.setattr(paths_module, "get_data_dir", lambda: tmp_path)
@@ -65,9 +63,85 @@ def test_save_files_controls_path_and_preserves_suffix(
     assert destination.resolve().is_relative_to((tmp_path / "animas" / "sofia" / "attachments").resolve())
 
 
-def test_save_files_does_not_overwrite_same_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@pytest.mark.parametrize(
+    ("name", "media_type"),
+    [
+        ("notes.txt", "text/plain"),
+        ("README.md", "text/markdown"),
+        ("README.md", "text/plain"),
+        ("win.csv", "application/vnd.ms-excel"),
+    ],
+)
+def test_text_document_types_are_valid(name: str, media_type: str) -> None:
+    assert _validate_files([_attachment(name, media_type, b"# title\nbody")]) is None
+
+
+def test_office_documents_are_validated_by_bytes() -> None:
+    from tests.unit.core.test_document_attachments import OLE_MAGIC, make_docx, make_xlsx
+
+    assert _validate_files([_attachment("a.docx", DOCX, make_docx(["hi"]))]) is None
+    assert _validate_files([_attachment("a.xlsx", XLSX, make_xlsx([["a"]]))]) is None
+    assert _validate_files([_attachment("a.doc", "application/msword", OLE_MAGIC + b"\x00" * 16)]) is None
+    assert _validate_files([_attachment("a.xls", "application/vnd.ms-excel", OLE_MAGIC + b"\x00" * 16)]) is None
+    # Renamed / mismatched containers are rejected regardless of the declared type.
+    assert _validate_files([_attachment("a.docx", DOCX, b"%PDF-1.7")]) is not None
+    assert _validate_files([_attachment("a.xls", "application/vnd.ms-excel", b"PK\x03\x04")]) is not None
+    assert _validate_files([_attachment("a.docx", DOCX, make_docx(["hi"], macro=True))]) is not None
+
+
+@pytest.mark.parametrize(
+    ("name", "media_type"),
+    [
+        ("tool.exe", "application/octet-stream"),
+        ("macro.docm", "application/vnd.ms-word.document.macroEnabled.12"),
+        ("sheet.xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12"),
+        ("script.js", "text/javascript"),
+        ("noext", "text/plain"),
+        ("archive.zip", "application/zip"),
+    ],
+)
+def test_non_allowlisted_extensions_are_rejected(name: str, media_type: str) -> None:
+    assert _validate_files([_attachment(name, media_type, b"PK\x03\x04data")]) is not None
+
+
+def test_file_count_limit_is_enforced() -> None:
+    items = [_attachment(f"f{i}.txt", "text/plain", b"ok") for i in range(11)]
+    error = _validate_files(items)
+    assert error is not None
+    assert "10" in error
+    assert _validate_files(items[:10]) is None
+
+
+def test_save_files_writes_text_sidecar_for_ooxml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.paths as paths_module
+    from tests.unit.core.test_document_attachments import make_docx
+
+    monkeypatch.setattr(paths_module, "get_data_dir", lambda: tmp_path)
+    (tmp_path / "animas" / "sofia").mkdir(parents=True)
+    paths = save_files("sofia", [_attachment("仕様書 v2.docx", DOCX, make_docx(["第1章", "本文"]))])
+
+    assert len(paths) == 1
+    document = tmp_path / "animas" / "sofia" / paths[0]
+    assert document.suffix == ".docx"
+    sidecar = document.with_name(document.name + ".txt")
+    assert sidecar.read_text(encoding="utf-8") == "第1章\n本文"
+    assert sidecar.resolve().is_relative_to((tmp_path / "animas" / "sofia" / "attachments").resolve())
+
+
+def test_save_files_refuses_unknown_suffix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.paths as paths_module
+
+    monkeypatch.setattr(paths_module, "get_data_dir", lambda: tmp_path)
+    (tmp_path / "animas" / "sofia").mkdir(parents=True)
+    with pytest.raises(ValueError):
+        save_files("sofia", [_attachment("tool.exe", "text/plain", b"MZ")])
+
+
+def test_save_files_does_not_overwrite_same_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import core.paths as paths_module
 
     monkeypatch.setattr(paths_module, "get_data_dir", lambda: tmp_path)

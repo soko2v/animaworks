@@ -166,9 +166,19 @@ STRINGS: dict[str, dict[str, str]] = {
         "ko": "첨부 파일의 총 크기가 너무 큽니다.",
     },
     "chat.unsupported_file_format": {
-        "ja": "対応していないファイル形式です。PDFまたはCSVを選択してください。",
-        "en": "Unsupported file format. Choose a PDF or CSV.",
-        "ko": "지원하지 않는 파일 형식입니다. PDF 또는 CSV를 선택하세요.",
+        "ja": "対応していないファイル形式です。PDF・Word（.docx/.doc）・Excel（.xlsx/.xls）・CSV・TXT・Markdownを選択してください。",
+        "en": "Unsupported file format. Choose a PDF, Word (.docx/.doc), Excel (.xlsx/.xls), CSV, TXT, or Markdown file.",
+        "ko": "지원하지 않는 파일 형식입니다. PDF, Word(.docx/.doc), Excel(.xlsx/.xls), CSV, TXT 또는 Markdown 파일을 선택하세요.",
+    },
+    "chat.file_count_exceeded": {
+        "ja": "添付ファイルは1回の送信につき{max_count}件までです。",
+        "en": "You can attach up to {max_count} files per message.",
+        "ko": "첨부 파일은 메시지당 최대 {max_count}개까지 가능합니다.",
+    },
+    "chat.file_macro_rejected": {
+        "ja": "マクロ（VBA）を含むOfficeファイルは添付できません。マクロなしで保存し直してください。",
+        "en": "Office files containing macros (VBA) cannot be attached. Save the file without macros.",
+        "ko": "매크로(VBA)가 포함된 Office 파일은 첨부할 수 없습니다. 매크로 없이 다시 저장하세요.",
     },
     "chat.invalid_file_data": {
         "ja": "添付ファイルの形式または内容が無効です。",
