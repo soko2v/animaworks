@@ -116,9 +116,17 @@ def _open_ooxml(data: bytes) -> zipfile.ZipFile:
         raise DocumentValidationError("invalid", "not a ZIP container")
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
-    except (zipfile.BadZipFile, OSError, UnicodeDecodeError, ValueError) as exc:
+    except (
+        zipfile.BadZipFile,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        NotImplementedError,
+    ) as exc:
         # UnicodeDecodeError: a central-directory name flagged UTF-8 that is
-        # not valid UTF-8; ValueError: malformed zip64 / extra-field records.
+        # not valid UTF-8; ValueError: malformed zip64 / extra-field records;
+        # NotImplementedError: a central-directory entry whose "version needed
+        # to extract" exceeds what CPython's zipfile supports.
         raise DocumentValidationError("invalid", "corrupt ZIP container") from exc
     infos = archive.infolist()
     if len(infos) > _MAX_ZIP_ENTRIES:

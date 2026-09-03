@@ -836,3 +836,29 @@ def test_invalid_utf8_zip_entry_name_is_rejected_cleanly() -> None:
         validate_document_bytes(broken, ".docx")
     assert excinfo.value.code == "invalid"
     assert extract_document_text(broken, ".docx") is None
+
+
+def set_zip_extract_version(data: bytes, name: str, version: int) -> bytes:
+    """Return *data* with the central-directory "version needed to extract" of *name* set to *version*."""
+    buf = bytearray(data)
+    encoded = name.encode()
+    pos = buf.find(b"PK\x01\x02")
+    while pos != -1:
+        (name_len,) = struct.unpack_from("<H", buf, pos + 28)
+        if bytes(buf[pos + 46 : pos + 46 + name_len]) == encoded:
+            struct.pack_into("<H", buf, pos + 6, version)
+        pos = buf.find(b"PK\x01\x02", pos + 4)
+    return bytes(buf)
+
+
+def test_unsupported_zip_extract_version_is_rejected_cleanly() -> None:
+    # A central-directory entry whose "version needed to extract" exceeds
+    # zipfile.MAX_EXTRACT_VERSION makes ``zipfile.ZipFile`` raise
+    # NotImplementedError; that must be a validation failure, not a 500.
+    broken = set_zip_extract_version(make_docx(["hello"]), "word/document.xml", 99)
+    with pytest.raises(NotImplementedError):
+        zipfile.ZipFile(io.BytesIO(broken))
+    with pytest.raises(DocumentValidationError) as excinfo:
+        validate_document_bytes(broken, ".docx")
+    assert excinfo.value.code == "invalid"
+    assert extract_document_text(broken, ".docx") is None
