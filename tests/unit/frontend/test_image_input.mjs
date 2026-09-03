@@ -391,6 +391,107 @@ describe("image-input document drag & drop", () => {
     assert.match(manager.getStatus()?.message, /chat\.file_count_limit_client/);
   });
 
+  it("restoreAttachments is all-or-none and canRestoreAttachments preflights the count limit", async () => {
+    const files = Array.from({ length: 9 }, (_, i) => makeFile("f" + i + ".txt"));
+    container.dispatch("drop", dropEvent(files));
+    await flush();
+    assert.equal(manager.getFileCount(), 9);
+    const entry = {
+      files: [
+        { name: "a.txt", media_type: "text/plain", data: "YQ==" },
+        { name: "b.txt", media_type: "text/plain", data: "Yg==" },
+      ],
+      displayFiles: [
+        { name: "a.txt", media_type: "text/plain", key: "a" },
+        { name: "b.txt", media_type: "text/plain", key: "b" },
+      ],
+    };
+    const before = changed;
+    assert.equal(manager.canRestoreAttachments(entry), false, "9 + 2 exceeds the limit of 10");
+    assert.equal(manager.getStatus()?.kind, "error");
+    assert.match(manager.getStatus()?.message, /chat\.file_count_limit_client/);
+    assert.match(manager.getStatus()?.message, /b\.txt/, "names the document that does not fit");
+    assert.equal(manager.restoreAttachments(entry), 0, "nothing is restored when the entry does not fit");
+    assert.equal(manager.getFileCount(), 9, "the first document must not be restored without the second");
+    assert.equal(changed, before);
+    assert.deepEqual(manager.getPendingFiles().map((f) => f.name).includes("a.txt"), false);
+
+    // Removing one composer document makes room for both; the preflight agrees with the restore.
+    manager.removeFile(0);
+    assert.equal(manager.canRestoreAttachments(entry), true);
+    assert.equal(manager.restoreAttachments(entry), 2);
+    assert.equal(manager.getFileCount(), 10);
+
+    // Documents already in the composer do not count against the entry again.
+    assert.equal(manager.canRestoreAttachments(entry), true);
+    assert.equal(manager.restoreAttachments(entry), 0);
+    assert.equal(manager.getFileCount(), 10);
+  });
+
+  it("restoreAttachments tells apart distinct payloads of equal length when the snapshot has no key", () => {
+    const one = { data: "YWFhYQ==", media_type: "image/png" }; // "aaaa"
+    const two = { data: "YmJiYg==", media_type: "image/png" }; // "bbbb" — same media type, same encoded length
+    assert.equal(one.data.length, two.data.length);
+    assert.equal(manager.restoreAttachments({ images: [one, two], displayImages: [] }), 2);
+    assert.equal(manager.getImageCount(), 2);
+    const keys = manager.getDisplayImages().map((i) => i.key);
+    assert.notEqual(keys[0], keys[1]);
+    // Restoring the same payloads again is still de-duplicated.
+    assert.equal(manager.restoreAttachments({ images: [one, two] }), 0);
+    assert.equal(manager.getImageCount(), 2);
+
+    const docA = { name: "same.txt", media_type: "text/plain", data: "YWFhYQ==" };
+    const docB = { name: "same.txt", media_type: "text/plain", data: "YmJiYg==" };
+    assert.equal(manager.restoreAttachments({ files: [docA, docB] }), 2);
+    assert.equal(manager.getFileCount(), 2);
+    assert.equal(manager.restoreAttachments({ files: [docA, docB] }), 0);
+    // The same payload listed twice within one entry is only restored once.
+    assert.equal(manager.restoreAttachments({ files: [{ ...docA, name: "twice.txt" }, { ...docA, name: "twice.txt" }] }), 1);
+  });
+
+  it("pasted images receive distinct identities that survive a queue edit round trip", async () => {
+    // Pasted images have no name/mtime; two of the same type and size must not
+    // collapse into one after being queued and restored into the composer.
+    const OriginalImage = globalThis.Image;
+    const originalCreateElement = globalThis.document.createElement;
+    const payloads = ["YWFhYQ==", "YmJiYg=="]; // equal length, different bytes
+    globalThis.Image = class { set src(_value) { queueMicrotask(() => this.onload?.()); } };
+    globalThis.document.createElement = (tag) => {
+      if (tag !== "canvas") return originalCreateElement(tag);
+      return {
+        getContext: () => ({ drawImage() {} }),
+        toDataURL: (type) => `data:${type || "image/png"};base64,${payloads.shift() || "eA=="}`,
+      };
+    };
+    try {
+      const pasteEvent = (file) => ({
+        prevented: false,
+        preventDefault() { this.prevented = true; },
+        clipboardData: { items: [{ type: "image/png", getAsFile: () => file }] },
+      });
+      const first = inputArea.dispatch("paste", pasteEvent(makeFile("image.png", { type: "image/png", size: 4 })));
+      const second = inputArea.dispatch("paste", pasteEvent(makeFile("image.png", { type: "image/png", size: 4 })));
+      assert.equal(first.prevented, true);
+      assert.equal(second.prevented, true);
+      await flush();
+      await flush();
+    } finally {
+      globalThis.Image = OriginalImage;
+      globalThis.document.createElement = originalCreateElement;
+    }
+    assert.equal(manager.getImageCount(), 2, "two pastes attach two images");
+    const keys = manager.getDisplayImages().map((i) => i.key);
+    assert.match(keys[0], /^paste\|/);
+    assert.match(keys[1], /^paste\|/);
+    assert.notEqual(keys[0], keys[1]);
+
+    const entry = { images: manager.getPendingImages(), displayImages: manager.getDisplayImages(), files: [], displayFiles: [] };
+    manager.clearImages();
+    assert.equal(manager.restoreAttachments(entry), 2, "both pasted images come back after a queue edit");
+    assert.deepEqual(manager.getDisplayImages().map((i) => i.key), keys);
+    assert.equal(manager.restoreAttachments(entry), 0);
+  });
+
   it("documentLabelFor maps extensions to short labels", () => {
     assert.equal(mod.documentLabelFor("a.docx"), "DOCX");
     assert.equal(mod.documentLabelFor("A.XLS"), "XLS");

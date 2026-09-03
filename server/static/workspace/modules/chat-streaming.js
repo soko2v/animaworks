@@ -43,7 +43,10 @@ function _drainQueue(explicitAnima, explicitThread) {
   const next = mgr.dequeue(anima, thread);
   wsShowPendingIndicator();
   if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
-  setTimeout(() => _sendConversation(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles }), 150);
+  // Carry the queue's own anima/thread: the user may switch conversations
+  // before the timer fires, and a queued attachment must never be sent to
+  // (and persisted under) whichever conversation is current by then.
+  setTimeout(() => _sendConversation(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles, targetAnima: anima, targetThread: thread }), 150);
 }
 
 function _baseCallbacks(streamingMsg) {
@@ -154,7 +157,7 @@ export function submitConversation() {
     const next = mgr.dequeue(anima, thread);
     wsShowPendingIndicator();
     if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
-    _sendConversation(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles });
+    _sendConversation(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles, targetAnima: anima, targetThread: thread });
     return;
   }
   if (_enqueueInput()) { wsShowPendingIndicator(); wsUpdateSendButton(true); return; }
@@ -175,7 +178,9 @@ async function _sendConversation(text, overrideImages = null) {
   const files = overrideImages?.files || im?.getPendingFiles() || [];
   const displayFiles = overrideImages?.displayFiles || im?.getDisplayFiles() || [];
   if (!text && images.length === 0 && files.length === 0) return;
-  const { anima, thread } = _animaThread();
+  const { anima: curAnima, thread: curThread } = _animaThread();
+  const anima = overrideImages?.targetAnima || curAnima;
+  const thread = overrideImages?.targetThread || curThread;
   if (!anima) return;
 
   dom.convInput.value = ""; dom.convInput.disabled = true; dom.convSend.disabled = true;
@@ -495,7 +500,14 @@ export function wsShowPendingIndicator() {
     }
     const item = e.target.closest(".pending-queue-item");
     if (!item) return;
-    const removed = mgr.removeFromQueue(anima, thread, parseInt(item.dataset.idx, 10));
+    const idx = parseInt(item.dataset.idx, 10);
+    // All-or-none: if the queued documents would not fit next to what is
+    // already in the composer, keep the entry queued (the manager shows why)
+    // rather than restoring part of it and losing the rest.
+    const im = _getImageManager();
+    const queued = mgr.getPendingQueue(anima, thread)[idx];
+    if (queued && im && !im.canRestoreAttachments(queued)) return;
+    const removed = mgr.removeFromQueue(anima, thread, idx);
     if (removed && dom.convInput) {
       dom.convInput.value = removed.text; dom.convInput.style.height = "auto";
       dom.convInput.style.height = Math.min(dom.convInput.scrollHeight, isMobileView() ? 100 : 120) + "px";
@@ -503,7 +515,7 @@ export function wsShowPendingIndicator() {
     }
     // Queued attachments were cleared from the composer when enqueued;
     // put them back so editing does not silently drop documents/images.
-    if (removed) _getImageManager()?.restoreAttachments(removed);
+    if (removed) im?.restoreAttachments(removed);
     wsShowPendingIndicator(); wsUpdateSendButton(mgr.isStreamingFor(anima, thread));
   };
 }

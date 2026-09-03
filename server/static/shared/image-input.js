@@ -53,6 +53,25 @@ function fileIdentity(file) {
   return `${file?.name || ""}|${file?.size ?? ""}|${file?.lastModified ?? ""}`;
 }
 
+/**
+ * Fingerprint of a complete base64 payload (two independent 32-bit FNV-1a
+ * passes). Used only to build a de-duplication key for queued attachments
+ * that carry no file identity; equal length + media type alone is not enough
+ * to tell two distinct payloads apart.
+ */
+function payloadFingerprint(text) {
+  const value = String(text || "");
+  let a = 0x811c9dc5;
+  let b = 0x050c5d1f;
+  for (let i = 0; i < value.length; i += 1) {
+    const c = value.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193) >>> 0;
+    b = Math.imul(b ^ c, 0x01000193) >>> 0;
+    b = (b ^ (b >>> 13)) >>> 0;
+  }
+  return `${value.length}:${a.toString(16).padStart(8, "0")}${b.toString(16).padStart(8, "0")}`;
+}
+
 /** Return the short label ("PDF", "DOCX", ...) for a document file name. */
 export function documentLabelFor(name) {
   return DOCUMENT_LABELS.get(fileExtension(name)) || "FILE";
@@ -101,6 +120,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
   const pendingImages = []; // Array of { data: base64String, media_type: string, dataUrl: string }
   const pendingFiles = []; // Array of { data: base64String, media_type: string, name: string, key: string }
   const queuedIdentities = new Set(); // fileIdentity() of every attached or in-flight file
+  let pasteSequence = 0; // pasted images have no file identity; allocate a unique one
   let pendingDocumentReads = 0;
   let processingCount = 0;
   let status = null;
@@ -357,7 +377,13 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     for (const item of items) {
       if (item.type.startsWith("image/")) {
         e.preventDefault();
-        processImageFile(item.getAsFile());
+        const file = item.getAsFile();
+        if (!file) continue;
+        // A pasted image has no stable name/mtime, so give it a unique key:
+        // it must survive a queue edit round trip without colliding with
+        // another pasted image of the same type and size.
+        pasteSequence += 1;
+        processImageFile(file, `paste|${pasteSequence}|${Date.now()}|${file.size ?? ""}`);
       }
     }
   });
@@ -393,6 +419,44 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     processImageFiles(e.dataTransfer?.files || []);
   });
 
+  // Compute what restoreAttachments() would add without mutating state.
+  // Keys come from the display snapshots (file identity or paste key); an
+  // entry without one gets a key derived from the complete payload.
+  function planRestore(entry) {
+    const images = Array.isArray(entry?.images) ? entry.images : [];
+    const displayImages = Array.isArray(entry?.displayImages) ? entry.displayImages : [];
+    const files = Array.isArray(entry?.files) ? entry.files : [];
+    const displayFiles = Array.isArray(entry?.displayFiles) ? entry.displayFiles : [];
+    const seen = new Set();
+    const plan = { images: [], files: [], overflow: null };
+    images.forEach((img, index) => {
+      if (!img?.data || !img?.media_type) return;
+      const shown = displayImages[index] || {};
+      const key = shown.key || `restored|image|${img.media_type}|${payloadFingerprint(img.data)}`;
+      if (queuedIdentities.has(key) || seen.has(key)) return;
+      seen.add(key);
+      plan.images.push({
+        data: img.data,
+        media_type: img.media_type,
+        dataUrl: shown.dataUrl || `data:${img.media_type};base64,${img.data}`,
+        key,
+      });
+    });
+    files.forEach((file, index) => {
+      if (!file?.data || !file?.name) return;
+      const shown = displayFiles[index] || {};
+      const key = shown.key || `restored|file|${file.name}|${payloadFingerprint(file.data)}`;
+      if (queuedIdentities.has(key) || seen.has(key)) return;
+      if (!plan.overflow && pendingFiles.length + plan.files.length >= MAX_FILE_COUNT) {
+        plan.overflow = file.name;
+        return;
+      }
+      seen.add(key);
+      plan.files.push({ data: file.data, media_type: file.media_type || "", name: file.name, key });
+    });
+    return plan;
+  }
+
   // ── Public API ────────────────────────────────────
 
   return {
@@ -421,45 +485,39 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     },
 
     /**
+     * Preflight for restoreAttachments(): true when every attachment of the
+     * queued entry that is not already in the composer fits within the
+     * document count limit. When it does not, the count-limit error is shown
+     * and nothing is changed, so the caller can leave the entry in the queue
+     * instead of losing part of it.
+     */
+    canRestoreAttachments(entry) {
+      const plan = planRestore(entry);
+      if (plan.overflow) {
+        setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: plan.overflow }));
+        return false;
+      }
+      return true;
+    },
+
+    /**
      * Re-attach a queued entry ({images, displayImages, files, displayFiles})
      * so editing a queued message restores its attachments, not only its text.
      * Identities are taken from the display snapshots so the original file
      * cannot be attached a second time; entries already present are skipped.
+     * Restoration is all-or-none: if the documents do not fit within the
+     * count limit, nothing is restored and 0 is returned.
      * Returns the number of attachments restored.
      */
     restoreAttachments(entry) {
-      const images = Array.isArray(entry?.images) ? entry.images : [];
-      const displayImages = Array.isArray(entry?.displayImages) ? entry.displayImages : [];
-      const files = Array.isArray(entry?.files) ? entry.files : [];
-      const displayFiles = Array.isArray(entry?.displayFiles) ? entry.displayFiles : [];
-      let restored = 0;
-      images.forEach((img, index) => {
-        if (!img?.data || !img?.media_type) return;
-        const shown = displayImages[index] || {};
-        const key = shown.key || `restored|image|${img.media_type}|${img.data.length}`;
-        if (queuedIdentities.has(key)) return;
-        queuedIdentities.add(key);
-        pendingImages.push({
-          data: img.data,
-          media_type: img.media_type,
-          dataUrl: shown.dataUrl || `data:${img.media_type};base64,${img.data}`,
-          key,
-        });
-        restored += 1;
-      });
-      files.forEach((file, index) => {
-        if (!file?.data || !file?.name) return;
-        if (pendingFiles.length >= MAX_FILE_COUNT) {
-          setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: file.name }));
-          return;
-        }
-        const shown = displayFiles[index] || {};
-        const key = shown.key || `restored|file|${file.name}|${file.data.length}`;
-        if (queuedIdentities.has(key)) return;
-        queuedIdentities.add(key);
-        pendingFiles.push({ data: file.data, media_type: file.media_type || "", name: file.name, key });
-        restored += 1;
-      });
+      const plan = planRestore(entry);
+      if (plan.overflow) {
+        setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: plan.overflow }));
+        return 0;
+      }
+      plan.images.forEach((img) => { queuedIdentities.add(img.key); pendingImages.push(img); });
+      plan.files.forEach((file) => { queuedIdentities.add(file.key); pendingFiles.push(file); });
+      const restored = plan.images.length + plan.files.length;
       if (restored > 0) {
         rejectedSinceLastSubmit = false;
         onImagesChanged?.();

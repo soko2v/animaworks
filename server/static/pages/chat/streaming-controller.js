@@ -146,7 +146,13 @@ export function createStreamingController(ctx) {
       }
       const item = e.target.closest(".pending-queue-item");
       if (item) {
-        const removed = mgr.removeFromQueue(name, tid, parseInt(item.dataset.idx, 10));
+        const idx = parseInt(item.dataset.idx, 10);
+        // All-or-none: if the queued documents would not fit next to what is
+        // already in the composer, keep the entry queued (the manager shows
+        // why) rather than restoring part of it and losing the rest.
+        const queued = mgr.getPendingQueue(name, tid)[idx];
+        if (queued && state.imageInputManager && !state.imageInputManager.canRestoreAttachments(queued)) return;
+        const removed = mgr.removeFromQueue(name, tid, idx);
         if (removed) {
           const input = $("chatPageInput");
           if (input) {
@@ -252,7 +258,7 @@ export function createStreamingController(ctx) {
       const next = mgr.dequeue(name, tid);
       showPendingIndicator();
       if (mgr.getPendingQueue(name, tid).length === 0) hidePendingIndicator();
-      sendChat(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles });
+      sendChat(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles, targetAnima: name, targetThread: tid });
       return;
     }
 

@@ -48,7 +48,7 @@ QUEUE_EDIT_SITES = {
     / "static"
     / "workspace"
     / "modules"
-    / "chat-streaming.js": "_getImageManager()?.restoreAttachments(removed)",
+    / "chat-streaming.js": "im?.restoreAttachments(removed)",
     PROJECT_ROOT
     / "server"
     / "static"
@@ -64,3 +64,51 @@ def test_queue_edit_restores_attachments_not_only_text(path: Path, call: str) ->
     source = path.read_text(encoding="utf-8")
     assert "removed.text" in source
     assert call in source, f"{path.name} queue edit restores only text; queued attachments would be lost"
+
+
+_WORKSPACE = PROJECT_ROOT / "server" / "static" / "workspace" / "modules" / "chat-streaming.js"
+_CHAT_PAGE = PROJECT_ROOT / "server" / "static" / "pages" / "chat" / "streaming-controller.js"
+
+
+@pytest.mark.parametrize("path", [_WORKSPACE, _CHAT_PAGE], ids=[_WORKSPACE.name, _CHAT_PAGE.name])
+def test_every_queue_drain_pins_the_target_anima_and_thread(path: Path) -> None:
+    """A drained entry must be sent to the conversation it was queued for.
+
+    The drain fires on a timer; if the user switches conversations meanwhile,
+    resolving the *current* anima/thread at send time would deliver (and
+    persist) the queued attachment under the wrong Anima.
+    """
+    source = path.read_text(encoding="utf-8")
+    calls = _CALL.findall(source)
+    assert calls
+    for args in calls:
+        assert "targetAnima:" in args, f"{path.name} drain site does not pin its anima: {{{args}}}"
+        assert "targetThread:" in args, f"{path.name} drain site does not pin its thread: {{{args}}}"
+
+
+def test_workspace_send_resolves_the_pinned_target_before_the_current_conversation() -> None:
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "overrideImages?.targetAnima || curAnima" in source
+    assert "overrideImages?.targetThread || curThread" in source
+
+
+QUEUE_EDIT_PREFLIGHT = {
+    _WORKSPACE: ("im.canRestoreAttachments(queued)", "mgr.removeFromQueue(anima, thread, idx)"),
+    _CHAT_PAGE: (
+        "state.imageInputManager.canRestoreAttachments(queued)",
+        "mgr.removeFromQueue(name, tid, idx)",
+    ),
+}
+
+
+@pytest.mark.parametrize(("path", "calls"), QUEUE_EDIT_PREFLIGHT.items(), ids=[p.name for p in QUEUE_EDIT_PREFLIGHT])
+def test_queue_edit_preflights_capacity_before_removing_the_entry(path: Path, calls: tuple[str, str]) -> None:
+    """The entry must stay queued when its documents do not fit in the composer.
+
+    Removing first and restoring afterwards would drop whatever does not fit
+    within the document count limit.
+    """
+    preflight, remove = calls
+    source = path.read_text(encoding="utf-8")
+    assert preflight in source, f"{path.name} restores without a capacity preflight"
+    assert source.index(preflight) < source.index(remove), f"{path.name} removes the queue entry before the preflight"
