@@ -327,7 +327,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       </div>
     `).join("");
     const statusHtml = status
-      ? `<div class="image-input-status image-input-status-${status.kind}" role="${status.kind === "error" ? "alert" : "status"}">${status.message}</div>`
+      ? `<div class="image-input-status image-input-status-${status.kind}" role="${status.kind === "error" ? "alert" : "status"}">${escapeHtml(status.message)}</div>`
       : "";
     previewContainer.innerHTML = previews + filePreviews + statusHtml;
 

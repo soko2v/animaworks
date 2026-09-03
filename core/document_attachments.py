@@ -116,7 +116,9 @@ def _open_ooxml(data: bytes) -> zipfile.ZipFile:
         raise DocumentValidationError("invalid", "not a ZIP container")
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
-    except (zipfile.BadZipFile, OSError) as exc:
+    except (zipfile.BadZipFile, OSError, UnicodeDecodeError, ValueError) as exc:
+        # UnicodeDecodeError: a central-directory name flagged UTF-8 that is
+        # not valid UTF-8; ValueError: malformed zip64 / extra-field records.
         raise DocumentValidationError("invalid", "corrupt ZIP container") from exc
     infos = archive.infolist()
     if len(infos) > _MAX_ZIP_ENTRIES:
@@ -143,9 +145,20 @@ def _read_part(archive: zipfile.ZipFile, name: str) -> bytes:
     try:
         with archive.open(name) as fh:
             chunk = fh.read(_MAX_PART_BYTES + 1)
-    except (KeyError, zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError, zlib.error, EOFError) as exc:
+    except (
+        KeyError,
+        zipfile.BadZipFile,
+        OSError,
+        RuntimeError,
+        NotImplementedError,
+        zlib.error,
+        EOFError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
         # RuntimeError: encrypted entry; NotImplementedError: compression
-        # method; zlib.error / EOFError: corrupt deflate stream.
+        # method; zlib.error / EOFError: corrupt deflate stream;
+        # UnicodeDecodeError / ValueError: malformed local header.
         raise DocumentValidationError("invalid", f"cannot read {name}") from exc
     if len(chunk) > _MAX_PART_BYTES:
         raise DocumentValidationError("invalid", f"{name} exceeds part limit")

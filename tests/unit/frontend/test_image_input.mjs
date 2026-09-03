@@ -261,6 +261,17 @@ describe("image-input document drag & drop", () => {
     assert.equal(manager.prepareForSubmit(), false, "text-only send is blocked once after a rejection");
   });
 
+  it("escapes crafted file names in status messages (no DOM XSS)", async () => {
+    const name = "<img src=x onerror=alert(1)>.exe";
+    container.dispatch("drop", dropEvent([makeFile(name, { type: "application/x-msdownload" })]));
+    await flush();
+    assert.equal(manager.getFileCount(), 0);
+    assert.equal(manager.getStatus()?.kind, "error");
+    assert.ok(manager.getStatus()?.message.includes(name), "status message carries the raw file name");
+    assert.doesNotMatch(preview.innerHTML, /<img src=x/, "file name must not be inserted as markup");
+    assert.match(preview.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;\.exe/);
+  });
+
   it("rejects documents above the per-file limit", async () => {
     container.dispatch("drop", dropEvent([makeFile("big.pdf", { size: 11 * 1024 * 1024 })]));
     await flush();

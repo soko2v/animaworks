@@ -818,3 +818,21 @@ def test_attribute_scanner_is_linear_on_long_attribute_runs() -> None:
     elapsed = time.perf_counter() - started
     assert text == "## Sheet: Data\n1\t2"
     assert elapsed < 1.0, f"attribute scan took {elapsed:.1f}s (quadratic backtracking?)"
+
+
+# ── r6: malformed ZIP entry names ──────────────────────────
+
+
+def test_invalid_utf8_zip_entry_name_is_rejected_cleanly() -> None:
+    # A central-directory name flagged UTF-8 (bit 11) whose bytes are not
+    # valid UTF-8 makes ``zipfile.ZipFile`` raise UnicodeDecodeError; that
+    # must surface as a validation failure, not an unhandled 500.
+    flagged = set_zip_entry_flag(make_docx(["hello"]), "word/document.xml", 0x800)
+    broken = flagged.replace(b"word/document.xml", b"word/documen\xff.xml")
+    assert broken != flagged
+    with pytest.raises(UnicodeDecodeError):
+        zipfile.ZipFile(io.BytesIO(broken))
+    with pytest.raises(DocumentValidationError) as excinfo:
+        validate_document_bytes(broken, ".docx")
+    assert excinfo.value.code == "invalid"
+    assert extract_document_text(broken, ".docx") is None
