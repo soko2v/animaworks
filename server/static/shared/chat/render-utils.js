@@ -11,6 +11,13 @@ const _FILE_KIND_LABELS = new Map([
   ["pdf", "PDF"], ["csv", "CSV"], ["txt", "TXT"], ["md", "MD"],
   ["docx", "DOCX"], ["doc", "DOC"], ["xlsx", "XLSX"], ["xls", "XLS"],
 ]);
+// Persisted turns only carry `attachments` paths (documents and images
+// together); this picks the document ones for the file chips.
+const _DOCUMENT_PATH_RE = /\.(?:pdf|csv|txt|md|docx?|xlsx?)$/i;
+
+export function isDocumentAttachmentPath(path) {
+  return _DOCUMENT_PATH_RE.test(String(path || ""));
+}
 
 function _renderFiles(files, escapeHtml) {
   if (!Array.isArray(files) || files.length === 0) return "";
@@ -528,7 +535,7 @@ export function renderHistoryMessage(msg, opts) {
     : "";
   const userContent = _stripVoiceSuffix(msg.content || "");
   const filesHtml = _renderFiles(
-    msg.files || (msg.attachments || []).filter(path => /\.(?:pdf|csv)$/i.test(path)),
+    msg.files || (msg.attachments || []).filter(isDocumentAttachmentPath),
     escapeHtml,
   );
   const contentHtml = isAnima

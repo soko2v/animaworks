@@ -8,7 +8,6 @@ import uuid
 from pathlib import Path
 
 from core.document_attachments import (
-    CANONICAL_MEDIA_TYPE,
     DOCUMENT_SUFFIXES,
     DocumentValidationError,
     extract_document_text,
@@ -22,10 +21,6 @@ from core.time_utils import now_local
 from server.routes.chat_models import MAX_FILE_COUNT, MAX_FILE_PAYLOAD_SIZE, MAX_FILE_SIZE, FileAttachment
 
 logger = logging.getLogger(__name__)
-
-# Backward-compatible alias: declared media type -> canonical extension.
-SUPPORTED_FILE_TYPES = {media_type: suffix for suffix, media_type in CANONICAL_MEDIA_TYPE.items()}
-SUPPORTED_FILE_TYPES.update({"application/csv": ".csv"})
 
 _ERROR_KEYS = {
     "unsupported": "chat.unsupported_file_format",

@@ -81,16 +81,20 @@ def test_text_document_types_are_valid(name: str, media_type: str) -> None:
 
 
 def test_office_documents_are_validated_by_bytes() -> None:
-    from tests.unit.core.test_document_attachments import OLE_MAGIC, make_docx, make_xlsx
+    from tests.unit.core.test_document_attachments import OLE_MAGIC, make_cfb, make_docx, make_xlsx
 
     assert _validate_files([_attachment("a.docx", DOCX, make_docx(["hi"]))]) is None
     assert _validate_files([_attachment("a.xlsx", XLSX, make_xlsx([["a"]]))]) is None
-    assert _validate_files([_attachment("a.doc", "application/msword", OLE_MAGIC + b"\x00" * 16)]) is None
-    assert _validate_files([_attachment("a.xls", "application/vnd.ms-excel", OLE_MAGIC + b"\x00" * 16)]) is None
-    # Renamed / mismatched containers are rejected regardless of the declared type.
+    assert _validate_files([_attachment("a.doc", "application/msword", make_cfb([("WordDocument", 2)]))]) is None
+    assert _validate_files([_attachment("a.xls", "application/vnd.ms-excel", make_cfb([("Workbook", 2)]))]) is None
+    # Renamed / mismatched / macro containers are rejected regardless of the declared type.
     assert _validate_files([_attachment("a.docx", DOCX, b"%PDF-1.7")]) is not None
     assert _validate_files([_attachment("a.xls", "application/vnd.ms-excel", b"PK\x03\x04")]) is not None
+    assert _validate_files([_attachment("a.doc", "application/msword", OLE_MAGIC + b"\x00" * 1024)]) is not None
     assert _validate_files([_attachment("a.docx", DOCX, make_docx(["hi"], macro=True))]) is not None
+    macro_doc = make_cfb([("WordDocument", 2), ("Macros", 1), ("VBA", 1)])
+    error = _validate_files([_attachment("a.doc", "application/msword", macro_doc)])
+    assert error is not None and "VBA" in error
 
 
 @pytest.mark.parametrize(

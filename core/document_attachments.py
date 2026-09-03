@@ -7,15 +7,15 @@ from __future__ import annotations
 
 Attachments come from untrusted browsers.  Everything here is fail-closed:
 the extension allowlist, the declared MIME allowlist per extension, magic
-bytes, macro/VBA detection and archive limits are all enforced on the
-decoded bytes, never on client-declared metadata.
+bytes, container structure, macro/VBA detection and archive limits are all
+enforced on the decoded bytes, never on client-declared metadata.
 
 Office Open XML files (``.docx``/``.xlsx``) are additionally turned into a
 plain-text sidecar so an Anima whose tools cannot parse Office formats can
-still read the content.  The extraction is regex based on purpose: no XML
-parser is involved, so entity expansion / external entity attacks are not
-possible.  Extracted text is untrusted data and must never be treated as
-instructions.
+still read the content.  Extraction is a single left-to-right pass over
+bounded tokens (no XML parser, no ``.*?`` spanning tags), so it is linear in
+the input size and immune to entity expansion.  Extracted text is untrusted
+data and must never be treated as instructions.
 """
 
 import io
@@ -65,13 +65,6 @@ _PDF_MAGIC = b"%PDF-"
 _ZIP_MAGIC = b"PK\x03\x04"
 _OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
-# OLE2 storage/stream names are stored as UTF-16LE; these mark VBA projects.
-_OLE_MACRO_MARKERS: tuple[bytes, ...] = (
-    "_VBA_PROJECT".encode("utf-16-le"),
-    "Macros".encode("utf-16-le"),
-    "VBA".encode("utf-16-le"),
-)
-
 _MAX_ZIP_ENTRIES = 4096
 _MAX_ZIP_UNCOMPRESSED = 64 * 1024 * 1024  # zip-bomb guard (sum of declared sizes)
 _MAX_PART_BYTES = 32 * 1024 * 1024  # single XML part read cap
@@ -101,7 +94,7 @@ def is_allowed_media_type(suffix: str, media_type: str) -> bool:
     return allowed is not None and media_type.lower() in allowed
 
 
-# ── Validation ─────────────────────────────────────────────
+# ── Validation: text / OOXML ───────────────────────────────
 
 
 def _validate_text_bytes(data: bytes) -> None:
@@ -155,18 +148,109 @@ def _validate_ooxml(data: bytes, suffix: str) -> None:
             raise DocumentValidationError("invalid", f"missing {required}")
         for name in names:
             lowered = name.lower()
-            if lowered.endswith("vbaproject.bin") or lowered.endswith(".bin") and "vba" in lowered:
+            if lowered.endswith("vbaproject.bin") or (lowered.endswith(".bin") and "vba" in lowered):
                 raise DocumentValidationError("macro", "VBA project present")
         content_types = _read_part(archive, "[Content_Types].xml").lower()
         if b"macroenabled" in content_types or b"vbaproject" in content_types:
             raise DocumentValidationError("macro", "macro-enabled content type")
 
 
-def _validate_ole(data: bytes) -> None:
-    if not data.startswith(_OLE_MAGIC):
+# ── Validation: OLE2 / Compound File Binary (.doc/.xls) ────
+
+_CFB_MAX_REGULAR_SECTOR = 0xFFFFFFFA  # sector ids >= this are markers (DIFSECT/FATSECT/ENDOFCHAIN/FREESECT)
+_CFB_MAX_DIR_SECTORS = 4096
+_CFB_MAX_DIFAT_SECTORS = 1024
+_CFB_DIR_ENTRY = 128
+_CFB_TYPE_STORAGE, _CFB_TYPE_STREAM, _CFB_TYPE_ROOT = 1, 2, 5
+_OLE_MACRO_NAMES = frozenset({"macros", "vba", "_vba_project_cur", "_vba_project"})
+
+
+def _u16(buf: bytes, offset: int) -> int:
+    return int.from_bytes(buf[offset : offset + 2], "little")
+
+
+def _u32(buf: bytes, offset: int) -> int:
+    return int.from_bytes(buf[offset : offset + 4], "little")
+
+
+def _cfb_sector(data: bytes, index: int, sector_size: int) -> bytes:
+    if index >= _CFB_MAX_REGULAR_SECTOR:
+        raise DocumentValidationError("invalid", "CFB sector id is a marker")
+    start = (index + 1) * sector_size
+    end = start + sector_size
+    if end > len(data):
+        raise DocumentValidationError("invalid", "CFB sector beyond end of file")
+    return data[start:end]
+
+
+def _cfb_directory_entries(data: bytes) -> list[tuple[str, int]]:
+    """Return ``[(name, object_type), ...]`` for every used directory entry.
+
+    Walks the header -> DIFAT -> FAT -> directory chain of a Compound File
+    (MS-CFB).  Any structural inconsistency raises ``invalid`` so a payload
+    that merely starts with the OLE magic is not accepted.
+    """
+    if len(data) < 512 or not data.startswith(_OLE_MAGIC):
         raise DocumentValidationError("invalid", "not an OLE2 compound file")
-    if any(marker in data for marker in _OLE_MACRO_MARKERS):
-        raise DocumentValidationError("macro", "VBA storage present")
+    major, byte_order, shift = _u16(data, 26), _u16(data, 28), _u16(data, 30)
+    if byte_order != 0xFFFE or (major, shift) not in {(3, 9), (4, 12)}:
+        raise DocumentValidationError("invalid", "unsupported CFB header")
+    sector_size = 1 << shift
+    num_fat, first_dir = _u32(data, 44), _u32(data, 48)
+    first_difat, num_difat = _u32(data, 68), _u32(data, 72)
+
+    fat_sectors = [s for s in (_u32(data, 76 + 4 * i) for i in range(109)) if s < _CFB_MAX_REGULAR_SECTOR]
+    seen: set[int] = set()
+    cursor = first_difat
+    while cursor < _CFB_MAX_REGULAR_SECTOR:
+        if cursor in seen or len(seen) >= min(num_difat, _CFB_MAX_DIFAT_SECTORS):
+            raise DocumentValidationError("invalid", "CFB DIFAT chain")
+        seen.add(cursor)
+        sec = _cfb_sector(data, cursor, sector_size)
+        fat_sectors.extend(
+            e for e in (_u32(sec, 4 * i) for i in range(sector_size // 4 - 1)) if e < _CFB_MAX_REGULAR_SECTOR
+        )
+        cursor = _u32(sec, sector_size - 4)
+    fat_sectors = fat_sectors[:num_fat]
+    if not fat_sectors:
+        raise DocumentValidationError("invalid", "CFB has no FAT")
+    fat: list[int] = []
+    for s in fat_sectors:
+        sec = _cfb_sector(data, s, sector_size)
+        fat.extend(_u32(sec, 4 * i) for i in range(sector_size // 4))
+
+    entries: list[tuple[str, int]] = []
+    seen = set()
+    cursor = first_dir
+    while cursor < _CFB_MAX_REGULAR_SECTOR:
+        if cursor in seen or len(seen) >= _CFB_MAX_DIR_SECTORS:
+            raise DocumentValidationError("invalid", "CFB directory chain")
+        seen.add(cursor)
+        sec = _cfb_sector(data, cursor, sector_size)
+        for off in range(0, sector_size, _CFB_DIR_ENTRY):
+            entry = sec[off : off + _CFB_DIR_ENTRY]
+            etype = entry[66]
+            if etype == 0:
+                continue
+            if etype not in (_CFB_TYPE_STORAGE, _CFB_TYPE_STREAM, _CFB_TYPE_ROOT):
+                raise DocumentValidationError("invalid", "CFB directory entry type")
+            name_len = _u16(entry, 64)
+            if name_len < 2 or name_len > 64 or name_len % 2:
+                raise DocumentValidationError("invalid", "CFB directory entry name")
+            entries.append((entry[: name_len - 2].decode("utf-16-le", errors="replace"), etype))
+        if cursor >= len(fat):
+            raise DocumentValidationError("invalid", "CFB FAT truncated")
+        cursor = fat[cursor]
+    if not entries or entries[0][1] != _CFB_TYPE_ROOT:
+        raise DocumentValidationError("invalid", "CFB root entry missing")
+    return entries
+
+
+def _validate_ole(data: bytes) -> None:
+    for name, _etype in _cfb_directory_entries(data):
+        lowered = name.lower()
+        if lowered in _OLE_MACRO_NAMES or lowered.startswith("_vba_project"):
+            raise DocumentValidationError("macro", f"VBA storage present: {name}")
 
 
 def validate_document_bytes(data: bytes, suffix: str) -> None:
@@ -194,52 +278,84 @@ def validate_document_bytes(data: bytes, suffix: str) -> None:
     raise DocumentValidationError("unsupported", f"no validator for {suffix!r}")
 
 
-# ── Text extraction (regex based, no XML parser) ───────────
+# ── Text extraction (single pass over bounded tokens) ──────
+#
+# Every alternative below starts with a literal "<" and is bounded by "[^<>]*"
+# / "[^>]*" character classes, so the scanner never re-reads input for an
+# unclosed tag: cost is proportional to the XML size regardless of nesting.
 
-_TAG_RE = re.compile(r"<[^>]+>")
-_DOCX_PARA_RE = re.compile(r"<w:p[ >].*?</w:p>|<w:p/>", re.DOTALL)
-_DOCX_RUN_TEXT_RE = re.compile(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>|<w:tab/>|<w:br/>|<w:cr/>", re.DOTALL)
-_XLSX_SI_RE = re.compile(r"<si>(.*?)</si>", re.DOTALL)
-_XLSX_T_RE = re.compile(r"<t(?:\s[^>]*)?>(.*?)</t>", re.DOTALL)
-_XLSX_ROW_RE = re.compile(r"<row[ >].*?</row>", re.DOTALL)
-_XLSX_CELL_RE = re.compile(r"<c\b([^>]*?)(?:/>|>(.*?)</c>)", re.DOTALL)
-_XLSX_V_RE = re.compile(r"<v>(.*?)</v>", re.DOTALL)
-_XLSX_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+_DOCX_TOKEN_RE = re.compile(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>|<w:tab/>|<w:br/>|<w:cr/>|</w:p>|<w:p/>")
+_SST_TOKEN_RE = re.compile(r"<si>|</si>|<t(?:\s[^>]*)?>([^<]*)</t>")
+_SHEET_TOKEN_RE = re.compile(
+    r"<c\b([^>]*?)/>|<c\b([^>]*)>|</c>|</row>|<v>([^<]*)</v>|<t(?:\s[^>]*)?>([^<]*)</t>",
+)
+_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _WB_SHEET_RE = re.compile(r"<sheet\b([^>]*)/?>")
 _RELS_RE = re.compile(r"<Relationship\b([^>]*)/?>")
 
 
-def _clean(fragment: str) -> str:
-    return unescape(_TAG_RE.sub("", fragment))
+class _TextBudget:
+    """Accumulate output lines while enforcing ``_MAX_TEXT_CHARS``."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.size = 0
+        self.truncated = False
+
+    def add(self, line: str) -> bool:
+        self.lines.append(line)
+        self.size += len(line) + 1
+        if self.size > _MAX_TEXT_CHARS:
+            self.truncated = True
+            return False
+        return True
+
+    def render(self) -> str:
+        text = "\n".join(self.lines)
+        if self.truncated:
+            return text[:_MAX_TEXT_CHARS] + _TRUNCATION_MARK
+        return text.strip("\n")
 
 
 def _extract_docx_text(archive: zipfile.ZipFile) -> str:
     xml = _read_part(archive, "word/document.xml").decode("utf-8", errors="replace")
-    lines: list[str] = []
-    size = 0
-    for para in _DOCX_PARA_RE.finditer(xml):
-        parts: list[str] = []
-        for m in _DOCX_RUN_TEXT_RE.finditer(para.group(0)):
-            token = m.group(0)
-            if token.startswith("<w:tab"):
-                parts.append("\t")
-            elif token.startswith(("<w:br", "<w:cr")):
-                parts.append("\n")
-            else:
-                parts.append(unescape(m.group(1) or ""))
-        line = "".join(parts)
-        lines.append(line)
-        size += len(line) + 1
-        if size > _MAX_TEXT_CHARS:
-            return "\n".join(lines)[:_MAX_TEXT_CHARS] + _TRUNCATION_MARK
-    return "\n".join(lines).strip("\n")
+    budget = _TextBudget()
+    parts: list[str] = []
+    for m in _DOCX_TOKEN_RE.finditer(xml):
+        text = m.group(1)
+        if text is not None:
+            parts.append(unescape(text))
+            continue
+        token = m.group(0)
+        if token == "<w:tab/>":
+            parts.append("\t")
+        elif token in ("<w:br/>", "<w:cr/>"):
+            parts.append("\n")
+        else:  # </w:p> or <w:p/>
+            if not budget.add("".join(parts)):
+                return budget.render()
+            parts = []
+    if parts:
+        budget.add("".join(parts))
+    return budget.render()
 
 
 def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
     if "xl/sharedStrings.xml" not in archive.namelist():
         return []
     xml = _read_part(archive, "xl/sharedStrings.xml").decode("utf-8", errors="replace")
-    return ["".join(unescape(t) for t in _XLSX_T_RE.findall(si)) for si in _XLSX_SI_RE.findall(xml)]
+    strings: list[str] = []
+    current: list[str] | None = None
+    for m in _SST_TOKEN_RE.finditer(xml):
+        token = m.group(0)
+        if token == "<si>":
+            current = []
+        elif token == "</si>":
+            strings.append("".join(current or []))
+            current = None
+        elif current is not None:
+            current.append(unescape(m.group(1) or ""))
+    return strings
 
 
 def _xlsx_sheet_order(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
@@ -249,7 +365,7 @@ def _xlsx_sheet_order(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     if "xl/_rels/workbook.xml.rels" in names:
         rels_xml = _read_part(archive, "xl/_rels/workbook.xml.rels").decode("utf-8", errors="replace")
         for m in _RELS_RE.finditer(rels_xml):
-            attrs = dict(_XLSX_ATTR_RE.findall(m.group(1)))
+            attrs = dict(_ATTR_RE.findall(m.group(1)))
             target = attrs.get("Target", "")
             if not target:
                 continue
@@ -261,7 +377,7 @@ def _xlsx_sheet_order(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     if "xl/workbook.xml" in names:
         wb_xml = _read_part(archive, "xl/workbook.xml").decode("utf-8", errors="replace")
         for m in _WB_SHEET_RE.finditer(wb_xml):
-            attrs = dict(_XLSX_ATTR_RE.findall(m.group(1)))
+            attrs = dict(_ATTR_RE.findall(m.group(1)))
             rid = attrs.get("r:id") or attrs.get("id", "")
             part = rels.get(rid)
             if part and part in names:
@@ -272,16 +388,11 @@ def _xlsx_sheet_order(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     return sheets
 
 
-def _xlsx_cell_value(attrs: str, inner: str | None, shared: list[str]) -> str:
-    parsed = dict(_XLSX_ATTR_RE.findall(attrs))
-    kind = parsed.get("t", "")
-    inner = inner or ""
+def _xlsx_cell_value(kind: str, raw: str | None, inline: list[str], shared: list[str]) -> str:
     if kind == "inlineStr":
-        return "".join(unescape(t) for t in _XLSX_T_RE.findall(inner))
-    v = _XLSX_V_RE.search(inner)
-    if v is None:
+        return "".join(inline)
+    if raw is None:
         return ""
-    raw = unescape(v.group(1))
     if kind == "s":
         try:
             return shared[int(raw)]
@@ -294,23 +405,41 @@ def _xlsx_cell_value(attrs: str, inner: str | None, shared: list[str]) -> str:
 
 def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
     shared = _xlsx_shared_strings(archive)
-    chunks: list[str] = []
-    size = 0
+    budget = _TextBudget()
     for sheet_name, part in _xlsx_sheet_order(archive):
         xml = _read_part(archive, part).decode("utf-8", errors="replace")
-        chunks.append(f"## Sheet: {sheet_name}")
-        for row in _XLSX_ROW_RE.finditer(xml):
-            cells = [
-                _xlsx_cell_value(m.group(1), m.group(2), shared).replace("\t", " ").replace("\n", " ")
-                for m in _XLSX_CELL_RE.finditer(row.group(0))
-            ]
-            line = "\t".join(cells).rstrip("\t")
-            chunks.append(line)
-            size += len(line) + 1
-            if size > _MAX_TEXT_CHARS:
-                return "\n".join(chunks)[:_MAX_TEXT_CHARS] + _TRUNCATION_MARK
-        chunks.append("")
-    return "\n".join(chunks).strip("\n")
+        if not budget.add(f"## Sheet: {sheet_name}"):
+            return budget.render()
+        row: list[str] = []
+        kind = ""
+        raw: str | None = None
+        inline: list[str] = []
+        in_cell = False
+        for m in _SHEET_TOKEN_RE.finditer(xml):
+            token = m.group(0)
+            if m.group(1) is not None:  # <c .../> empty cell
+                row.append("")
+            elif m.group(2) is not None:  # <c ...>
+                kind = dict(_ATTR_RE.findall(m.group(2))).get("t", "")
+                raw, inline, in_cell = None, [], True
+            elif token == "</c>":
+                if in_cell:
+                    value = _xlsx_cell_value(kind, raw, inline, shared)
+                    row.append(value.replace("\t", " ").replace("\n", " "))
+                in_cell = False
+            elif token == "</row>":
+                if not budget.add("\t".join(row).rstrip("\t")):
+                    return budget.render()
+                row = []
+            elif m.group(3) is not None:  # <v>
+                if in_cell:
+                    raw = unescape(m.group(3))
+            elif in_cell:  # <t> inside <is>
+                inline.append(unescape(m.group(4) or ""))
+        if row and not budget.add("\t".join(row).rstrip("\t")):
+            return budget.render()
+        budget.add("")
+    return budget.render()
 
 
 def extract_document_text(data: bytes, suffix: str) -> str | None:
