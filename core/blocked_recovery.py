@@ -733,6 +733,57 @@ def _wait_unreaped(proc: subprocess.Popen, timeout: float) -> None:
         time.sleep(min(_WAITID_POLL_SECONDS, remaining))
 
 
+_REAP_ATTEMPTS = 5
+_REAP_WAIT_SECONDS = 2.0
+
+
+def _reap_root(proc: subprocess.Popen) -> None:
+    """Reap ``proc`` with bounded retries, re-sending SIGKILL between attempts.
+
+    ``proc`` must be our own child (reaped or not). A root that is still
+    live -- for example frozen by SIGSTOP when containment was interrupted --
+    is killed again before each retry so the reap cannot block forever.
+    """
+    for _ in range(_REAP_ATTEMPTS):
+        if proc.returncode is not None:
+            return
+        try:
+            proc.wait(timeout=_REAP_WAIT_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            _signal_group(proc.pid, signal.SIGKILL)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+    if proc.returncode is None:
+        logger.warning("blocked_recovery: root pid %s not reaped after %s attempts", proc.pid, _REAP_ATTEMPTS)
+
+
+def _contain_and_reap(proc: subprocess.Popen, marker: str) -> None:
+    """Kill the check's tree, then reap its root; never leave the root live and unreaped.
+
+    ``proc`` must still be unreaped on entry: an unreaped child pins its PID
+    and, being a session leader, its process-group id, so the signals below
+    cannot reach an unrelated process. If ``_kill_tree`` raises part-way
+    (e.g. after freezing the group with SIGSTOP but before SIGKILL) the group
+    and the root are killed directly so the reap cannot block on a frozen
+    root, and the reap itself is retried a bounded number of times. The
+    containment error is re-raised after the reap.
+    """
+    try:
+        _kill_tree(proc, marker)
+    except BaseException:
+        _signal_group(proc.pid, signal.SIGKILL)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise
+    finally:
+        _reap_root(proc)
+
+
 def _run_sandboxed(
     argv: list[str],
     *,
@@ -796,17 +847,17 @@ def _run_sandboxed(
                 return 1
             return 0 if stderr_clean else 1
         except subprocess.TimeoutExpired:
-            try:
-                _kill_tree(proc, marker)
-            finally:
-                proc.wait()
+            _contain_and_reap(proc, marker)
             raise
         except BaseException:
-            if reject_stderr or proc.poll() is None:
-                try:
-                    _kill_tree(proc, marker)
-                finally:
-                    proc.wait()
+            # Signal only while the root is still our unreaped child: an
+            # unreaped root pins its PID and (as session leader) its process
+            # group id, so nothing unrelated can be hit. Once the final
+            # ``wait`` has reaped it -- CPython may reap inside ``wait`` and
+            # still re-raise a KeyboardInterrupt -- those ids may already
+            # belong to another process, so no group signal is sent.
+            if proc.returncode is None and (reject_stderr or proc.poll() is None):
+                _contain_and_reap(proc, marker)
             raise
     finally:
         if drain is not None:

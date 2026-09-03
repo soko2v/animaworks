@@ -265,6 +265,7 @@ def test_no_sandbox_available_fails_closed_without_running_check(
 def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     proc = Mock()
     proc.pid = 4242
+    proc.returncode = None  # unreaped, as a real Popen before wait()
     proc.wait.return_value = -9
     proc.stderr, _ = _stderr_pipe()
 
@@ -288,7 +289,7 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["env"] == {}
     kill_tree.assert_called_once_with(proc, "m")
-    proc.wait.assert_called_once_with()
+    proc.wait.assert_called_once_with(timeout=blocked_recovery._REAP_WAIT_SECONDS)
     assert proc.stderr.closed
     assert not any(t.name == "unblock-check-stderr" for t in threading.enumerate())
 
@@ -324,7 +325,7 @@ def test_run_sandboxed_contains_and_reaps_when_drain_finished_raises(
         blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
 
     kill_tree.assert_called_once_with(proc, "m")
-    proc.wait.assert_called_once_with()
+    proc.wait.assert_called_once_with(timeout=blocked_recovery._REAP_WAIT_SECONDS)
     assert proc.returncode is not None
 
 
@@ -349,7 +350,7 @@ def test_run_sandboxed_contains_and_reaps_when_reject_open_stderr_raises(
         blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
 
     kill_tree.assert_called_once_with(proc, "m")
-    proc.wait.assert_called_once_with()
+    proc.wait.assert_called_once_with(timeout=blocked_recovery._REAP_WAIT_SECONDS)
     assert proc.returncode is not None
 
 
@@ -368,13 +369,100 @@ def test_run_sandboxed_reaps_when_kill_tree_raises_after_timeout(
         "_kill_tree",
         Mock(side_effect=RuntimeError("containment failed")),
     )
+    signal_group = Mock()
+    monkeypatch.setattr(blocked_recovery, "_signal_group", signal_group)
 
     with pytest.raises(RuntimeError, match="containment failed") as exc_info:
         blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
 
     assert exc_info.value.__context__ is timeout_error
-    proc.wait.assert_called_once_with()
+    # containment failed part-way: the still-unreaped root's group and the root itself are killed directly
+    signal_group.assert_called_once_with(proc.pid, blocked_recovery.signal.SIGKILL)
+    proc.kill.assert_called_once_with()
+    proc.wait.assert_called_once_with(timeout=blocked_recovery._REAP_WAIT_SECONDS)
     assert proc.returncode is not None
+
+
+def test_run_sandboxed_does_not_signal_after_root_reaped_on_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the final wait has reaped the root its PID/PGID may be recycled: never signal them."""
+    proc = _mock_reaped_process()
+    drain = Mock()
+    drain.finished.return_value = True
+    drain.eof = True
+    drain.seen = False
+
+    def _wait_then_interrupt(*_args, **_kwargs) -> int:
+        proc.returncode = 0
+        raise KeyboardInterrupt
+
+    proc.wait.side_effect = _wait_then_interrupt
+    kill_tree = Mock()
+    signal_group = Mock()
+    monkeypatch.setattr(blocked_recovery.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(blocked_recovery, "_StderrDrain", lambda _stream: drain)
+    monkeypatch.setattr(blocked_recovery, "_wait_unreaped", Mock())
+    monkeypatch.setattr(blocked_recovery, "_kill_tree", kill_tree)
+    monkeypatch.setattr(blocked_recovery, "_signal_group", signal_group)
+
+    with pytest.raises(KeyboardInterrupt):
+        blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
+
+    kill_tree.assert_not_called()
+    signal_group.assert_not_called()
+    proc.kill.assert_not_called()
+
+
+def test_reap_root_rekills_and_retries_when_wait_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = Mock()
+    proc.pid = 4242
+    proc.returncode = None
+    calls = {"n": 0}
+
+    def _wait(*_args, **_kwargs) -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise subprocess.TimeoutExpired("sh", 1)
+        proc.returncode = -9
+        return proc.returncode
+
+    proc.wait.side_effect = _wait
+    signal_group = Mock()
+    monkeypatch.setattr(blocked_recovery, "_signal_group", signal_group)
+
+    blocked_recovery._reap_root(proc)
+
+    assert calls["n"] == 2
+    signal_group.assert_called_once_with(4242, blocked_recovery.signal.SIGKILL)
+    proc.kill.assert_called_once_with()
+    assert proc.returncode == -9
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_contain_and_reap_kills_and_reaps_real_root_when_kill_tree_fails_after_freeze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A containment failure after SIGSTOP must not leave a frozen root that blocks the reap forever."""
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 30"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    def _freeze_then_fail(target: subprocess.Popen, _marker: str) -> None:
+        os.killpg(target.pid, blocked_recovery.signal.SIGSTOP)
+        raise RuntimeError("containment interrupted")
+
+    monkeypatch.setattr(blocked_recovery, "_kill_tree", _freeze_then_fail)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="containment interrupted"):
+        blocked_recovery._contain_and_reap(proc, "m")
+
+    assert time.monotonic() - started < blocked_recovery._REAP_WAIT_SECONDS
+    assert proc.returncode == -int(blocked_recovery.signal.SIGKILL)
 
 
 def test_kill_tree_freezes_root_group_before_first_snapshot() -> None:
@@ -954,6 +1042,7 @@ def test_run_sandboxed_reaps_child_when_stderr_reader_cannot_start() -> None:
     """Thread.start failure after Popen must not leave the child running or the pipe open."""
     proc = Mock()
     proc.pid = 4242
+    proc.returncode = None  # unreaped, as a real Popen before wait()
     proc.poll.return_value = None
     proc.stderr, _ = _stderr_pipe()
     with (
@@ -964,7 +1053,7 @@ def test_run_sandboxed_reaps_child_when_stderr_reader_cannot_start() -> None:
     ):
         blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
     kill_tree.assert_called_once_with(proc, "m")
-    proc.wait.assert_called_once_with()
+    proc.wait.assert_called_once_with(timeout=blocked_recovery._REAP_WAIT_SECONDS)
     assert proc.stderr.closed
 
 
