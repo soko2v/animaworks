@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from core import blocked_recovery
 from core._anima_heartbeat import HeartbeatMixin
 from core.blocked_recovery import revalidate_blocked_tasks
 from core.config.schemas import BackgroundTaskConfig
@@ -66,10 +69,8 @@ def test_check_success_republishes_without_consuming_retry(tmp_path: Path) -> No
 
     with (
         patch("core.config.models.load_config", return_value=_config()),
-        patch(
-            "core.blocked_recovery.subprocess.run",
-            return_value=subprocess.CompletedProcess([], 0),
-        ) as run,
+        patch("core.blocked_recovery._sandbox_route", return_value="bwrap"),
+        patch("core.blocked_recovery._run_sandboxed", return_value=0) as run,
     ):
         result = revalidate_blocked_tasks(anima_dir, "worker")
 
@@ -103,6 +104,164 @@ def test_check_success_republishes_without_consuming_retry(tmp_path: Path) -> No
     assert kwargs["timeout"] == 60
     assert set(kwargs["env"]) == {"PATH", "HOME", "ANIMAWORKS_ANIMA_DIR"}
     assert kwargs["env"]["ANIMAWORKS_ANIMA_DIR"] == str(anima_dir)
+    events = _activity_events(anima_dir)
+    assert events[0]["meta"] == {"task_id": "check-pass", "method": "check", "sandbox": "bwrap"}
+
+
+def _activity_events(anima_dir: Path) -> list[dict]:
+    files = list((anima_dir / "activity_log").glob("*.jsonl"))
+    return [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+
+
+def test_macos_sandbox_exec_fallback_when_bwrap_missing(tmp_path: Path) -> None:
+    """No bwrap + macOS sandbox-exec: run the check through a fixed Seatbelt profile."""
+    anima_dir = tmp_path / "animas" / "worker"
+    manager = _blocked_task(
+        anima_dir,
+        task_id="mac-pass",
+        meta={"unblock_check": "test -w .", "task_desc": {"title": "finish"}},
+    )
+
+    with (
+        patch("core.config.models.load_config", return_value=_config()),
+        patch("core.blocked_recovery.shutil.which", return_value=None),
+        patch("core.blocked_recovery.sys.platform", "darwin"),
+        patch("core.blocked_recovery.os.access", return_value=True) as access,
+        patch("core.blocked_recovery._run_sandboxed", return_value=0) as run,
+    ):
+        assert revalidate_blocked_tasks(anima_dir, "worker") == ["mac-pass"]
+
+    access.assert_called_once_with("/usr/bin/sandbox-exec", os.X_OK)
+    argv = run.call_args.args[0]
+    assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert argv[3:] == ["/bin/sh", "-c", "test -w ."]
+    profile = argv[2]
+    assert profile is blocked_recovery._MACOS_SANDBOX_PROFILE
+    assert "test -w ." not in profile
+    kwargs = run.call_args.kwargs
+    assert kwargs["cwd"] == anima_dir
+    assert kwargs["timeout"] == 60
+    assert set(kwargs["env"]) == {"PATH", "HOME", "ANIMAWORKS_ANIMA_DIR"}
+    assert manager.get_task_by_id("mac-pass").status == "pending"
+    assert _activity_events(anima_dir)[0]["meta"]["sandbox"] == "sandbox-exec"
+
+
+def test_macos_profile_is_static_read_only_and_network_denied() -> None:
+    profile = blocked_recovery._MACOS_SANDBOX_PROFILE
+    lines = [line.strip() for line in profile.splitlines() if line.strip()]
+    assert lines[0] == "(version 1)"
+    assert lines[1] == "(deny default)"
+    assert "(deny network*)" in lines
+    assert '(allow file-write* (literal "/dev/null"))' in lines
+    assert not any(line.startswith("(allow file-write*") and "/dev/null" not in line for line in lines)
+    assert not any(line.startswith("(allow network") for line in lines)
+    # The check string is never interpolated: a hostile check cannot alter the profile.
+    hostile = '") (allow default) ('
+    argv = blocked_recovery._sandbox_argv("sandbox-exec", hostile)
+    assert argv[2] == profile
+    assert argv[-1] == hostile
+
+
+def test_bwrap_preferred_over_sandbox_exec() -> None:
+    with (
+        patch("core.blocked_recovery.shutil.which", return_value="/usr/bin/bwrap"),
+        patch("core.blocked_recovery.sys.platform", "darwin"),
+        patch("core.blocked_recovery.os.access", return_value=True),
+    ):
+        assert blocked_recovery._sandbox_route() == "bwrap"
+
+
+def test_sandbox_exec_not_used_outside_darwin() -> None:
+    with (
+        patch("core.blocked_recovery.shutil.which", return_value=None),
+        patch("core.blocked_recovery.sys.platform", "linux"),
+        patch("core.blocked_recovery.os.access", return_value=True),
+    ):
+        assert blocked_recovery._sandbox_route() is None
+
+
+def test_no_sandbox_available_fails_closed_without_running_check(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    anima_dir = tmp_path / "animas" / "worker"
+    manager = _blocked_task(
+        anima_dir,
+        task_id="no-sandbox",
+        meta={"unblock_check": "touch escaped", "task_desc": {"title": "finish"}},
+    )
+
+    with (
+        patch("core.config.models.load_config", return_value=_config()),
+        patch("core.blocked_recovery._sandbox_route", return_value=None),
+        patch("core.blocked_recovery.subprocess.Popen") as popen,
+        caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
+    ):
+        assert revalidate_blocked_tasks(anima_dir, "worker") == []
+
+    popen.assert_not_called()
+    current = manager.get_task_by_id("no-sandbox")
+    assert current is not None
+    assert current.status == "blocked"
+    assert current.meta["unblock_check_failures"] == 1
+    assert not (anima_dir / "escaped").exists()
+    assert "sandbox unavailable" in caplog.text
+
+
+def test_run_sandboxed_kills_process_group_on_timeout() -> None:
+    proc = Mock()
+    proc.pid = 4242
+    proc.wait.side_effect = [subprocess.TimeoutExpired("sh", 60), -9]
+
+    with (
+        patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen,
+        patch("core.blocked_recovery.os.killpg") as killpg,
+        pytest.raises(subprocess.TimeoutExpired),
+    ):
+        blocked_recovery._run_sandboxed(["/bin/sh", "-c", "sleep 99"], cwd=Path("/"), env={}, timeout=60)
+
+    kwargs = popen.call_args.kwargs
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["env"] == {}
+    killpg.assert_called_once_with(4242, blocked_recovery.signal.SIGKILL)
+    assert proc.wait.call_count == 2
+
+
+def test_run_sandboxed_returns_exit_code() -> None:
+    proc = Mock()
+    proc.wait.return_value = 3
+    with patch("core.blocked_recovery.subprocess.Popen", return_value=proc):
+        assert blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5) == 3
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not os.access("/usr/bin/sandbox-exec", os.X_OK),
+    reason="requires macOS sandbox-exec",
+)
+@pytest.mark.parametrize(
+    ("check", "expected"),
+    [
+        ("exit 0", 0),
+        ("exit 7", 7),
+        ("test -r . && true >/dev/null", 0),
+        ("touch escaped", 1),
+        ("mkdir escaped_dir", 1),
+        ("python3 -c \"import socket; socket.create_connection(('127.0.0.1', 22), 1)\"", 1),
+    ],
+)
+def test_real_sandbox_exec_denies_writes_and_network(tmp_path: Path, check: str, expected: int) -> None:
+    """Integration: the shipped profile really blocks writes/network and propagates exit codes."""
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "ANIMAWORKS_ANIMA_DIR": str(tmp_path)}
+    code = blocked_recovery._run_sandboxed(
+        blocked_recovery._sandbox_argv("sandbox-exec", check), cwd=tmp_path, env=env, timeout=30
+    )
+    assert (code == 0) == (expected == 0)
+    if expected not in (0, 1):
+        assert code == expected
+    assert not (tmp_path / "escaped").exists()
+    assert not (tmp_path / "escaped_dir").exists()
 
 
 def test_recovery_batch_limit_uses_oldest_blocked_tasks(tmp_path: Path) -> None:
@@ -117,10 +276,8 @@ def test_recovery_batch_limit_uses_oldest_blocked_tasks(tmp_path: Path) -> None:
 
     with (
         patch("core.config.models.load_config", return_value=_config()),
-        patch(
-            "core.blocked_recovery.subprocess.run",
-            return_value=subprocess.CompletedProcess([], 0),
-        ),
+        patch("core.blocked_recovery._sandbox_route", return_value="bwrap"),
+        patch("core.blocked_recovery._run_sandboxed", return_value=0),
     ):
         assert revalidate_blocked_tasks(anima_dir, "worker") == ["task-0", "task-1", "task-2"]
 
@@ -157,7 +314,8 @@ def test_missing_bwrap_fails_closed_and_warns(tmp_path: Path, caplog: pytest.Log
 
     with (
         patch("core.config.models.load_config", return_value=_config()),
-        patch("core.blocked_recovery.subprocess.run", side_effect=FileNotFoundError("bwrap")),
+        patch("core.blocked_recovery._sandbox_route", return_value="bwrap"),
+        patch("core.blocked_recovery._run_sandboxed", side_effect=FileNotFoundError("bwrap")),
         caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
     ):
         assert revalidate_blocked_tasks(anima_dir, "worker") == []
@@ -183,7 +341,7 @@ def test_taskboard_suppression_skips_recovery(tmp_path: Path) -> None:
     with (
         patch("core.config.models.load_config", return_value=_config()),
         patch("core.taskboard.attention_resolver.resolver_for_anima_dir", return_value=resolver) as factory,
-        patch("core.blocked_recovery.subprocess.run") as run,
+        patch("core.blocked_recovery._run_sandboxed") as run,
     ):
         assert revalidate_blocked_tasks(anima_dir, "worker") == []
 
@@ -209,6 +367,8 @@ def test_publish_failure_restores_blocked_status(tmp_path: Path) -> None:
 
     with (
         patch("core.config.models.load_config", return_value=_config()),
+        patch("core.blocked_recovery._sandbox_route", return_value="bwrap"),
+        patch("core.blocked_recovery._run_sandboxed", return_value=0),
         patch("core.blocked_recovery.regenerate_pending_json", side_effect=fail_publish),
     ):
         assert revalidate_blocked_tasks(anima_dir, "worker") == []
@@ -243,7 +403,7 @@ def test_checkless_task_waits_for_reprobe_interval(tmp_path: Path) -> None:
 
     with (
         patch("core.config.models.load_config", return_value=_config()),
-        patch("core.blocked_recovery.subprocess.run") as run,
+        patch("core.blocked_recovery._run_sandboxed") as run,
     ):
         assert revalidate_blocked_tasks(anima_dir, "worker") == []
 
@@ -265,12 +425,13 @@ def test_failed_check_stays_blocked_and_counts_failure(tmp_path: Path, failure: 
             "task_desc": {"title": "finish"},
         },
     )
-    outcome = subprocess.CompletedProcess([], 1) if failure == "nonzero" else subprocess.TimeoutExpired("false", 60)
+    outcome = 1 if failure == "nonzero" else subprocess.TimeoutExpired("false", 60)
 
     with (
         patch("core.config.models.load_config", return_value=_config()),
+        patch("core.blocked_recovery._sandbox_route", return_value="sandbox-exec"),
         patch(
-            "core.blocked_recovery.subprocess.run",
+            "core.blocked_recovery._run_sandboxed",
             return_value=outcome if failure == "nonzero" else None,
             side_effect=outcome if failure == "timeout" else None,
         ),

@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import signal
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -133,6 +136,92 @@ def _alert_manual_intervention_required(
     manager.update_meta(entry.task_id, {"blocked_recovery_alerted": True})
 
 
+# Linux route: bubblewrap. Root is bind-mounted read-only, /tmp is a private
+# tmpfs, the network namespace is unshared, and children die with the parent.
+_BWRAP_ARGV_PREFIX: tuple[str, ...] = (
+    "bwrap",
+    "--ro-bind",
+    "/",
+    "/",
+    "--dev",
+    "/dev",
+    "--proc",
+    "/proc",
+    "--tmpfs",
+    "/tmp",
+    "--unshare-net",
+    "--die-with-parent",
+    "--",
+)
+
+# macOS route: Seatbelt via /usr/bin/sandbox-exec. The profile is a fixed
+# constant -- the unblock_check string is never interpolated into it; the check
+# is passed verbatim as a single argv element to ``/bin/sh -c``. Everything is
+# denied by default; only read access, process exec/fork, self-signalling,
+# sysctl reads and writes to the /dev/null device are allowed. All file writes
+# (including /tmp) and all network access are denied.
+_MACOS_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+_MACOS_SANDBOX_PROFILE = """(version 1)
+(deny default)
+(allow process-exec*)
+(allow process-fork)
+(allow signal (target self))
+(allow sysctl-read)
+(allow file-read*)
+(allow file-write* (literal "/dev/null"))
+(deny network*)
+"""
+
+
+def _sandbox_route() -> str | None:
+    """Return the available read-only/no-network sandbox route, or None (fail closed)."""
+    if shutil.which("bwrap"):
+        return "bwrap"
+    if sys.platform == "darwin" and os.access(_MACOS_SANDBOX_EXEC, os.X_OK):
+        return "sandbox-exec"
+    return None
+
+
+def _sandbox_argv(route: str, check: str) -> list[str]:
+    """Build the sandboxed ``/bin/sh -c <check>`` argv for ``route``."""
+    inner = ["/bin/sh", "-c", check]
+    if route == "bwrap":
+        return [*_BWRAP_ARGV_PREFIX, *inner]
+    if route == "sandbox-exec":
+        return [_MACOS_SANDBOX_EXEC, "-p", _MACOS_SANDBOX_PROFILE, *inner]
+    raise ValueError(f"unknown sandbox route: {route}")
+
+
+def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int) -> int:
+    """Run ``argv`` with suppressed output and return its exit code.
+
+    The child is started in its own session so that, on timeout, the whole
+    process group (including grandchildren spawned by ``/bin/sh``) is killed.
+    bwrap already provides ``--die-with-parent``; sandbox-exec does not, so the
+    group kill is what keeps a timed-out check from leaving orphans on macOS.
+    Raises ``OSError`` when the sandbox binary cannot be started and
+    ``subprocess.TimeoutExpired`` on timeout.
+    """
+    proc = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+
+
 def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
     """Revalidate blocked tasks and return task IDs changed back to pending."""
     from core.config.models import load_config
@@ -168,43 +257,33 @@ def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
 
             check = entry.meta.get("unblock_check")
             has_check = isinstance(check, str) and bool(check.strip())
+            route: str | None = None
             if has_check:
                 env = {
                     "PATH": os.environ.get("PATH", ""),
                     "HOME": os.environ.get("HOME", ""),
                     "ANIMAWORKS_ANIMA_DIR": str(anima_dir),
                 }
+                route = _sandbox_route()
+                if route is None:
+                    logger.warning(
+                        "unblock_check sandbox unavailable for task %s (no bwrap, no macOS sandbox-exec); failing closed",
+                        entry.task_id,
+                    )
+                    _record_check_failure(manager, entry)
+                    continue
                 try:
-                    result = subprocess.run(
-                        [
-                            "bwrap",
-                            "--ro-bind",
-                            "/",
-                            "/",
-                            "--dev",
-                            "/dev",
-                            "--proc",
-                            "/proc",
-                            "--tmpfs",
-                            "/tmp",
-                            "--unshare-net",
-                            "--die-with-parent",
-                            "--",
-                            "/bin/sh",
-                            "-c",
-                            check,
-                        ],
+                    returncode = _run_sandboxed(
+                        _sandbox_argv(route, check),
                         cwd=anima_dir,
                         env=env,
                         timeout=config.blocked_check_timeout_seconds,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
                     )
                 except OSError:
                     logger.warning(
-                        "unblock_check sandbox unavailable for task %s; failing closed",
+                        "unblock_check sandbox unavailable for task %s (route=%s); failing closed",
                         entry.task_id,
+                        route,
                         exc_info=True,
                     )
                     _record_check_failure(manager, entry)
@@ -212,7 +291,7 @@ def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
                 except subprocess.TimeoutExpired:
                     _record_check_failure(manager, entry)
                     continue
-                if result.returncode != 0:
+                if returncode != 0:
                     _record_check_failure(manager, entry)
                     continue
                 suffix = ""
@@ -253,6 +332,7 @@ def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
                 meta={
                     "task_id": entry.task_id,
                     "method": "check" if has_check else "reprobe",
+                    "sandbox": route if has_check else "",
                 },
                 safe=True,
             )
