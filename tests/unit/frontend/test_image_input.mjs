@@ -289,6 +289,17 @@ describe("image-input document drag & drop", () => {
     assert.equal(manager.getFileCount(), 1, "a failed read must not poison de-duplication");
   });
 
+  it("keeps an empty document read sticky so a bare submit is blocked", async () => {
+    // A zero-byte file yields a data URL without a payload; the read fails inside onload.
+    container.dispatch("drop", dropEvent([makeFile("empty.txt", { bytes: "" })]));
+    await flush();
+    assert.equal(manager.getFileCount(), 0);
+    assert.equal(manager.isProcessing(), false);
+    assert.equal(manager.getStatus()?.kind, "error");
+    assert.match(manager.getStatus()?.message, /chat\.file_read_failed/);
+    assert.equal(manager.prepareForSubmit(), false, "a failed document read must not degrade into a text-only send");
+  });
+
   it("keeps an image conversion failure sticky so a bare submit is blocked", async () => {
     // The mock <canvas> has no getContext(), so decoding succeeds but conversion throws.
     const OriginalImage = globalThis.Image;

@@ -267,7 +267,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         onImagesChanged?.();
       } catch (error) {
         releaseIdentity(identity);
-        status = { kind: "error", message: error?.message || t("chat.file_read_failed") };
+        setStatus("error", error?.message || t("chat.file_read_failed"));
       } finally {
         pendingDocumentReads -= 1;
         processingCount -= 1;

@@ -172,6 +172,7 @@ _CFB_MAX_DIFAT_SECTORS = 1024
 _CFB_DIR_ENTRY = 128
 _CFB_HEADER_DIFAT_SLOTS = 109
 _CFB_MINI_SECTOR = 64
+_CFB_MAX_STREAM_SIZE_V3 = 0x80000000  # MS-CFB 2.6.1: version 3 stream sizes are 32-bit
 _CFB_TYPE_STORAGE, _CFB_TYPE_STREAM, _CFB_TYPE_ROOT = 1, 2, 5
 _OLE_MACRO_NAMES = frozenset({"macros", "vba", "_vba_project_cur", "_vba_project"})
 
@@ -179,6 +180,7 @@ _OLE_MACRO_NAMES = frozenset({"macros", "vba", "_vba_project_cur", "_vba_project
 # when no VBA storage exists (Excel 4.0 / XLM macros live in the Workbook stream).
 _BIFF_BOF = 0x0809
 _BIFF_BOUNDSHEET = 0x0085
+_BIFF_FILEPASS = 0x002F  # workbook is encrypted from this record on: macro checks would be blind
 _BIFF_BOF_MACRO_TYPES = frozenset({0x0006, 0x0040})  # VB module, Excel 4.0 macro sheet
 _BIFF_BOUNDSHEET_MACRO_TYPES = frozenset({0x01, 0x06})  # macro sheet, VB module
 # Word binary File Information Block: Word 6/95 files carry WordBasic macros
@@ -220,6 +222,7 @@ class _CompoundFile:
         if byte_order != 0xFFFE or (major, shift) not in {(3, 9), (4, 12)} or mini_shift != 6:
             raise DocumentValidationError("invalid", "unsupported CFB header")
         self.data = data
+        self.major = major
         self.sector_size = 1 << shift
         # Sectors physically present after the header sector; every sector id
         # used anywhere in the file must be below this.
@@ -341,14 +344,25 @@ class _CompoundFile:
                 if name_len < 2 or name_len > 64 or name_len % 2:
                     raise DocumentValidationError("invalid", "CFB directory entry name")
                 name = entry[: name_len - 2].decode("utf-16-le", errors="replace")
-                size = _u32(entry, 120)
-                if etype == _CFB_TYPE_STREAM and size > len(self.data):
+                size = self._entry_size(entry)
+                if etype != _CFB_TYPE_STORAGE and size > len(self.data):
                     raise DocumentValidationError("invalid", "CFB stream larger than file")
                 entries.append(_CfbEntry(name, etype, _u32(entry, 116), size))
             cursor = self._next(self.fat, cursor)
         if not entries or entries[0].object_type != _CFB_TYPE_ROOT:
             raise DocumentValidationError("invalid", "CFB root entry missing")
         return entries
+
+    def _entry_size(self, entry: bytes) -> int:
+        """Return the declared stream size of a directory *entry* (64-bit for v4, 32-bit for v3)."""
+        low, high = _u32(entry, 120), _u32(entry, 124)
+        if self.major == 4:
+            return low | (high << 32)
+        # MS-CFB 2.6.1: version 3 sizes must not exceed 2 GiB and older writers
+        # left the high dword uninitialised, so only the low dword is meaningful.
+        if low > _CFB_MAX_STREAM_SIZE_V3:
+            raise DocumentValidationError("invalid", "CFB v3 stream size exceeds 2 GiB")
+        return low
 
     # ── streams ──
 
@@ -392,7 +406,11 @@ class _CompoundFile:
 
 
 def _scan_biff_for_macros(stream: bytes) -> None:
-    """Walk the BIFF record stream and reject macro sheets / VB modules."""
+    """Walk the BIFF record stream and reject macro sheets / VB modules.
+
+    Encrypted workbooks (``FILEPASS``) are refused outright: every record after
+    it is ciphertext, so BOUNDSHEET / substream BOF types could not be checked.
+    """
     if len(stream) < 4 or _u16(stream, 0) != _BIFF_BOF:
         raise DocumentValidationError("invalid", "Workbook stream does not start with BOF")
     offset = 0
@@ -401,6 +419,8 @@ def _scan_biff_for_macros(stream: bytes) -> None:
         body = offset + 4
         if body + rlen > len(stream):
             raise DocumentValidationError("invalid", "truncated BIFF record")
+        if rid == _BIFF_FILEPASS:
+            raise DocumentValidationError("unsupported", "password-protected Excel workbooks are not accepted")
         if rid == _BIFF_BOF and rlen >= 4 and _u16(stream, body + 2) in _BIFF_BOF_MACRO_TYPES:
             raise DocumentValidationError("macro", "Excel macro sheet / VB module substream")
         if rid == _BIFF_BOUNDSHEET and rlen >= 6 and stream[body + 5] in _BIFF_BOUNDSHEET_MACRO_TYPES:
@@ -484,9 +504,10 @@ _MAX_SHARED_STRINGS = _MAX_TEXT_CHARS  # more strings than output chars can neve
 class _TextBudget:
     """Accumulate output lines while enforcing ``_MAX_TEXT_CHARS``.
 
-    ``reserve`` accounts for characters buffered for the line under
-    construction so an unclosed paragraph/row cannot grow without bound before
-    it is flushed; ``add`` commits a line.
+    ``reserve`` charges characters *before* they are buffered for the line
+    under construction so an unclosed paragraph/row cannot grow without bound
+    and a rejected value is never retained; ``fits`` is the non-charging check
+    for a value that is held transiently; ``add`` commits a line.
     """
 
     def __init__(self) -> None:
@@ -495,11 +516,16 @@ class _TextBudget:
         self.pending = 0
         self.truncated = False
 
-    def reserve(self, chars: int) -> bool:
-        self.pending += chars
-        if self.size + self.pending > _MAX_TEXT_CHARS:
+    def fits(self, chars: int) -> bool:
+        if self.size + self.pending + chars > _MAX_TEXT_CHARS:
             self.truncated = True
             return False
+        return True
+
+    def reserve(self, chars: int) -> bool:
+        if not self.fits(chars):
+            return False
+        self.pending += chars
         return True
 
     def add(self, line: str) -> bool:
@@ -526,15 +552,15 @@ def _extract_docx_text(archive: zipfile.ZipFile) -> str:
         text = m.group(1)
         if text is not None:
             text = unescape(text)
-            parts.append(text)
             if not budget.reserve(len(text)):
                 break
+            parts.append(text)
             continue
         token = m.group(0)
         if token == "<w:tab/>":
-            parts.append("\t")
+            separator = "\t"
         elif token in ("<w:br/>", "<w:cr/>"):
-            parts.append("\n")
+            separator = "\n"
         else:  # </w:p> or <w:p/>
             if not budget.add("".join(parts)):
                 return budget.render()
@@ -542,6 +568,7 @@ def _extract_docx_text(archive: zipfile.ZipFile) -> str:
             continue
         if not budget.reserve(1):
             break
+        parts.append(separator)
     if parts:
         budget.add("".join(parts))
     return budget.render()
@@ -566,10 +593,10 @@ def _xlsx_shared_strings(archive: zipfile.ZipFile) -> tuple[list[str], bool]:
                 return strings, True
         elif current is not None:
             text = unescape(m.group(1) or "")
-            current.append(text)
             stored += len(text)
             if stored > _MAX_TEXT_CHARS:
                 return strings, True
+            current.append(text)
     return strings, False
 
 
@@ -636,34 +663,37 @@ def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
             attrs = m.group(1)
             if attrs is not None:  # <c ...> or <c .../>
                 if attrs.rstrip().endswith("/"):
-                    row.append("")
-                    in_cell = False
                     if not budget.reserve(1):
                         break
+                    row.append("")
+                    in_cell = False
                     continue
                 kind = dict(_ATTR_RE.findall(attrs)).get("t", "")
                 raw, inline, in_cell = None, [], True
             elif token == "</c>":
                 if in_cell:
                     value = _xlsx_cell_value(kind, raw, inline, shared)
+                    # Inline-string text was charged as it was buffered; every
+                    # other kind is charged exactly once here, plus the separator.
+                    if not budget.reserve(1 if kind == "inlineStr" else len(value) + 1):
+                        break
                     row.append(value.replace("\t", " ").replace("\n", " "))
                     in_cell = False
-                    if not budget.reserve(len(value) + 1):
-                        break
             elif token == "</row>":
                 if not budget.add("\t".join(row).rstrip("\t")):
                     return budget.render()
                 row = []
             elif m.group(2) is not None:  # <v>
                 if in_cell:
-                    raw = unescape(m.group(2))
-                    if not budget.reserve(len(raw)):
+                    candidate = unescape(m.group(2))
+                    if not budget.fits(len(candidate)):  # held until </c>, charged there
                         break
+                    raw = candidate
             elif in_cell:  # <t> inside <is>
                 text = unescape(m.group(3) or "")
-                inline.append(text)
                 if not budget.reserve(len(text)):
                     break
+                inline.append(text)
         if row:
             budget.add("\t".join(row).rstrip("\t"))
         if budget.truncated:

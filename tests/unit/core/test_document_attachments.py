@@ -355,6 +355,17 @@ def test_xls_requires_well_formed_workbook_stream() -> None:
         assert exc.value.code == "invalid", label
 
 
+@pytest.mark.parametrize("stream_name", ["Workbook", "Book"])
+def test_xls_password_protected_workbook_is_rejected(stream_name: str) -> None:
+    # FILEPASS follows the globals BOF; every later record (BOUNDSHEET, sheet
+    # BOFs) is ciphertext, so a macro sheet behind it could never be detected.
+    filepass = biff(0x002F, struct.pack("<HHH", 0x0001, 0x0001, 0x0000) + b"\x00" * 48)
+    workbook = biff_bof(0x0005) + filepass + make_workbook([0x00, 0x01])[len(biff_bof(0x0005)) :]
+    with pytest.raises(DocumentValidationError) as exc:
+        validate_document_bytes(make_cfb(streams={stream_name: workbook}), ".xls")
+    assert exc.value.code == "unsupported"
+
+
 def test_doc_requires_word97_fib() -> None:
     validate_document_bytes(make_cfb(streams={"WordDocument": make_fib(0x00C1), "1Table": b"\x00" * 16}), ".doc")
     validate_document_bytes(make_cfb(streams={"WordDocument": make_fib(0x0112)}, sector_shift=12), ".doc")
@@ -444,6 +455,28 @@ def test_cfb_declared_counts_are_bounded_by_file_size() -> None:
             validate_document_bytes(payload, ".doc")
         assert exc.value.code == "invalid", label
     assert time.perf_counter() - started < 1.0, "malformed counts must be rejected before any large allocation"
+
+
+def test_cfb_stream_sizes_use_version_specific_width() -> None:
+    v4 = make_cfb(streams={"WordDocument": make_fib()}, sector_shift=12)
+    validate_document_bytes(v4, ".doc")
+    # Version 4 sizes are 64-bit: a non-zero high dword declares > 4 GiB.
+    huge = bytearray(v4)
+    struct.pack_into("<I", huge, 8192 + 128 + 124, 1)  # directory = sector 1
+    with pytest.raises(DocumentValidationError) as exc:
+        validate_document_bytes(bytes(huge), ".doc")
+    assert exc.value.code == "invalid"
+    # Version 3 sizes are 32-bit; MS-CFB 2.6.1 notes that older writers left
+    # the high dword uninitialised, so it is ignored rather than trusted ...
+    stale_high = bytearray(make_cfb(streams={"WordDocument": make_fib()}))
+    struct.pack_into("<I", stale_high, 1024 + 128 + 124, 0xDEADBEEF)
+    validate_document_bytes(bytes(stale_high), ".doc")
+    # ... while the low dword must still be a legal (<= 2 GiB) v3 size.
+    too_big = bytearray(make_cfb(streams={"WordDocument": make_fib()}))
+    struct.pack_into("<I", too_big, 1024 + 128 + 120, 0x80000001)
+    with pytest.raises(DocumentValidationError) as big:
+        validate_document_bytes(bytes(too_big), ".doc")
+    assert big.value.code == "invalid"
 
 
 def test_unknown_suffix_is_unsupported() -> None:
@@ -565,6 +598,60 @@ def test_shared_strings_and_unterminated_row_are_bounded_by_output_budget(monkey
     assert "truncated" in text
     assert "\tabc" in text, "strings inside the retained table resolve; those beyond it render empty"
     assert len(text) <= 100 + len(mod._TRUNCATION_MARK)
+
+
+def test_budget_rejects_oversized_values_before_buffering(monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.document_attachments as mod
+
+    monkeypatch.setattr(mod, "_MAX_TEXT_CHARS", 100)
+    committed: list[int] = []
+    original_add = mod._TextBudget.add
+
+    def spying_add(self: mod._TextBudget, line: str) -> bool:
+        committed.append(len(line))
+        return original_add(self, line)
+
+    monkeypatch.setattr(mod._TextBudget, "add", spying_add)
+    big = "x" * 10_000
+
+    docx = make_docx_raw(
+        f"<w:document><w:body><w:p><w:r><w:t>ok</w:t></w:r><w:r><w:t>{big}</w:t></w:r></w:p></w:body></w:document>"
+    )
+    text = extract_document_text(docx, ".docx")
+    assert text is not None and "truncated" in text
+    assert max(committed) <= 100, "a single over-budget run must not be buffered or flushed"
+
+    committed.clear()
+    sheet = (
+        '<worksheet><sheetData><row r="1"><c><v>1</v></c>'
+        f'<c t="inlineStr"><is><t>{big}</t></is></c><c><v>{big}</v></c></row></sheetData></worksheet>'
+    )
+    text = extract_document_text(make_xlsx_raw(sheet), ".xlsx")
+    assert text is not None and "truncated" in text
+    assert max(committed) <= 100
+
+    with mod._open_ooxml(make_xlsx_raw("<worksheet/>", shared_strings=f"<sst><si><t>{big}</t></si></sst>")) as archive:
+        strings, truncated = mod._xlsx_shared_strings(archive)
+    assert truncated and strings == [], "an over-budget shared string is dropped, not retained"
+
+
+def test_xlsx_values_within_budget_are_charged_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.document_attachments as mod
+
+    monkeypatch.setattr(mod, "_MAX_TEXT_CHARS", 80)
+    sst = "<sst><si><t>abcdefghij</t></si></sst>"
+    sheet = (
+        '<worksheet><sheetData><row r="1"><c><v>123456789</v></c><c t="s"><v>0</v></c><c t="b"><v>1</v></c>'
+        '<c t="inlineStr"><is><t>klmnopqrst</t></is></c></row>'
+        '<row r="2"><c><v>987654321</v></c><c t="s"><v>0</v></c></row></sheetData></worksheet>'
+    )
+    text = extract_document_text(make_xlsx_raw(sheet, shared_strings=sst), ".xlsx")
+    assert text is not None
+    # 74 characters of output sit between 50% and 100% of the cap: double
+    # charging numeric / shared / boolean cells would truncate this sheet.
+    assert "truncated" not in text
+    assert "123456789\tabcdefghij\tTRUE\tklmnopqrst" in text
+    assert "987654321\tabcdefghij" in text
 
 
 @pytest.mark.parametrize("suffix", [".pdf", ".doc", ".xls", ".txt", ".csv", ".md"])
