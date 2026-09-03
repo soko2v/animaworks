@@ -112,3 +112,15 @@ def test_queue_edit_preflights_capacity_before_removing_the_entry(path: Path, ca
     source = path.read_text(encoding="utf-8")
     assert preflight in source, f"{path.name} restores without a capacity preflight"
     assert source.index(preflight) < source.index(remove), f"{path.name} removes the queue entry before the preflight"
+
+
+def test_chat_page_pinned_sends_keep_their_target_when_a_meeting_is_active() -> None:
+    """A queued item drained into sendChat() must not be redirected to a meeting.
+
+    The drain sites pin ``targetAnima``/``targetThread``; if the user entered a
+    meeting while the 150 ms drain timer was pending, the meeting branch would
+    otherwise take the text/images and drop the documents.
+    """
+    source = _CHAT_PAGE.read_text(encoding="utf-8")
+    assert "if (!overrideImages?.targetAnima && ctx.controllers.meeting?.isActive?.())" in source
+    assert "if (ctx.controllers.meeting?.isActive?.()) {\n      sendMeetingChat(message, overrideImages);" not in source

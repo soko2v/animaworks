@@ -284,7 +284,11 @@ export function createStreamingController(ctx) {
   }
 
   async function sendChat(message, overrideImages = null) {
-    if (ctx.controllers.meeting?.isActive?.()) {
+    // A queued item is pinned to the Anima/thread it was written in; it must
+    // keep that target even if the user entered a meeting while the drain
+    // timer was pending (the meeting path also drops document attachments).
+    // Only direct, unpinned sends follow the active meeting.
+    if (!overrideImages?.targetAnima && ctx.controllers.meeting?.isActive?.()) {
       sendMeetingChat(message, overrideImages);
       return;
     }

@@ -114,9 +114,12 @@ export function _resetWindowDropGuardForTests() {
  * @param {HTMLElement} options.inputArea - Chat input area element (for paste events)
  * @param {HTMLElement} options.previewContainer - Element to render thumbnails in
  * @param {function(): void} [options.onImagesChanged] - Callback when images array changes
+ * @param {function(string): string} [options.fingerprint] - Payload fingerprint used to
+ *   narrow restore de-duplication lookups (identity is always confirmed by comparing the
+ *   complete payload); overridable so tests can force a collision
  * @returns {object} Manager with getPendingImages(), clearImages(), getImageCount(), addFiles()
  */
-export function createImageInput({ container, inputArea, previewContainer, onImagesChanged }) {
+export function createImageInput({ container, inputArea, previewContainer, onImagesChanged, fingerprint = payloadFingerprint }) {
   const pendingImages = []; // Array of { data: base64String, media_type: string, dataUrl: string }
   const pendingFiles = []; // Array of { data: base64String, media_type: string, name: string, key: string }
   const queuedIdentities = new Set(); // fileIdentity() of every attached or in-flight file
@@ -419,22 +422,43 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     processImageFiles(e.dataTransfer?.files || []);
   });
 
+  // Payload currently attached under *key*, or undefined when the key is free.
+  function pendingPayloadFor(key) {
+    const hit = pendingImages.find((img) => img.key === key) || pendingFiles.find((file) => file.key === key);
+    return hit ? hit.data : undefined;
+  }
+
+  // Key for a restored attachment whose snapshot carries no identity. The
+  // fingerprint only narrows the lookup: identity is confirmed by comparing
+  // the complete payload, so two distinct payloads that share a fingerprint
+  // get distinct keys instead of one being silently dropped. Returns a key
+  // that is either free or already holds this exact payload.
+  function fallbackRestoreKey(kind, label, data, seen) {
+    const base = `restored|${kind}|${label}|${fingerprint(data)}`;
+    let key = base;
+    for (let n = 2; ; n += 1) {
+      const existing = seen.has(key) ? seen.get(key) : pendingPayloadFor(key);
+      if (existing === undefined || existing === data) return key;
+      key = `${base}#${n}`;
+    }
+  }
+
   // Compute what restoreAttachments() would add without mutating state.
   // Keys come from the display snapshots (file identity or paste key); an
-  // entry without one gets a key derived from the complete payload.
+  // entry without one gets a key confirmed against the complete payload.
   function planRestore(entry) {
     const images = Array.isArray(entry?.images) ? entry.images : [];
     const displayImages = Array.isArray(entry?.displayImages) ? entry.displayImages : [];
     const files = Array.isArray(entry?.files) ? entry.files : [];
     const displayFiles = Array.isArray(entry?.displayFiles) ? entry.displayFiles : [];
-    const seen = new Set();
+    const seen = new Map(); // key -> payload planned in this entry
     const plan = { images: [], files: [], overflow: null };
     images.forEach((img, index) => {
       if (!img?.data || !img?.media_type) return;
       const shown = displayImages[index] || {};
-      const key = shown.key || `restored|image|${img.media_type}|${payloadFingerprint(img.data)}`;
+      const key = shown.key || fallbackRestoreKey("image", img.media_type, img.data, seen);
       if (queuedIdentities.has(key) || seen.has(key)) return;
-      seen.add(key);
+      seen.set(key, img.data);
       plan.images.push({
         data: img.data,
         media_type: img.media_type,
@@ -445,13 +469,13 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     files.forEach((file, index) => {
       if (!file?.data || !file?.name) return;
       const shown = displayFiles[index] || {};
-      const key = shown.key || `restored|file|${file.name}|${payloadFingerprint(file.data)}`;
+      const key = shown.key || fallbackRestoreKey("file", file.name, file.data, seen);
       if (queuedIdentities.has(key) || seen.has(key)) return;
       if (!plan.overflow && pendingFiles.length + plan.files.length >= MAX_FILE_COUNT) {
         plan.overflow = file.name;
         return;
       }
-      seen.add(key);
+      seen.set(key, file.data);
       plan.files.push({ data: file.data, media_type: file.media_type || "", name: file.name, key });
     });
     return plan;

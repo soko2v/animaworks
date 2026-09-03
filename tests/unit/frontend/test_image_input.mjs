@@ -449,6 +449,34 @@ describe("image-input document drag & drop", () => {
     assert.equal(manager.restoreAttachments({ files: [{ ...docA, name: "twice.txt" }, { ...docA, name: "twice.txt" }] }), 1);
   });
 
+  it("restoreAttachments confirms fallback identity by the whole payload, not only its fingerprint", () => {
+    // Force every payload to the same fingerprint: a collision must not drop a
+    // distinct payload, while identical payloads stay de-duplicated.
+    const colliding = mod.createImageInput({
+      container: new MockEl("div"),
+      inputArea: new MockEl("textarea"),
+      previewContainer: new MockEl("div"),
+      fingerprint: () => "collision",
+    });
+    const one = { data: "YWFhYQ==", media_type: "image/png" };
+    const two = { data: "YmJiYg==", media_type: "image/png" };
+    assert.equal(colliding.restoreAttachments({ images: [one, two] }), 2, "colliding fingerprints restore both payloads");
+    const keys = colliding.getDisplayImages().map((i) => i.key);
+    assert.notEqual(keys[0], keys[1]);
+    assert.equal(colliding.restoreAttachments({ images: [one, two] }), 0, "identical payloads are still de-duplicated");
+    assert.equal(colliding.restoreAttachments({ images: [two, one] }), 0, "order does not matter");
+    assert.equal(colliding.getImageCount(), 2);
+
+    const docA = { name: "same.txt", media_type: "text/plain", data: "YWFhYQ==" };
+    const docB = { name: "same.txt", media_type: "text/plain", data: "YmJiYg==" };
+    const docC = { name: "same.txt", media_type: "text/plain", data: "Y2NjYw==" };
+    assert.equal(colliding.restoreAttachments({ files: [docA, docB, docA] }), 2, "third distinct-looking entry is the first payload again");
+    assert.equal(colliding.restoreAttachments({ files: [docB, docA] }), 0);
+    assert.equal(colliding.restoreAttachments({ files: [docC] }), 1, "a third colliding payload still gets its own key");
+    assert.equal(colliding.getFileCount(), 3);
+    assert.equal(new Set(colliding.getDisplayFiles().map((f) => f.key)).size, 3);
+  });
+
   it("pasted images receive distinct identities that survive a queue edit round trip", async () => {
     // Pasted images have no name/mtime; two of the same type and size must not
     // collapse into one after being queued and restored into the composer.
