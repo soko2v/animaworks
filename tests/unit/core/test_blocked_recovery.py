@@ -293,6 +293,90 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     assert not any(t.name == "unblock-check-stderr" for t in threading.enumerate())
 
 
+def _mock_reaped_process() -> Mock:
+    """Build a mocked process whose wait records that the root was reaped."""
+    proc = Mock()
+    proc.pid = 4242
+    proc.returncode = None
+    proc.stderr = Mock()
+
+    def _wait(*_args, **_kwargs) -> int:
+        proc.returncode = -9
+        return proc.returncode
+
+    proc.wait.side_effect = _wait
+    return proc
+
+
+def test_run_sandboxed_contains_and_reaps_when_drain_finished_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = _mock_reaped_process()
+    drain = Mock()
+    drain.finished.side_effect = RuntimeError("reader join failed")
+    kill_tree = Mock()
+    monkeypatch.setattr(blocked_recovery.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(blocked_recovery, "_StderrDrain", lambda _stream: drain)
+    monkeypatch.setattr(blocked_recovery, "_wait_unreaped", Mock())
+    monkeypatch.setattr(blocked_recovery, "_kill_tree", kill_tree)
+
+    with pytest.raises(RuntimeError, match="reader join failed"):
+        blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
+
+    kill_tree.assert_called_once_with(proc, "m")
+    proc.wait.assert_called_once_with()
+    assert proc.returncode is not None
+
+
+def test_run_sandboxed_contains_and_reaps_when_reject_open_stderr_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = _mock_reaped_process()
+    drain = Mock()
+    drain.finished.return_value = False
+    kill_tree = Mock()
+    monkeypatch.setattr(blocked_recovery.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(blocked_recovery, "_StderrDrain", lambda _stream: drain)
+    monkeypatch.setattr(blocked_recovery, "_wait_unreaped", Mock())
+    monkeypatch.setattr(blocked_recovery, "_kill_tree", kill_tree)
+    monkeypatch.setattr(
+        blocked_recovery,
+        "_reject_open_stderr",
+        Mock(side_effect=RuntimeError("stderr containment failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="stderr containment failed"):
+        blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
+
+    kill_tree.assert_called_once_with(proc, "m")
+    proc.wait.assert_called_once_with()
+    assert proc.returncode is not None
+
+
+def test_run_sandboxed_reaps_when_kill_tree_raises_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The containment error supersedes the timeout, but the root is still reaped."""
+    proc = _mock_reaped_process()
+    drain = Mock()
+    timeout_error = subprocess.TimeoutExpired("sh", 5)
+    monkeypatch.setattr(blocked_recovery.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(blocked_recovery, "_StderrDrain", lambda _stream: drain)
+    monkeypatch.setattr(blocked_recovery, "_wait_unreaped", Mock(side_effect=timeout_error))
+    monkeypatch.setattr(
+        blocked_recovery,
+        "_kill_tree",
+        Mock(side_effect=RuntimeError("containment failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="containment failed") as exc_info:
+        blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True)
+
+    assert exc_info.value.__context__ is timeout_error
+    proc.wait.assert_called_once_with()
+    assert proc.returncode is not None
+
+
 def test_kill_tree_freezes_root_group_before_first_snapshot() -> None:
     proc = Mock()
     proc.pid = 77
@@ -1085,10 +1169,27 @@ def _kill_captured_group_if_same_live_root(
     current = _test_process_identity(popen, root_pid)
     if current != expected or current.pgid != root_pid:
         return
+    current = _test_process_identity(popen, root_pid)
+    if current != expected or current.pgid != root_pid:
+        return
     try:
         os.killpg(root_pid, blocked_recovery.signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def test_kill_captured_group_revalidates_root_identity_before_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = _identity(77, 77)
+    changed = _identity(77, 77, "Wed Sep  4 12:00:01 2026")
+    process_identity = Mock(side_effect=[expected, changed])
+    killpg = Mock()
+    monkeypatch.setattr(sys.modules[__name__], "_test_process_identity", process_identity)
+    monkeypatch.setattr(os, "killpg", killpg)
+
+    _kill_captured_group_if_same_live_root(Mock(), 77, expected)
+
+    assert process_identity.call_count == 2
+    killpg.assert_not_called()
 
 
 @pytest.mark.skipif(sys.platform == "win32" or not _PS_AVAILABLE, reason="requires inspectable POSIX processes")

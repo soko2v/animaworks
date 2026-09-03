@@ -782,27 +782,32 @@ def _run_sandboxed(
             if not reject_stderr:
                 return proc.wait(timeout=timeout)
             _wait_unreaped(proc, timeout)
+            if drain is None:
+                proc.wait()
+                return 1
+            settled = drain.finished(_STDERR_EOF_GRACE_SECONDS)
+            if not settled:
+                _reject_open_stderr(proc.pid, marker, drain)
+            stderr_clean = settled and drain.eof and not drain.seen
+            returncode = proc.wait()
+            if returncode != 0:
+                return returncode
+            if not settled:
+                return 1
+            return 0 if stderr_clean else 1
         except subprocess.TimeoutExpired:
-            _kill_tree(proc, marker)
-            proc.wait()
+            try:
+                _kill_tree(proc, marker)
+            finally:
+                proc.wait()
             raise
         except BaseException:
             if reject_stderr or proc.poll() is None:
-                _kill_tree(proc, marker)
-                proc.wait()
+                try:
+                    _kill_tree(proc, marker)
+                finally:
+                    proc.wait()
             raise
-        if drain is None:
-            proc.wait()
-            return 1
-        settled = drain.finished(_STDERR_EOF_GRACE_SECONDS)
-        if not settled:
-            _reject_open_stderr(proc.pid, marker, drain)
-        returncode = proc.wait()
-        if returncode != 0:
-            return returncode
-        if not settled:
-            return 1
-        return 0 if drain.eof and not drain.seen else 1
     finally:
         if drain is not None:
             drain.close()
