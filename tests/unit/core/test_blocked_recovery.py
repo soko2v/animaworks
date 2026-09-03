@@ -207,13 +207,15 @@ def test_no_sandbox_available_fails_closed_without_running_check(
     assert "sandbox unavailable" in caplog.text
 
 
-def test_run_sandboxed_kills_process_group_on_timeout() -> None:
+def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     proc = Mock()
     proc.pid = 4242
     proc.wait.side_effect = [subprocess.TimeoutExpired("sh", 60), -9]
 
     with (
         patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen,
+        patch("core.blocked_recovery._descendant_pids", return_value=[4300, 4301]) as descendants,
+        patch("core.blocked_recovery.os.kill") as kill,
         patch("core.blocked_recovery.os.killpg") as killpg,
         pytest.raises(subprocess.TimeoutExpired),
     ):
@@ -225,8 +227,49 @@ def test_run_sandboxed_kills_process_group_on_timeout() -> None:
     assert kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["env"] == {}
+    descendants.assert_called_once_with(4242)
+    assert [c.args for c in kill.call_args_list] == [
+        (4300, blocked_recovery.signal.SIGKILL),
+        (4301, blocked_recovery.signal.SIGKILL),
+    ]
     killpg.assert_called_once_with(4242, blocked_recovery.signal.SIGKILL)
+    proc.kill.assert_called_once_with()
     assert proc.wait.call_count == 2
+
+
+def test_descendant_pids_walks_ps_tree() -> None:
+    listing = "1 0\n100 1\n200 100\n300 200\n301 200\n400 1\n"
+    with patch(
+        "core.blocked_recovery.subprocess.run",
+        return_value=subprocess.CompletedProcess([], 0, stdout=listing),
+    ) as run:
+        assert blocked_recovery._descendant_pids(100) == [200, 300, 301]
+    assert run.call_args.args[0] == ["ps", "-axo", "pid=,ppid="]
+    assert run.call_args.kwargs["stdin"] is subprocess.DEVNULL
+
+
+def test_descendant_pids_returns_empty_when_ps_unavailable() -> None:
+    with patch("core.blocked_recovery.subprocess.run", side_effect=FileNotFoundError("ps")):
+        assert blocked_recovery._descendant_pids(1) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_real_timeout_kills_setsid_escapee() -> None:
+    """Integration: a descendant that setsid()s out of the group must not survive the timeout."""
+    marker = f"aw_unblock_escapee_{os.getpid()}"
+    escapee = f"import os, time; os.setsid(); time.sleep(120)  # {marker}"
+    argv = ["/bin/sh", "-c", f"python3 -c '{escapee}' & sleep 120"]
+    with pytest.raises(subprocess.TimeoutExpired):
+        blocked_recovery._run_sandboxed(argv, cwd=Path("/"), env={"PATH": os.environ.get("PATH", "")}, timeout=2)
+    survivors = subprocess.run(
+        ["pgrep", "-f", marker], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, text=True
+    ).stdout.split()
+    for pid in survivors:  # never leave a stray sleeper behind even if the assertion fails
+        try:
+            os.kill(int(pid), blocked_recovery.signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+    assert survivors == []
 
 
 def test_run_sandboxed_returns_exit_code() -> None:

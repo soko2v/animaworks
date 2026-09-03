@@ -192,14 +192,73 @@ def _sandbox_argv(route: str, check: str) -> list[str]:
     raise ValueError(f"unknown sandbox route: {route}")
 
 
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Return all live descendants of ``root_pid`` (via ``ps``), children first.
+
+    This catches descendants that left the process group/session (``setsid``)
+    but whose parent chain is still alive. A fully detached double-fork daemon
+    is reparented to PID 1 and cannot be attributed; that residual risk is
+    accepted and documented.
+    """
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    found: list[int] = []
+    queue = [root_pid]
+    while queue:
+        current = queue.pop(0)
+        for child in children.get(current, []):
+            if child not in found and child != root_pid:
+                found.append(child)
+                queue.append(child)
+    return found
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """SIGKILL every descendant of ``proc`` (tree walk first), then its process group."""
+    for pid in _descendant_pids(proc.pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int) -> int:
     """Run ``argv`` with suppressed output and return its exit code.
 
     The child is started in its own session so that, on timeout, the whole
-    process group (including grandchildren spawned by ``/bin/sh``) is killed.
-    bwrap already provides ``--die-with-parent``; sandbox-exec does not, so the
-    group kill is what keeps a timed-out check from leaving orphans on macOS.
-    Raises ``OSError`` when the sandbox binary cannot be started and
+    process group is killed; before that, the live descendant tree is walked
+    and killed so that a check which ``setsid()``s out of the group does not
+    survive either. bwrap already provides ``--die-with-parent``; sandbox-exec
+    does not, so this is what keeps a timed-out check from leaving orphans on
+    macOS. Raises ``OSError`` when the sandbox binary cannot be started and
     ``subprocess.TimeoutExpired`` on timeout.
     """
     proc = subprocess.Popen(
@@ -214,10 +273,7 @@ def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: 
     try:
         return proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        _kill_tree(proc)
         proc.wait()
         raise
 
