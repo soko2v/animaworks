@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -106,6 +107,7 @@ def test_check_success_republishes_without_consuming_retry(tmp_path: Path) -> No
     kwargs = run.call_args.kwargs
     assert kwargs["cwd"] == anima_dir
     assert kwargs["timeout"] == 60
+    assert kwargs["reject_stderr"] is False
     assert set(kwargs["env"]) == {"PATH", "HOME", "ANIMAWORKS_ANIMA_DIR", "ANIMAWORKS_UNBLOCK_CHECK_ID"}
     assert kwargs["env"]["ANIMAWORKS_ANIMA_DIR"] == str(anima_dir)
     assert kwargs["env"]["ANIMAWORKS_UNBLOCK_CHECK_ID"] == kwargs["marker"]
@@ -147,6 +149,7 @@ def test_macos_sandbox_exec_fallback_when_bwrap_missing(tmp_path: Path) -> None:
     kwargs = run.call_args.kwargs
     assert kwargs["cwd"] == anima_dir
     assert kwargs["timeout"] == 60
+    assert kwargs["reject_stderr"] is True
     assert set(kwargs["env"]) == {"PATH", "HOME", "ANIMAWORKS_ANIMA_DIR", "ANIMAWORKS_UNBLOCK_CHECK_ID"}
     assert manager.get_task_by_id("mac-pass").status == "pending"
     assert _activity_events(anima_dir)[0]["meta"]["sandbox"] == "sandbox-exec"
@@ -221,6 +224,7 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     proc.pid = 4242
     proc.wait.side_effect = [subprocess.TimeoutExpired("sh", 60), -9]
     proc.stderr = Mock()
+    proc.stderr.raw.read.side_effect = [b""]
 
     # Pass 1 sees two descendants; pass 2 sees one more forked meanwhile; pass 3 is stable.
     snapshots = [[4300, 4301], [4300, 4301, 4302], [4300, 4301, 4302]]
@@ -232,7 +236,9 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
         patch("core.blocked_recovery.os.killpg") as killpg,
         pytest.raises(subprocess.TimeoutExpired),
     ):
-        blocked_recovery._run_sandboxed(["/bin/sh", "-c", "sleep 99"], cwd=Path("/"), env={}, timeout=60, marker="m")
+        blocked_recovery._run_sandboxed(
+            ["/bin/sh", "-c", "sleep 99"], cwd=Path("/"), env={}, timeout=60, marker="m", reject_stderr=True
+        )
 
     kwargs = popen.call_args.kwargs
     assert kwargs["start_new_session"] is True
@@ -517,23 +523,35 @@ def test_real_timeout_kills_double_forked_daemon_via_marker() -> None:
 def test_run_sandboxed_returns_exit_code() -> None:
     proc = Mock()
     proc.wait.return_value = 3
-    proc.stderr = Mock()
-    proc.stderr.read.return_value = b""
-    with patch("core.blocked_recovery.subprocess.Popen", return_value=proc):
+    proc.stderr = None
+    with patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen:
         assert blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m") == 3
+    assert popen.call_args.kwargs["stderr"] is subprocess.DEVNULL
+
+
+def test_run_sandboxed_default_route_keeps_exit_status_contract() -> None:
+    """bwrap route: stderr is discarded and a zero exit is accepted as before."""
+    proc = Mock()
+    proc.wait.return_value = 0
+    proc.stderr = None
+    with patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen:
+        assert blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m") == 0
+    assert popen.call_args.kwargs["stderr"] is subprocess.DEVNULL
 
 
 def test_run_sandboxed_fails_closed_when_zero_exit_writes_stderr() -> None:
     proc = Mock()
     proc.wait.return_value = 0
     proc.stderr = Mock()
-    proc.stderr.fileno.return_value = 42
-    with (
-        patch("core.blocked_recovery.subprocess.Popen", return_value=proc),
-        patch("core.blocked_recovery.os.set_blocking"),
-        patch("core.blocked_recovery.os.read", return_value=b"Operation not permitted"),
-    ):
-        assert blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m") == 1
+    proc.stderr.raw.read.side_effect = [b"Operation not permitted", b""]
+    with patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen:
+        assert (
+            blocked_recovery._run_sandboxed(
+                ["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True
+            )
+            == 1
+        )
+    assert popen.call_args.kwargs["stderr"] is subprocess.PIPE
     proc.stderr.close.assert_called_once()
 
 
@@ -541,13 +559,63 @@ def test_run_sandboxed_accepts_quiet_zero_exit_without_marked_child() -> None:
     proc = Mock()
     proc.wait.return_value = 0
     proc.stderr = Mock()
-    proc.stderr.fileno.return_value = 42
-    with (
-        patch("core.blocked_recovery.subprocess.Popen", return_value=proc),
-        patch("core.blocked_recovery.os.set_blocking"),
-        patch("core.blocked_recovery.os.read", return_value=b""),
-    ):
-        assert blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m") == 0
+    proc.stderr.raw.read.side_effect = [b""]
+    with patch("core.blocked_recovery.subprocess.Popen", return_value=proc):
+        assert (
+            blocked_recovery._run_sandboxed(
+                ["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True
+            )
+            == 0
+        )
+    proc.stderr.close.assert_called_once()
+
+
+def test_run_sandboxed_fails_closed_when_stderr_read_fails() -> None:
+    proc = Mock()
+    proc.wait.return_value = 0
+    proc.stderr = Mock()
+    proc.stderr.raw.read.side_effect = OSError("bad pipe")
+    with patch("core.blocked_recovery.subprocess.Popen", return_value=proc):
+        assert (
+            blocked_recovery._run_sandboxed(
+                ["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True
+            )
+            == 1
+        )
+
+
+def test_run_sandboxed_sweeps_and_rejects_when_pipe_stays_open_after_zero_exit() -> None:
+    """A stray holding stderr past the grace period is swept (group + marker) and the check is rejected."""
+    proc = Mock()
+    proc.pid = 4242
+    proc.wait.return_value = 0
+    proc.stderr = Mock()
+    release = threading.Event()
+
+    def _held_read(_size: int) -> bytes:
+        release.wait(5)
+        return b""
+
+    proc.stderr.raw.read.side_effect = _held_read
+    try:
+        with (
+            patch("core.blocked_recovery.subprocess.Popen", return_value=proc),
+            patch("core.blocked_recovery._STDERR_EOF_GRACE_SECONDS", 0.05),
+            patch("core.blocked_recovery._process_group_pids", return_value=[4300]) as group,
+            patch("core.blocked_recovery._marker_pids", return_value=([4300, 4301], True)),
+            patch("core.blocked_recovery._signal_all") as signal_all,
+        ):
+            assert (
+                blocked_recovery._run_sandboxed(
+                    ["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m", reject_stderr=True
+                )
+                == 1
+            )
+    finally:
+        release.set()
+    group.assert_called_once_with(4242)
+    signal_all.assert_called_once_with([4300, 4301], blocked_recovery.signal.SIGKILL)
+    proc.stderr.close.assert_called_once()
 
 
 def test_process_group_pids_selects_only_the_requested_group() -> None:
@@ -586,6 +654,7 @@ def test_real_sandbox_exec_denies_writes_and_network(tmp_path: Path, check: str,
         env=env,
         timeout=30,
         marker=marker,
+        reject_stderr=True,
     )
     assert (code == 0) == (expected == 0)
     if expected not in (0, 1):
@@ -613,6 +682,7 @@ def test_real_sandbox_exec_fails_closed_when_negated_ps_is_denied(tmp_path: Path
         env=env,
         timeout=30,
         marker=marker,
+        reject_stderr=True,
     )
     assert code == 1
 
@@ -625,13 +695,17 @@ def test_run_sandboxed_fails_closed_and_kills_background_stderr_holder_after_dir
     pid_file = tmp_path / "child.pid"
     child_pid: int | None = None
     try:
-        assert blocked_recovery._run_sandboxed(
-            ["/bin/sh", "-c", 'sleep 120 & printf "%s" "$!" > child.pid; exit 0'],
-            cwd=tmp_path,
-            env=env,
-            timeout=2,
-            marker=marker,
-        ) == 1
+        assert (
+            blocked_recovery._run_sandboxed(
+                ["/bin/sh", "-c", 'sleep 120 & printf "%s" "$!" > child.pid; exit 0'],
+                cwd=tmp_path,
+                env=env,
+                timeout=2,
+                marker=marker,
+                reject_stderr=True,
+            )
+            == 1
+        )
     finally:
         if pid_file.exists():
             child_pid = int(pid_file.read_text(encoding="utf-8"))
@@ -649,6 +723,42 @@ def test_run_sandboxed_fails_closed_and_kills_background_stderr_holder_after_dir
             time.sleep(0.05)
         else:
             pytest.fail(f"background child {child_pid} survived")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_run_sandboxed_rejects_large_stderr_promptly_without_pipe_stall(tmp_path: Path) -> None:
+    """Output far beyond the pipe buffer must be drained, rejected, and never ride out the timeout."""
+    marker = f"stderr-flood-{os.getpid()}"
+    env = {"PATH": os.environ.get("PATH", ""), blocked_recovery._CHECK_MARKER_ENV: marker}
+    started = time.monotonic()
+    code = blocked_recovery._run_sandboxed(
+        ["/bin/sh", "-c", 'head -c 400000 /dev/zero | tr "\\0" x >&2; exit 0'],
+        cwd=tmp_path,
+        env=env,
+        timeout=20,
+        marker=marker,
+        reject_stderr=True,
+    )
+    elapsed = time.monotonic() - started
+    assert code == 1
+    assert elapsed < 10, f"stderr flood took {elapsed:.1f}s; child was stalled on a full pipe"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+@pytest.mark.parametrize(("reject_stderr", "expected"), [(False, 0), (True, 1)])
+def test_run_sandboxed_stderr_rejection_is_route_scoped(tmp_path: Path, reject_stderr: bool, expected: int) -> None:
+    """Only the stderr-rejecting route turns a zero-exit warning into failure."""
+    marker = f"stderr-scope-{os.getpid()}"
+    env = {"PATH": os.environ.get("PATH", ""), blocked_recovery._CHECK_MARKER_ENV: marker}
+    code = blocked_recovery._run_sandboxed(
+        ["/bin/sh", "-c", "echo warning >&2; exit 0"],
+        cwd=tmp_path,
+        env=env,
+        timeout=10,
+        marker=marker,
+        reject_stderr=reject_stderr,
+    )
+    assert code == expected
 
 
 def test_recovery_batch_limit_uses_oldest_blocked_tasks(tmp_path: Path) -> None:

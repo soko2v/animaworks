@@ -13,10 +13,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import IO
 
 from core.i18n import t
 from core.memory._io import atomic_write_text
@@ -397,7 +399,80 @@ def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
         )
 
 
-def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int, marker: str) -> int:
+# After a zero exit on a stderr-rejecting route, how long to wait for the child's
+# stderr pipe to reach EOF before a still-open pipe is treated as a stray holder.
+_STDERR_EOF_GRACE_SECONDS = 1.0
+
+
+class _StderrDrain:
+    """Drain a child's stderr on a daemon thread, recording only whether bytes arrived.
+
+    Draining concurrently with ``Popen.wait`` keeps a chatty child from
+    blocking on a full pipe until the timeout. Nothing is accumulated, so
+    parent memory stays flat regardless of output volume. Reads go through
+    the raw file object: once the parent closes it, any further read raises
+    ``ValueError`` instead of touching a possibly reused descriptor number.
+    """
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        self._raw = getattr(stream, "raw", stream)
+        self.seen = False
+        self.eof = False
+        self.failed = False
+        self._thread = threading.Thread(target=self._run, name="unblock-check-stderr", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                chunk = self._raw.read(65536)
+                if not chunk:
+                    self.eof = True
+                    return
+                self.seen = True
+        except (OSError, ValueError):
+            self.failed = True
+
+    def finished(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for EOF or failure; False means the pipe is still open."""
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+
+def _reject_open_stderr(root_pid: int, marker: str) -> None:
+    """Sweep and kill whatever still holds the check's stderr after the root exited."""
+    group_pids: list[int] = []
+    marked: list[int] = []
+    group_ok = True
+    marker_ok = True
+    try:
+        group_pids = _process_group_pids(root_pid)
+    except _ProcessListingUnavailable:
+        group_ok = False
+    try:
+        marked, marker_ok = _marker_pids(marker)
+    except _ProcessListingUnavailable:
+        marker_ok = False
+    strays = list(dict.fromkeys([*group_pids, *marked]))
+    if strays:
+        _signal_all(strays, signal.SIGKILL)
+    logger.warning(
+        "unblock_check completed with open stderr pipe; rejecting: group_ok=%s marker_ok=%s stray_pids=%s",
+        group_ok,
+        marker_ok,
+        strays,
+    )
+
+
+def _run_sandboxed(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+    marker: str,
+    reject_stderr: bool = False,
+) -> int:
     """Run ``argv`` with suppressed output and return a fail-closed result.
 
     ``env`` must carry ``marker`` under ``_CHECK_MARKER_ENV``. The child is
@@ -405,12 +480,16 @@ def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: 
     the whole tree (see there). Raises ``OSError`` when the sandbox binary
     cannot be started and ``subprocess.TimeoutExpired`` on timeout.
 
-    A check that emits stderr is never accepted as successful, even when its
-    shell syntax negates a failed command and therefore returns zero. stderr is
-    sampled non-blockingly after normal exit. A still-open pipe proves a child
-    retained it, so the process group and inherited marker are swept before
-    failing closed; any unavailable inspection also fails closed without
-    unbounded waiting or parent-memory accumulation.
+    Without ``reject_stderr`` (the bwrap route) stderr is discarded and the
+    exit status alone decides, as before. With ``reject_stderr`` (the macOS
+    sandbox-exec route) the exit status is not trusted on its own: Seatbelt
+    reports a denied operation only through the child's stderr, and a check
+    such as ``! ps ... | grep -q .`` would negate that denial into exit 0. On
+    that route stderr is drained concurrently and any output rejects a zero
+    exit. A pipe still open shortly after exit means a child retained it, so
+    the process group and inherited marker are swept before failing closed;
+    an uninspectable pipe also fails closed. Checks on that route must be
+    stderr-silent and must never negate an observation command.
     """
     proc = subprocess.Popen(
         argv,
@@ -418,51 +497,21 @@ def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: 
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE if reject_stderr else subprocess.DEVNULL,
         start_new_session=True,
     )
     stderr = proc.stderr
+    drain = _StderrDrain(stderr) if reject_stderr and stderr is not None else None
     try:
         returncode = proc.wait(timeout=timeout)
-        if returncode != 0:
+        if not reject_stderr or returncode != 0:
             return returncode
-        if stderr is None:
+        if drain is None:
             return 1
-        stderr_seen = False
-        stderr_inspectable = True
-        stderr_open = False
-        try:
-            os.set_blocking(stderr.fileno(), False)
-            if os.read(stderr.fileno(), 1):
-                stderr_seen = True
-        except BlockingIOError:
-            stderr_open = True
-        except (OSError, ValueError):
-            stderr_inspectable = False
-        if stderr_open:
-            group_pids: list[int] = []
-            marked: list[int] = []
-            group_ok = True
-            marker_ok = True
-            try:
-                group_pids = _process_group_pids(proc.pid)
-            except _ProcessListingUnavailable:
-                group_ok = False
-            try:
-                marked, marker_ok = _marker_pids(marker)
-            except _ProcessListingUnavailable:
-                marker_ok = False
-            strays = list(dict.fromkeys([*group_pids, *marked]))
-            if strays:
-                _signal_all(strays, signal.SIGKILL)
-            logger.warning(
-                "unblock_check completed with open stderr pipe; rejecting: group_ok=%s marker_ok=%s stray_pids=%s",
-                group_ok,
-                marker_ok,
-                strays,
-            )
+        if not drain.finished(_STDERR_EOF_GRACE_SECONDS):
+            _reject_open_stderr(proc.pid, marker)
             return 1
-        return 0 if stderr_inspectable and not stderr_seen else 1
+        return 0 if drain.eof and not drain.seen else 1
     except subprocess.TimeoutExpired:
         _kill_tree(proc, marker)
         proc.wait()
@@ -531,6 +580,7 @@ def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
                         env=env,
                         timeout=config.blocked_check_timeout_seconds,
                         marker=marker,
+                        reject_stderr=route == "sandbox-exec",
                     )
                 except OSError:
                     logger.warning(
