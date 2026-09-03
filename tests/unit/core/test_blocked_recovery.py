@@ -97,13 +97,18 @@ def test_check_success_republishes_without_consuming_retry(tmp_path: Path) -> No
         "--",
         "/bin/sh",
         "-c",
+        blocked_recovery._SH_WRAPPER,
+        "unblock_check",
+        "60",
         "test -w .",
     ]
     kwargs = run.call_args.kwargs
     assert kwargs["cwd"] == anima_dir
     assert kwargs["timeout"] == 60
-    assert set(kwargs["env"]) == {"PATH", "HOME", "ANIMAWORKS_ANIMA_DIR"}
+    assert set(kwargs["env"]) == {"PATH", "HOME", "ANIMAWORKS_ANIMA_DIR", "ANIMAWORKS_UNBLOCK_CHECK_ID"}
     assert kwargs["env"]["ANIMAWORKS_ANIMA_DIR"] == str(anima_dir)
+    assert kwargs["env"]["ANIMAWORKS_UNBLOCK_CHECK_ID"] == kwargs["marker"]
+    assert kwargs["marker"].startswith("check-pass:")
     events = _activity_events(anima_dir)
     assert events[0]["meta"] == {"task_id": "check-pass", "method": "check", "sandbox": "bwrap"}
 
@@ -134,14 +139,14 @@ def test_macos_sandbox_exec_fallback_when_bwrap_missing(tmp_path: Path) -> None:
     access.assert_called_once_with("/usr/bin/sandbox-exec", os.X_OK)
     argv = run.call_args.args[0]
     assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
-    assert argv[3:] == ["/bin/sh", "-c", "test -w ."]
+    assert argv[3:] == ["/bin/sh", "-c", blocked_recovery._SH_WRAPPER, "unblock_check", "60", "test -w ."]
     profile = argv[2]
     assert profile is blocked_recovery._MACOS_SANDBOX_PROFILE
     assert "test -w ." not in profile
     kwargs = run.call_args.kwargs
     assert kwargs["cwd"] == anima_dir
     assert kwargs["timeout"] == 60
-    assert set(kwargs["env"]) == {"PATH", "HOME", "ANIMAWORKS_ANIMA_DIR"}
+    assert set(kwargs["env"]) == {"PATH", "HOME", "ANIMAWORKS_ANIMA_DIR", "ANIMAWORKS_UNBLOCK_CHECK_ID"}
     assert manager.get_task_by_id("mac-pass").status == "pending"
     assert _activity_events(anima_dir)[0]["meta"]["sandbox"] == "sandbox-exec"
 
@@ -156,10 +161,13 @@ def test_macos_profile_is_static_read_only_and_network_denied() -> None:
     assert not any(line.startswith("(allow file-write*") and "/dev/null" not in line for line in lines)
     assert not any(line.startswith("(allow network") for line in lines)
     # The check string is never interpolated: a hostile check cannot alter the profile.
-    hostile = '") (allow default) ('
-    argv = blocked_recovery._sandbox_argv("sandbox-exec", hostile)
+    hostile = '") (allow default) (; echo pwned #'
+    argv = blocked_recovery._sandbox_argv("sandbox-exec", hostile, cpu_seconds=60)
     assert argv[2] == profile
     assert argv[-1] == hostile
+    # The wrapper script is a constant; the check only ever appears as the trailing positional argument.
+    assert argv[-4] == blocked_recovery._SH_WRAPPER
+    assert hostile not in blocked_recovery._SH_WRAPPER
 
 
 def test_bwrap_preferred_over_sandbox_exec() -> None:
@@ -217,11 +225,12 @@ def test_run_sandboxed_kills_descendants_and_process_group_on_timeout() -> None:
     with (
         patch("core.blocked_recovery.subprocess.Popen", return_value=proc) as popen,
         patch("core.blocked_recovery._descendant_pids", side_effect=snapshots) as descendants,
+        patch("core.blocked_recovery._marker_pids", return_value=[]),
         patch("core.blocked_recovery.os.kill") as kill,
         patch("core.blocked_recovery.os.killpg") as killpg,
         pytest.raises(subprocess.TimeoutExpired),
     ):
-        blocked_recovery._run_sandboxed(["/bin/sh", "-c", "sleep 99"], cwd=Path("/"), env={}, timeout=60)
+        blocked_recovery._run_sandboxed(["/bin/sh", "-c", "sleep 99"], cwd=Path("/"), env={}, timeout=60, marker="m")
 
     kwargs = popen.call_args.kwargs
     assert kwargs["start_new_session"] is True
@@ -250,11 +259,89 @@ def test_kill_tree_freezes_root_group_before_first_snapshot() -> None:
     order: list[str] = []
     with (
         patch("core.blocked_recovery._descendant_pids", side_effect=lambda _pid: order.append("snapshot") or []),
+        patch("core.blocked_recovery._marker_pids", side_effect=lambda _m: order.append("marker") or []),
         patch("core.blocked_recovery.os.killpg", side_effect=lambda _pid, sig: order.append(f"killpg:{int(sig)}")),
     ):
-        blocked_recovery._kill_tree(proc)
+        blocked_recovery._kill_tree(proc, "m")
     stop, kill_sig = int(blocked_recovery.signal.SIGSTOP), int(blocked_recovery.signal.SIGKILL)
-    assert order == [f"killpg:{stop}", "snapshot", f"killpg:{kill_sig}"]
+    assert order == [f"killpg:{stop}", "snapshot", "marker", f"killpg:{kill_sig}", "marker"]
+
+
+def test_kill_tree_marker_sweep_catches_reparented_daemon() -> None:
+    """A daemon that left the tree (not a descendant) but carries the marker is frozen and killed."""
+    proc = Mock()
+    proc.pid = 77
+    marker_snapshots = [[900], [900], []]
+    with (
+        patch("core.blocked_recovery._descendant_pids", return_value=[]),
+        patch("core.blocked_recovery._marker_pids", side_effect=marker_snapshots),
+        patch("core.blocked_recovery.os.kill") as kill,
+        patch("core.blocked_recovery.os.killpg"),
+    ):
+        blocked_recovery._kill_tree(proc, "m")
+    stop, kill_sig = blocked_recovery.signal.SIGSTOP, blocked_recovery.signal.SIGKILL
+    assert [c.args for c in kill.call_args_list] == [(900, stop), (900, kill_sig)]
+
+
+def test_kill_tree_post_kill_sweep_kills_and_warns_on_strays(caplog: pytest.LogCaptureFixture) -> None:
+    proc = Mock()
+    proc.pid = 77
+    with (
+        patch("core.blocked_recovery._descendant_pids", return_value=[]),
+        patch("core.blocked_recovery._marker_pids", side_effect=[[], [901]]),
+        patch("core.blocked_recovery.os.kill") as kill,
+        patch("core.blocked_recovery.os.killpg"),
+        caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
+    ):
+        blocked_recovery._kill_tree(proc, "m")
+    assert (901, blocked_recovery.signal.SIGKILL) in [c.args for c in kill.call_args_list]
+    assert "cleanup incomplete" in caplog.text
+    assert "stray_pids=[901]" in caplog.text
+
+
+def test_kill_tree_ps_unavailable_still_kills_group_and_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """Fail closed but visible: without process enumeration, the group is killed and a warning is logged."""
+    proc = Mock()
+    proc.pid = 77
+    with (
+        patch("core.blocked_recovery._descendant_pids", side_effect=blocked_recovery._ProcessListingUnavailable("ps")),
+        patch("core.blocked_recovery._marker_pids", side_effect=blocked_recovery._ProcessListingUnavailable("ps")),
+        patch("core.blocked_recovery.os.killpg") as killpg,
+        caplog.at_level("WARNING", logger="animaworks.blocked_recovery"),
+    ):
+        blocked_recovery._kill_tree(proc, "m")
+    assert [c.args for c in killpg.call_args_list] == [
+        (77, blocked_recovery.signal.SIGSTOP),
+        (77, blocked_recovery.signal.SIGKILL),
+    ]
+    proc.kill.assert_called_once_with()
+    assert "cleanup incomplete" in caplog.text
+    assert "enumeration_ok=False" in caplog.text
+
+
+def test_ps_lines_retries_then_raises() -> None:
+    with (
+        patch("core.blocked_recovery.subprocess.run", side_effect=FileNotFoundError("ps")) as run,
+        patch("core.blocked_recovery.time.sleep"),
+        pytest.raises(blocked_recovery._ProcessListingUnavailable),
+    ):
+        blocked_recovery._ps_lines(["-axo", "pid=,ppid="])
+    assert run.call_count == blocked_recovery._PS_RETRIES
+
+
+def test_marker_pids_parses_ps_env_output_and_skips_zombies_and_self() -> None:
+    listing = (
+        "500 S    python3 -c x ANIMAWORKS_UNBLOCK_CHECK_ID=m1 PATH=/bin\n"
+        "501 Z    (python3) ANIMAWORKS_UNBLOCK_CHECK_ID=m1\n"
+        "502 S    sleep 5 ANIMAWORKS_UNBLOCK_CHECK_ID=other\n"
+        f"{os.getpid()} S    pytest ANIMAWORKS_UNBLOCK_CHECK_ID=m1\n"
+    )
+    with (
+        patch("core.blocked_recovery.sys.platform", "darwin"),
+        patch("core.blocked_recovery._ps_lines", return_value=listing.splitlines()) as ps,
+    ):
+        assert blocked_recovery._marker_pids("m1") == [500]
+    ps.assert_called_once_with(["-axEo", "pid=,stat=,command="])
 
 
 def test_kill_tree_pass_limit_bounds_a_runaway_forker() -> None:
@@ -263,10 +350,11 @@ def test_kill_tree_pass_limit_bounds_a_runaway_forker() -> None:
     counter = iter(range(10, 10_000))
     with (
         patch("core.blocked_recovery._descendant_pids", side_effect=lambda _pid: [next(counter)]) as descendants,
+        patch("core.blocked_recovery._marker_pids", return_value=[]),
         patch("core.blocked_recovery.os.kill"),
         patch("core.blocked_recovery.os.killpg") as killpg,
     ):
-        blocked_recovery._kill_tree(proc)
+        blocked_recovery._kill_tree(proc, "m")
     assert descendants.call_count == blocked_recovery._KILL_TREE_MAX_PASSES
     assert killpg.call_count == 2
 
@@ -282,9 +370,13 @@ def test_descendant_pids_walks_ps_tree() -> None:
     assert run.call_args.kwargs["stdin"] is subprocess.DEVNULL
 
 
-def test_descendant_pids_returns_empty_when_ps_unavailable() -> None:
-    with patch("core.blocked_recovery.subprocess.run", side_effect=FileNotFoundError("ps")):
-        assert blocked_recovery._descendant_pids(1) == []
+def test_descendant_pids_raises_when_ps_unavailable() -> None:
+    with (
+        patch("core.blocked_recovery.subprocess.run", side_effect=FileNotFoundError("ps")),
+        patch("core.blocked_recovery.time.sleep"),
+        pytest.raises(blocked_recovery._ProcessListingUnavailable),
+    ):
+        blocked_recovery._descendant_pids(1)
 
 
 def _live_survivors(marker: str) -> list[str]:
@@ -325,8 +417,9 @@ def test_real_timeout_kills_continuously_forking_setsid_escapees() -> None:
         f"# {marker}"
     )
     argv = ["/bin/sh", "-c", f"exec python3 -c '{forker}'"]
+    env = {"PATH": os.environ.get("PATH", ""), blocked_recovery._CHECK_MARKER_ENV: marker}
     with pytest.raises(subprocess.TimeoutExpired):
-        blocked_recovery._run_sandboxed(argv, cwd=Path("/"), env={"PATH": os.environ.get("PATH", "")}, timeout=1)
+        blocked_recovery._run_sandboxed(argv, cwd=Path("/"), env=env, timeout=1, marker=marker)
     survivors = _live_survivors(marker)
     for pid in survivors:
         try:
@@ -342,8 +435,36 @@ def test_real_timeout_kills_setsid_escapee() -> None:
     marker = f"aw_unblock_escapee_{os.getpid()}"
     escapee = f"import os, time; os.setsid(); time.sleep(120)  # {marker}"
     argv = ["/bin/sh", "-c", f"python3 -c '{escapee}' & sleep 120"]
+    env = {"PATH": os.environ.get("PATH", ""), blocked_recovery._CHECK_MARKER_ENV: marker}
     with pytest.raises(subprocess.TimeoutExpired):
-        blocked_recovery._run_sandboxed(argv, cwd=Path("/"), env={"PATH": os.environ.get("PATH", "")}, timeout=2)
+        blocked_recovery._run_sandboxed(argv, cwd=Path("/"), env=env, timeout=2, marker=marker)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="marker sweep via ps -E is darwin-specific here")
+def test_real_timeout_kills_double_forked_daemon_via_marker() -> None:
+    """Integration (deterministic): a daemon already reparented to PID 1 before the timeout still dies."""
+    marker = f"aw_unblock_daemon_{os.getpid()}"
+    daemon = (
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    if os.fork() == 0:\n"
+        "        time.sleep(120)\n"
+        "    os._exit(0)\n"
+        "os.wait(); time.sleep(120)\n"
+        f"# {marker}"
+    )
+    argv = ["/bin/sh", "-c", f"exec python3 -c '{daemon}'"]
+    env = {"PATH": os.environ.get("PATH", ""), blocked_recovery._CHECK_MARKER_ENV: marker}
+    with pytest.raises(subprocess.TimeoutExpired):
+        blocked_recovery._run_sandboxed(argv, cwd=Path("/"), env=env, timeout=2, marker=marker)
+    survivors = _live_survivors(marker)
+    for pid in survivors:
+        try:
+            os.kill(int(pid), blocked_recovery.signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+    assert survivors == []
     survivors = _live_survivors(marker)
     for pid in survivors:  # never leave a stray sleeper behind even if the assertion fails
         try:
@@ -357,7 +478,7 @@ def test_run_sandboxed_returns_exit_code() -> None:
     proc = Mock()
     proc.wait.return_value = 3
     with patch("core.blocked_recovery.subprocess.Popen", return_value=proc):
-        assert blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5) == 3
+        assert blocked_recovery._run_sandboxed(["/bin/true"], cwd=Path("/"), env={}, timeout=5, marker="m") == 3
 
 
 @pytest.mark.skipif(
@@ -373,13 +494,24 @@ def test_run_sandboxed_returns_exit_code() -> None:
         ("touch escaped", 1),
         ("mkdir escaped_dir", 1),
         ("python3 -c \"import socket; socket.create_connection(('127.0.0.1', 22), 1)\"", 1),
+        ('python3 -c "while True: pass"', 1),  # killed by the inherited CPU rlimit, not the timeout
     ],
 )
 def test_real_sandbox_exec_denies_writes_and_network(tmp_path: Path, check: str, expected: int) -> None:
     """Integration: the shipped profile really blocks writes/network and propagates exit codes."""
-    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "ANIMAWORKS_ANIMA_DIR": str(tmp_path)}
+    marker = f"real-{os.getpid()}"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "ANIMAWORKS_ANIMA_DIR": str(tmp_path),
+        blocked_recovery._CHECK_MARKER_ENV: marker,
+    }
     code = blocked_recovery._run_sandboxed(
-        blocked_recovery._sandbox_argv("sandbox-exec", check), cwd=tmp_path, env=env, timeout=30
+        blocked_recovery._sandbox_argv("sandbox-exec", check, cpu_seconds=1),
+        cwd=tmp_path,
+        env=env,
+        timeout=30,
+        marker=marker,
     )
     assert (code == 0) == (expected == 0)
     if expected not in (0, 1):

@@ -13,6 +13,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -173,6 +175,28 @@ _MACOS_SANDBOX_PROFILE = """(version 1)
 """
 
 
+# Environment variable carrying a per-run marker. It is inherited by every
+# process the check spawns (including double-forked daemons that leave the
+# parent chain), so timeout cleanup can find strays without relying on ppid.
+_CHECK_MARKER_ENV = "ANIMAWORKS_UNBLOCK_CHECK_ID"
+
+# Outer shell wrapper. The CPU-time rlimit is inherited by every descendant
+# (fork, setsid, double-fork alike) and bounds how long any escapee can burn
+# CPU. The check itself is passed as a positional parameter ($2) so it is
+# never parsed as part of this script; only the inner ``/bin/sh -c "$2"``
+# interprets it, exactly as before.
+_SH_WRAPPER = 'ulimit -t "$1" 2>/dev/null; exec /bin/sh -c "$2"'
+
+# Upper bound on freeze passes; each pass stops every newly seen process so
+# a stopped parent cannot fork again, and the set converges quickly.
+_KILL_TREE_MAX_PASSES = 8
+_PS_RETRIES = 3
+
+
+class _ProcessListingUnavailable(RuntimeError):
+    """``ps`` (or /proc) could not be consulted; cleanup cannot enumerate strays."""
+
+
 def _sandbox_route() -> str | None:
     """Return the available read-only/no-network sandbox route, or None (fail closed)."""
     if shutil.which("bwrap"):
@@ -182,9 +206,13 @@ def _sandbox_route() -> str | None:
     return None
 
 
-def _sandbox_argv(route: str, check: str) -> list[str]:
-    """Build the sandboxed ``/bin/sh -c <check>`` argv for ``route``."""
-    inner = ["/bin/sh", "-c", check]
+def _sandbox_argv(route: str, check: str, *, cpu_seconds: int) -> list[str]:
+    """Build the sandboxed ``/bin/sh -c <check>`` argv for ``route``.
+
+    ``check`` is always the last argv element and is never interpolated into
+    the profile, the wrapper script, or any other shell text.
+    """
+    inner = ["/bin/sh", "-c", _SH_WRAPPER, "unblock_check", str(int(cpu_seconds)), check]
     if route == "bwrap":
         return [*_BWRAP_ARGV_PREFIX, *inner]
     if route == "sandbox-exec":
@@ -192,28 +220,35 @@ def _sandbox_argv(route: str, check: str) -> list[str]:
     raise ValueError(f"unknown sandbox route: {route}")
 
 
-def _descendant_pids(root_pid: int) -> list[int]:
-    """Return all live descendants of ``root_pid`` (via ``ps``), children first.
+def _ps_lines(args: list[str]) -> list[str]:
+    """Run ``ps`` with retries; raise ``_ProcessListingUnavailable`` if it cannot be consulted."""
+    last: BaseException | None = None
+    for attempt in range(_PS_RETRIES):
+        try:
+            result = subprocess.run(
+                ["ps", *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+                text=True,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last = exc
+        else:
+            if result.returncode == 0:
+                return result.stdout.splitlines()
+            last = RuntimeError(f"ps exited {result.returncode}")
+        if attempt + 1 < _PS_RETRIES:
+            time.sleep(0.1)
+    raise _ProcessListingUnavailable(str(last))
 
-    This catches descendants that left the process group/session (``setsid``)
-    but whose parent chain is still alive. A fully detached double-fork daemon
-    is reparented to PID 1 and cannot be attributed; that residual risk is
-    accepted and documented.
-    """
-    try:
-        listing = subprocess.run(
-            ["ps", "-axo", "pid=,ppid="],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-            text=True,
-        ).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Return all live descendants of ``root_pid`` (via ``ps``), children first."""
     children: dict[int, list[int]] = {}
-    for line in listing.splitlines():
+    for line in _ps_lines(["-axo", "pid=,ppid="]):
         parts = line.split()
         if len(parts) != 2:
             continue
@@ -233,45 +268,83 @@ def _descendant_pids(root_pid: int) -> list[int]:
     return found
 
 
-# Upper bound on freeze passes; each pass stops every newly seen descendant so
-# a stopped parent cannot fork again, and the tree converges quickly.
-_KILL_TREE_MAX_PASSES = 8
+def _marker_pids(marker: str) -> list[int]:
+    """Return live (non-zombie) PIDs whose environment carries ``marker``.
 
-
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """Freeze, then SIGKILL, the whole descendant tree of ``proc`` and its process group.
-
-    A single ``ps`` snapshot is racy: a descendant may fork a child that
-    ``setsid()``s between the snapshot and the kill. So the root's process
-    group is SIGSTOPped first, then descendants that already left the group
-    are SIGSTOPped pass by pass (a stopped process cannot fork) until a pass
-    finds nothing new, and only then is everything SIGKILLed. Fully detached
-    double-fork daemons (already reparented to PID 1 before the timeout) remain
-    out of reach; that is the documented accepted residual.
+    Independent of the parent chain: a double-forked daemon reparented to
+    PID 1 still inherits the environment. Processes that scrub or replace
+    their environment are the documented residual.
     """
-    # Freeze the root and everything still in its session first: the root is
-    # not part of its own descendant list, and an unfrozen root could keep
-    # forking new sessions between the last snapshot and the kill.
+    needle = f"{_CHECK_MARKER_ENV}={marker}"
+    own = os.getpid()
+    pids: list[int] = []
+    if sys.platform == "darwin":
+        for line in _ps_lines(["-axEo", "pid=,stat=,command="]):
+            parts = line.split(None, 2)
+            if len(parts) < 3 or needle not in parts[2] or parts[1].startswith("Z"):
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if pid != own:
+                pids.append(pid)
+        return pids
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        raise _ProcessListingUnavailable("/proc unavailable")
+    needle_b = needle.encode() + b"\0"
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == own:
+            continue
+        try:
+            if needle_b in (entry / "environ").read_bytes():
+                pids.append(int(entry.name))
+        except OSError:
+            continue
+    return pids
+
+
+def _signal_all(pids: list[int], sig: signal.Signals) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _kill_tree(proc: subprocess.Popen, marker: str) -> None:
+    """Freeze, then SIGKILL, everything the check spawned.
+
+    Order: SIGSTOP the root's process group (the root is not in its own
+    descendant list and would otherwise keep forking); then, pass by pass,
+    SIGSTOP every newly seen process found either as a live descendant or by
+    the inherited environment marker, until a pass finds nothing new (a
+    stopped process cannot fork); then SIGKILL the frozen set, the group and
+    the direct child; finally sweep the marker once more and kill anything
+    that still shows up. If process enumeration is unavailable the group is
+    still killed and a warning is logged so the incomplete cleanup is visible.
+    Residual (documented): processes that scrubbed the inherited marker
+    environment before detaching.
+    """
     try:
         os.killpg(proc.pid, signal.SIGSTOP)
     except (ProcessLookupError, PermissionError):
         pass
     frozen: list[int] = []
+    enumeration_ok = True
     for _ in range(_KILL_TREE_MAX_PASSES):
-        new_pids = [pid for pid in _descendant_pids(proc.pid) if pid not in frozen]
+        try:
+            seen = [*_descendant_pids(proc.pid), *_marker_pids(marker)]
+        except _ProcessListingUnavailable:
+            enumeration_ok = False
+            break
+        new_pids = [pid for pid in dict.fromkeys(seen) if pid not in frozen and pid != proc.pid]
         if not new_pids:
             break
-        for pid in new_pids:
-            try:
-                os.kill(pid, signal.SIGSTOP)
-            except (ProcessLookupError, PermissionError):
-                continue
-            frozen.append(pid)
-    for pid in frozen:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        _signal_all(new_pids, signal.SIGSTOP)
+        frozen.extend(new_pids)
+    _signal_all(frozen, signal.SIGKILL)
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -280,18 +353,29 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
     except ProcessLookupError:
         pass
+    strays: list[int] = []
+    try:
+        strays = [pid for pid in _marker_pids(marker) if pid != proc.pid]
+    except _ProcessListingUnavailable:
+        enumeration_ok = False
+    if strays:
+        _signal_all(strays, signal.SIGKILL)
+    if strays or not enumeration_ok:
+        logger.warning(
+            "unblock_check timeout cleanup incomplete for marker %s: enumeration_ok=%s stray_pids=%s",
+            marker,
+            enumeration_ok,
+            strays,
+        )
 
 
-def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int) -> int:
+def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int, marker: str) -> int:
     """Run ``argv`` with suppressed output and return its exit code.
 
-    The child is started in its own session so that, on timeout, the whole
-    process group is killed; before that, the live descendant tree is walked
-    and killed so that a check which ``setsid()``s out of the group does not
-    survive either. bwrap already provides ``--die-with-parent``; sandbox-exec
-    does not, so this is what keeps a timed-out check from leaving orphans on
-    macOS. Raises ``OSError`` when the sandbox binary cannot be started and
-    ``subprocess.TimeoutExpired`` on timeout.
+    ``env`` must carry ``marker`` under ``_CHECK_MARKER_ENV``. The child is
+    started in its own session; on timeout ``_kill_tree`` freezes and kills
+    the whole tree (see there). Raises ``OSError`` when the sandbox binary
+    cannot be started and ``subprocess.TimeoutExpired`` on timeout.
     """
     proc = subprocess.Popen(
         argv,
@@ -305,7 +389,7 @@ def _run_sandboxed(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: 
     try:
         return proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_tree(proc)
+        _kill_tree(proc, marker)
         proc.wait()
         raise
 
@@ -347,10 +431,12 @@ def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
             has_check = isinstance(check, str) and bool(check.strip())
             route: str | None = None
             if has_check:
+                marker = f"{entry.task_id}:{uuid.uuid4().hex}"
                 env = {
                     "PATH": os.environ.get("PATH", ""),
                     "HOME": os.environ.get("HOME", ""),
                     "ANIMAWORKS_ANIMA_DIR": str(anima_dir),
+                    _CHECK_MARKER_ENV: marker,
                 }
                 route = _sandbox_route()
                 if route is None:
@@ -362,10 +448,11 @@ def revalidate_blocked_tasks(anima_dir: Path, anima_name: str) -> list[str]:
                     continue
                 try:
                     returncode = _run_sandboxed(
-                        _sandbox_argv(route, check),
+                        _sandbox_argv(route, check, cpu_seconds=config.blocked_check_timeout_seconds),
                         cwd=anima_dir,
                         env=env,
                         timeout=config.blocked_check_timeout_seconds,
+                        marker=marker,
                     )
                 except OSError:
                     logger.warning(
