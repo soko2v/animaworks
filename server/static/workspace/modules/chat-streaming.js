@@ -32,7 +32,7 @@ function _animaThread() {
   return { anima: st.conversationAnima, thread: st.activeThreadId || "default" };
 }
 
-function _drainQueue(explicitAnima, explicitThread) {
+function _drainQueue(explicitAnima, explicitThread, updateUi = true) {
   const { anima: curAnima, thread: curThread } = _animaThread();
   const anima = explicitAnima || curAnima;
   const thread = explicitThread || curThread;
@@ -41,8 +41,10 @@ function _drainQueue(explicitAnima, explicitThread) {
   const q = mgr.getPendingQueue(anima, thread);
   if (q.length === 0 || q[0].requiresExplicitRetry) return;
   const next = mgr.dequeue(anima, thread);
-  wsShowPendingIndicator();
-  if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
+  if (updateUi) {
+    wsShowPendingIndicator();
+    if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
+  }
   // Carry the queue's own anima/thread: the user may switch conversations
   // before the timer fires, and a queued attachment must never be sent to
   // (and persisted under) whichever conversation is current by then.
@@ -143,7 +145,7 @@ function _recoverFailedEntry(anima, thread, text, images, displayImages, files, 
     _mgr().enqueue(anima, thread, { ...entry, requiresExplicitRetry: true });
     if (isCurrent) wsShowPendingIndicator();
   }
-  wsUpdateSendButton(_mgr().isStreamingFor(anima, thread));
+  if (isCurrent) wsUpdateSendButton(_mgr().isStreamingFor(anima, thread));
 }
 
 let _convLatestZone = "all";
@@ -214,13 +216,33 @@ async function _sendConversation(text, overrideImages = null) {
   const thread = overrideImages?.targetThread || curThread;
   if (!anima) return;
 
-  dom.convInput.value = ""; dom.convInput.disabled = true; dom.convSend.disabled = true;
-  if (!overrideImages) im?.clearImages();
-  wsUpdateSendButton(true);
-  renderWsThreadTabs();
+  // A queued item remains pinned to its original conversation.  When the
+  // user is now composing in another conversation, never let that background
+  // send touch the currently visible composer or its draft.
+  const isTargetActive = () => {
+    const current = _animaThread();
+    return current.anima === anima && current.thread === thread;
+  };
+  const renderTargetMessages = () => {
+    if (isTargetActive()) renderConvMessages();
+  };
+  const updateTargetBubble = (msg, zone = "all") => {
+    if (isTargetActive()) updateStreamingBubble(msg, zone);
+  };
+  const scheduleTargetStreamingUpdate = (msg, zone = "text") => {
+    if (isTargetActive()) scheduleStreamingUpdate(msg, zone);
+  };
+
+  if (isTargetActive()) {
+    dom.convInput.value = ""; dom.convInput.disabled = true; dom.convSend.disabled = true;
+    wsUpdateSendButton(true);
+    renderWsThreadTabs();
+  }
+  if (!overrideImages && isTargetActive()) im?.clearImages();
 
   const mgr = _mgr();
   let talkingStarted = false;
+  let transportFailure = false;
 
   // Use let + onStreamCreated to avoid TDZ: const destructuring from
   // await would not be initialized when SSE callbacks fire during streaming.
@@ -229,8 +251,8 @@ async function _sendConversation(text, overrideImages = null) {
   const _wsToolDetailTimers = new Map();
   const _throttledWsToolDetail = (toolId) => {
     if (_wsToolDetailTimers.has(toolId)) return;
-    updateStreamingBubble(streamingMsg, "tools");
-    _wsToolDetailTimers.set(toolId, setTimeout(() => { _wsToolDetailTimers.delete(toolId); updateStreamingBubble(streamingMsg, "tools"); }, 200));
+    updateTargetBubble(streamingMsg, "tools");
+    _wsToolDetailTimers.set(toolId, setTimeout(() => { _wsToolDetailTimers.delete(toolId); updateTargetBubble(streamingMsg, "tools"); }, 200));
   };
   let _textAnimator = null;
   let _thinkingAnimator = null;
@@ -247,24 +269,24 @@ async function _sendConversation(text, overrideImages = null) {
           onUpdate: (displayText) => {
             if (!streamingMsg) return;
             streamingMsg._displayText = displayText;
-            scheduleStreamingUpdate(streamingMsg, "text");
+            scheduleTargetStreamingUpdate(streamingMsg, "text");
           },
         });
         _textAnimator.start();
-        renderConvMessages();
+        renderTargetMessages();
       },
       onTextDelta: (d) => {
         if (!streamingMsg?.streaming) return;
         streamingMsg.afterHeartbeatRelay = false;
-        if (!talkingStarted) { setTalking(true); setExpression("neutral"); talkingStarted = true; }
+        if (!talkingStarted && isTargetActive()) { setTalking(true); setExpression("neutral"); talkingStarted = true; }
         streamingMsg.text += d;
         if (_textAnimator) _textAnimator.push(d);
       },
-      onCompressionStart: () => { if (streamingMsg?.streaming) { streamingMsg.compressing = true; updateStreamingBubble(streamingMsg, "text"); } },
-      onCompressionEnd: () => { if (streamingMsg?.streaming) { streamingMsg.compressing = false; updateStreamingBubble(streamingMsg, "text"); } },
-      onToolStart: (n, detail) => { if (streamingMsg?.streaming) { streamingMsg.activeTool = n; if (!streamingMsg.toolHistory) streamingMsg.toolHistory = []; streamingMsg.toolHistory.push({ tool_name: n, tool_id: detail?.tool_id || "", started_at: Date.now() }); setExpression("thinking"); updateStreamingBubble(streamingMsg, "tools"); } },
+      onCompressionStart: () => { if (streamingMsg?.streaming) { streamingMsg.compressing = true; updateTargetBubble(streamingMsg, "text"); } },
+      onCompressionEnd: () => { if (streamingMsg?.streaming) { streamingMsg.compressing = false; updateTargetBubble(streamingMsg, "text"); } },
+      onToolStart: (n, detail) => { if (streamingMsg?.streaming) { streamingMsg.activeTool = n; if (!streamingMsg.toolHistory) streamingMsg.toolHistory = []; streamingMsg.toolHistory.push({ tool_name: n, tool_id: detail?.tool_id || "", started_at: Date.now() }); if (isTargetActive()) setExpression("thinking"); updateTargetBubble(streamingMsg, "tools"); } },
       onToolDetail: (_toolName, detailText, info) => { if (streamingMsg?.streaming && streamingMsg.toolHistory && info?.tool_id) { for (let i = streamingMsg.toolHistory.length - 1; i >= 0; i--) { const entry = streamingMsg.toolHistory[i]; if (entry.tool_id === info.tool_id && !entry.completed) { entry.detail = detailText; break; } } } _throttledWsToolDetail(info?.tool_id || "_"); },
-      onToolEnd: (detail) => { if (streamingMsg?.streaming) { streamingMsg.activeTool = null; if (streamingMsg.toolHistory && detail?.tool_id) { for (let i = streamingMsg.toolHistory.length - 1; i >= 0; i--) { const entry = streamingMsg.toolHistory[i]; if (entry.tool_id === detail.tool_id && !entry.completed) { entry.completed = true; entry.duration_ms = Date.now() - entry.started_at; break; } } } setExpression("neutral"); updateStreamingBubble(streamingMsg, "tools"); } },
+      onToolEnd: (detail) => { if (streamingMsg?.streaming) { streamingMsg.activeTool = null; if (streamingMsg.toolHistory && detail?.tool_id) { for (let i = streamingMsg.toolHistory.length - 1; i >= 0; i--) { const entry = streamingMsg.toolHistory[i]; if (entry.tool_id === detail.tool_id && !entry.completed) { entry.completed = true; entry.duration_ms = Date.now() - entry.started_at; break; } } } if (isTargetActive()) setExpression("neutral"); updateTargetBubble(streamingMsg, "tools"); } },
       onThinkingStart: () => {
         if (!streamingMsg?.streaming) return;
         streamingMsg.thinkingText = ""; streamingMsg.thinking = true;
@@ -272,11 +294,11 @@ async function _sendConversation(text, overrideImages = null) {
           onUpdate: (displayText) => {
             if (!streamingMsg) return;
             streamingMsg._displayThinkingText = displayText;
-            scheduleStreamingUpdate(streamingMsg, "thinking");
+            scheduleTargetStreamingUpdate(streamingMsg, "thinking");
           },
         });
         _thinkingAnimator.start();
-        updateStreamingBubble(streamingMsg, "thinking");
+        updateTargetBubble(streamingMsg, "thinking");
       },
       onThinkingDelta: (t) => {
         if (!streamingMsg?.streaming) return;
@@ -288,11 +310,11 @@ async function _sendConversation(text, overrideImages = null) {
         if (_thinkingAnimator) { _thinkingAnimator.flush(); _thinkingAnimator = null; }
         delete streamingMsg._displayThinkingText;
         streamingMsg.thinking = false;
-        updateStreamingBubble(streamingMsg, "thinking");
+        updateTargetBubble(streamingMsg, "thinking");
       },
-      onHeartbeatRelayStart: () => { if (streamingMsg?.streaming) { streamingMsg.heartbeatRelay = true; streamingMsg.heartbeatText = ""; scheduleStreamingUpdate(streamingMsg, "text"); } },
-      onHeartbeatRelay: ({ text: t }) => { if (streamingMsg?.streaming) { streamingMsg.heartbeatText = (streamingMsg.heartbeatText || "") + t; scheduleStreamingUpdate(streamingMsg, "text"); } },
-      onHeartbeatRelayDone: () => { if (streamingMsg?.streaming) { streamingMsg.heartbeatRelay = false; streamingMsg.heartbeatText = ""; streamingMsg.afterHeartbeatRelay = true; scheduleStreamingUpdate(streamingMsg, "text"); } },
+      onHeartbeatRelayStart: () => { if (streamingMsg?.streaming) { streamingMsg.heartbeatRelay = true; streamingMsg.heartbeatText = ""; scheduleTargetStreamingUpdate(streamingMsg, "text"); } },
+      onHeartbeatRelay: ({ text: t }) => { if (streamingMsg?.streaming) { streamingMsg.heartbeatText = (streamingMsg.heartbeatText || "") + t; scheduleTargetStreamingUpdate(streamingMsg, "text"); } },
+      onHeartbeatRelayDone: () => { if (streamingMsg?.streaming) { streamingMsg.heartbeatRelay = false; streamingMsg.heartbeatText = ""; streamingMsg.afterHeartbeatRelay = true; scheduleTargetStreamingUpdate(streamingMsg, "text"); } },
       onDone: ({ summary, emotion, images: di, thinkingSummary }) => {
         if (_textAnimator) _textAnimator.flush();
         if (_thinkingAnimator) { _thinkingAnimator.flush(); _thinkingAnimator = null; }
@@ -310,15 +332,16 @@ async function _sendConversation(text, overrideImages = null) {
             streamingMsg.thinkingText = thinkingSummary;
           }
           streamingMsg.streaming = false; streamingMsg.activeTool = null;
-          updateStreamingBubble(streamingMsg);
+          updateTargetBubble(streamingMsg);
         }
-        setExpression(emotion); setTimeout(() => setExpression("neutral"), 3000);
+        if (isTargetActive()) { setExpression(emotion); setTimeout(() => setExpression("neutral"), 3000); }
       },
       onError: ({ message: m }) => {
+        transportFailure = true;
         if (_textAnimator) _textAnimator.flush();
         if (_thinkingAnimator) { _thinkingAnimator.flush(); _thinkingAnimator = null; }
-        setExpression("troubled");
-        if (streamingMsg) { streamingMsg.text += `\n${t("chat.error_prefix")} ${m}`; delete streamingMsg._displayText; delete streamingMsg._displayThinkingText; updateStreamingBubble(streamingMsg); }
+        if (isTargetActive()) setExpression("troubled");
+        if (streamingMsg) { streamingMsg.text += `\n${t("chat.error_prefix")} ${m}`; delete streamingMsg._displayText; delete streamingMsg._displayThinkingText; updateTargetBubble(streamingMsg); }
       },
       onAbort: () => {
         if (_textAnimator) _textAnimator.flush();
@@ -337,15 +360,17 @@ async function _sendConversation(text, overrideImages = null) {
       for (const t of _wsToolDetailTimers.values()) clearTimeout(t);
       _wsToolDetailTimers.clear();
       try {
-        setTalking(false);
+        if (isTargetActive()) setTalking(false);
         if (streamingMsg?.streaming) {
           streamingMsg.streaming = false;
           if (!streamingMsg.text) streamingMsg.text = t("chat.empty_response");
         }
-        renderConvMessages();
-        renderWsThreadTabs();
-        if (dom.convInput) dom.convInput.disabled = false;
-        wsUpdateSendButton(false); wsSaveDraft(); dom.convInput?.focus();
+        renderTargetMessages();
+        if (isTargetActive()) {
+          renderWsThreadTabs();
+          if (dom.convInput) dom.convInput.disabled = false;
+          wsUpdateSendButton(false); wsSaveDraft(); dom.convInput?.focus();
+        }
 
         const st = getState();
         const threadList = st.threads[anima] || [];
@@ -353,20 +378,20 @@ async function _sendConversation(text, overrideImages = null) {
         if (entry && entry.label === t("thread.new") && (text || "").trim()) {
           const lbl = (text || "").trim().slice(0, 20) + ((text || "").trim().length > 20 ? "..." : "");
           setState({ threads: { ...st.threads, [anima]: threadList.map(t => t.id === thread ? { ...t, label: lbl } : t) } });
-          renderWsThreadTabs();
+          if (isTargetActive()) renderWsThreadTabs();
         }
       } finally {
-        _drainQueue(anima, thread);
+        if (!transportFailure) _drainQueue(anima, thread, isTargetActive());
       }
     },
   });
 
-  renderConvMessages();
+  renderTargetMessages();
 
   if (!success && error && error.name !== "AbortError") {
     _recoverFailedEntry(anima, thread, text, images, displayImages, files, displayFiles);
     logger.error("Conversation stream error", { anima, error: error.message });
-    setExpression("troubled");
+    if (isTargetActive()) setExpression("troubled");
   }
 }
 

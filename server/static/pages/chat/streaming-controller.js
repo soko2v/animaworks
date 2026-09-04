@@ -293,8 +293,10 @@ export function createStreamingController(ctx) {
 
   function requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles) {
     mgr.enqueue(name, tid, queuedEntry(message, images, displayImages, files, displayFiles));
-    if (state.selectedAnima === name && state.selectedThreadId === tid) showPendingIndicator();
-    updateSendButton();
+    if (state.selectedAnima === name && state.selectedThreadId === tid) {
+      showPendingIndicator();
+      updateSendButton();
+    }
   }
 
   function recoverFailedEntry(name, tid, message, images, displayImages, files, displayFiles) {
@@ -322,11 +324,13 @@ export function createStreamingController(ctx) {
       input.focus();
     } else {
       mgr.enqueue(name, tid, { ...entry, requiresExplicitRetry: true });
-      if (isCurrent) showPendingIndicator();
-      updateSendButton();
+      if (isCurrent) {
+        showPendingIndicator();
+        updateSendButton();
+      }
       return;
     }
-    updateSendButton();
+    if (isCurrent) updateSendButton();
   }
 
   async function sendChat(message, overrideImages = null) {
@@ -346,6 +350,7 @@ export function createStreamingController(ctx) {
     const displayFiles = overrideImages?.displayFiles || state.imageInputManager?.getDisplayFiles() || [];
     const tid = overrideImages?.targetThread || state.selectedThreadId;
     if (!name || (!message.trim() && images.length === 0 && files.length === 0)) return;
+    const isVisible = () => state.selectedAnima === name && state.selectedThreadId === tid;
     if (mgr.isStreamingFor(name, tid)) {
       if (overrideImages?.targetAnima) {
         requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles);
@@ -360,7 +365,7 @@ export function createStreamingController(ctx) {
         requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles);
       }
       const msgs = $("chatPageMessages");
-      if (msgs) {
+      if (msgs && isVisible()) {
         const el = document.createElement("div");
         el.className = "chat-bubble assistant";
         el.textContent = t("chat.bootstrap_needs_repair");
@@ -374,7 +379,7 @@ export function createStreamingController(ctx) {
         requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles);
       }
       const msgs = $("chatPageMessages");
-      if (msgs) {
+      if (msgs && isVisible()) {
         const el = document.createElement("div");
         el.className = "chat-bubble assistant";
         el.textContent = t("chat.bootstrapping");
@@ -392,18 +397,16 @@ export function createStreamingController(ctx) {
     }
 
     const input = $("chatPageInput");
-    updateSendButton();
+    if (isVisible()) updateSendButton();
     ctx.controllers.anima.renderAnimaTabs();
     ctx.controllers.thread.renderThreadTabs();
-    if (input) input.placeholder = t("chat.message_to", { name });
+    if (input && isVisible()) input.placeholder = t("chat.message_to", { name });
     if (!overrideImages) state.imageInputManager?.clearImages();
 
     // User actively sent a message → re-attach scroll to bottom
-    ctx.controllers.renderer.reattach();
+    if (isVisible()) ctx.controllers.renderer.reattach();
 
     ctx.controllers.activity.addLocalActivity("chat", name, `${t("chat.user_prefix")} ${message}`);
-
-    const isVisible = () => state.selectedAnima === name && state.selectedThreadId === tid;
 
     const finalizeStreamError = (streamingMsg, errorMsg, recoveredText = "") => {
       if (_textAnimator) _textAnimator.flush();
@@ -460,6 +463,7 @@ export function createStreamingController(ctx) {
     let streamingMsg = null;
     let _textAnimator = null;
     let _thinkingAnimator = null;
+    let transportFailure = false;
 
     const { success, error } = await mgr.sendChat(name, tid, message, {
       images,
@@ -579,6 +583,7 @@ export function createStreamingController(ctx) {
         },
         onContextUpdate: (ctxData) => { updateContextRing(ctxData, name); },
         onError: ({ message: errorMsg }) => {
+          transportFailure = true;
           logger.debug(`onError: ${errorMsg}`);
           if (!streamingMsg?.text) {
             void (async () => {
@@ -663,7 +668,7 @@ export function createStreamingController(ctx) {
           }
 
           const inputEl = $("chatPageInput");
-          if (inputEl && state.selectedAnima === name) {
+          if (inputEl && isVisible()) {
             inputEl.placeholder = t("chat.message_to", { name });
             saveDraft(name, inputEl.value || "", tid);
             const paneEl = ctx.state.container?.closest(".chat-pane");
@@ -671,22 +676,24 @@ export function createStreamingController(ctx) {
               inputEl.focus();
             }
           }
-          updateSendButton();
+          if (isVisible()) updateSendButton();
           ctx.controllers.anima.renderAnimaTabs();
           ctx.controllers.thread.renderThreadTabs();
         } finally {
           const pendingQueue = mgr.getPendingQueue(name, tid);
-          if (pendingQueue.length > 0 && !pendingQueue[0].requiresExplicitRetry) {
+          if (!transportFailure && pendingQueue.length > 0 && !pendingQueue[0].requiresExplicitRetry) {
             const next = mgr.dequeue(name, tid);
-            showPendingIndicator();
-            if (mgr.getPendingQueue(name, tid).length === 0) hidePendingIndicator();
+            if (isVisible()) {
+              showPendingIndicator();
+              if (mgr.getPendingQueue(name, tid).length === 0) hidePendingIndicator();
+            }
             setTimeout(() => sendChat(next.text, { images: next.images, displayImages: next.displayImages, files: next.files, displayFiles: next.displayFiles, targetAnima: name, targetThread: tid }), 150);
           }
         }
       },
     });
 
-    ctx.controllers.renderer.renderChat(!ctx.controllers.renderer.isUserDetached());
+    if (isVisible()) ctx.controllers.renderer.renderChat(!ctx.controllers.renderer.isUserDetached());
 
     if (!success && error && error.name !== "AbortError") {
       recoverFailedEntry(name, tid, message, images, displayImages, files, displayFiles);
@@ -840,7 +847,7 @@ export function createStreamingController(ctx) {
     } catch (err) {
       if (err.name !== "AbortError") {
         logger.error("Meeting chat stream error", { roomId, error: err.message });
-        if (currentStreamingMsg) {
+        if (currentStreamingMsg && !err.callbackReported) {
           currentStreamingMsg.text += `\n${t("chat.error_prefix")} ${err.message}`;
           currentStreamingMsg.streaming = false;
           renderFull();

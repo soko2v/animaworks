@@ -10,6 +10,24 @@ import { basePath } from "/shared/base-path.js";
 const logger = createLogger("chat-stream");
 
 /**
+ * Build an error for a terminal SSE response that must not be retried as a
+ * reconnect.  The event callback has already displayed a server-side error
+ * when ``callbackReported`` is true, so consumers must not report it twice.
+ *
+ * @param {string} name - Stable error name for callers that need to recover.
+ * @param {string} message - User-visible server error message.
+ * @param {boolean} [callbackReported=false] - Whether onError already ran.
+ * @returns {Error}
+ */
+function terminalStreamFailure(name, message, callbackReported = false) {
+  const error = new Error(message);
+  error.name = name;
+  error.isTerminalStreamFailure = true;
+  error.callbackReported = callbackReported;
+  return error;
+}
+
+/**
  * Fetch the active stream for an anima.
  * @param {string} animaName
  * @param {string} [threadId] - Optional thread ID to filter by
@@ -106,7 +124,7 @@ export async function streamChat(animaName, body, signal, callbacks) {
   } catch (err) {
     const elapsed = ((performance.now() - start) / 1000).toFixed(1);
     logger.info(`[SSE-FE] _processStream ERROR anima=${animaName} err=${err.name}:${err.message} elapsed=${elapsed}s responseId=${responseId} lastEventId=${lastEventId}`);
-    if (err.name === "AbortError") throw err;
+    if (err.name === "AbortError" || err.isTerminalStreamFailure) throw err;
 
     // Attempt reconnection with exponential backoff
     if (responseId) {
@@ -264,15 +282,21 @@ async function _processStream(res, callbacks, setResponseId, setLastEventId, sig
             break;
           }
 
-          case "error":
-            logger.info(`[SSE-FE] EVENT error code=${data.code || "?"} msg=${getErrorMessage(data)} id=${id}`);
-            callbacks.onError?.({ message: getErrorMessage(data) });
-            break;
+          case "error": {
+            const message = getErrorMessage(data);
+            logger.info(`[SSE-FE] EVENT error code=${data.code || "?"} msg=${message} id=${id}`);
+            callbacks.onError?.({ message });
+            throw terminalStreamFailure("TerminalStreamError", message, true);
+          }
 
-          case "bootstrap":
+          case "bootstrap": {
             logger.info(`[SSE-FE] EVENT bootstrap status=${data.status} id=${id}`);
             callbacks.onBootstrap?.(data);
+            if (data.status === "busy") {
+              throw terminalStreamFailure("BootstrapBusyError", data.message || "Bootstrap is in progress");
+            }
             break;
+          }
 
           case "chain_start":
             logger.debug(`[SSE-FE] EVENT chain_start id=${id}`);

@@ -92,6 +92,15 @@ def test_workspace_send_resolves_the_pinned_target_before_the_current_conversati
     assert "overrideImages?.targetThread || curThread" in source
 
 
+def test_workspace_background_pinned_send_does_not_mutate_the_active_composer() -> None:
+    """Draining conversation A after switching to B must preserve B's draft/UI."""
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "const isTargetActive = () =>" in source
+    assert 'if (isTargetActive()) {\n    dom.convInput.value = ""' in source
+    assert "if (isTargetActive()) {\n          renderWsThreadTabs();" in source
+    assert "wsUpdateSendButton(false); wsSaveDraft(); dom.convInput?.focus();" in source
+
+
 QUEUE_EDIT_PREFLIGHT = {
     _WORKSPACE: ("im.canRestoreAttachments(queued)", "mgr.removeFromQueue(anima, thread, idx)"),
     _CHAT_PAGE: (

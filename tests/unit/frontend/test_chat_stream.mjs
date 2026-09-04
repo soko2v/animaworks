@@ -216,7 +216,7 @@ describe("streamChat", () => {
     assert.strictEqual(doneData.images[0].path, "assets/avatar_fullbody.png");
   });
 
-  it("should call onError for error events", async () => {
+  it("should call onError and reject for terminal error events", async () => {
     const chunks = [
       sseEvent("error", { code: "IPC_TIMEOUT", message: "timeout" }),
     ];
@@ -224,9 +224,12 @@ describe("streamChat", () => {
     globalThis.fetch = createMockFetch(chunks);
 
     let errorData = null;
-    await streamChat("test-anima", '{"message":"hi"}', null, {
-      onError: (data) => { errorData = data; },
-    });
+    await assert.rejects(
+      () => streamChat("test-anima", '{"message":"hi"}', null, {
+        onError: (data) => { errorData = data; },
+      }),
+      (err) => err.name === "TerminalStreamError" && err.isTerminalStreamFailure,
+    );
 
     // Under Node tests, i18n is stubbed to return the key itself
     assert.strictEqual(errorData.message, "sse.ipc_timeout");
@@ -250,6 +253,21 @@ describe("streamChat", () => {
     assert.strictEqual(bootstrapEvents.length, 2);
     assert.strictEqual(bootstrapEvents[0].status, "started");
     assert.strictEqual(bootstrapEvents[1].status, "completed");
+  });
+
+  it("should reject a bootstrap-busy response after reporting it", async () => {
+    globalThis.fetch = createMockFetch([
+      sseEvent("bootstrap", { status: "busy", message: "still starting" }),
+    ]);
+
+    let bootstrapData = null;
+    await assert.rejects(
+      () => streamChat("test-anima", '{"message":"with document"}', null, {
+        onBootstrap: (data) => { bootstrapData = data; },
+      }),
+      (err) => err.name === "BootstrapBusyError" && err.isTerminalStreamFailure,
+    );
+    assert.strictEqual(bootstrapData.status, "busy");
   });
 
   it("should call onChainStart for chain_start events", async () => {
@@ -459,7 +477,6 @@ describe("streamChat", () => {
       sseEvent("tool_end", {}),
       sseEvent("bootstrap", { status: "started" }),
       sseEvent("chain_start", {}),
-      sseEvent("error", { code: "STREAM_ERROR" }),
       sseEvent("done", { summary: "ok" }),
     ];
 

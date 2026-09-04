@@ -294,7 +294,7 @@ export class ChatSessionManager extends EventTarget {
     } catch (err) {
       if (err.name === "AbortError") {
         callbacks.onAbort?.();
-      } else {
+      } else if (!err.callbackReported) {
         callbacks.onError?.({ message: err.message });
       }
       return { streamingMsg, success: false, error: err };
@@ -363,7 +363,7 @@ export class ChatSessionManager extends EventTarget {
       );
       return { streamingMsg, success: true };
     } catch (err) {
-      if (err.name !== "AbortError") {
+      if (err.name !== "AbortError" && !err.callbackReported) {
         callbacks.onError?.({ message: err.message });
       }
       return { streamingMsg: null, success: false, error: err };
@@ -418,7 +418,7 @@ export class ChatSessionManager extends EventTarget {
     } catch (err) {
       if (err.name === "AbortError") {
         callbacks.onAbort?.();
-      } else {
+      } else if (!err.callbackReported) {
         callbacks.onError?.({ message: err.message });
       }
       return { success: false, error: err };
