@@ -477,6 +477,142 @@ describe("image-input document drag & drop", () => {
     assert.equal(new Set(colliding.getDisplayFiles().map((f) => f.key)).size, 3);
   });
 
+  it("restoreAttachments keeps distinct payloads when an explicit snapshot key collides", () => {
+    const imageKey = "same.png|4|42";
+    const composerImage = { data: "YmJiYg==", media_type: "image/png" };
+    const queuedImage = { data: "YWFhYQ==", media_type: "image/png" };
+    assert.equal(manager.restoreAttachments({
+      images: [composerImage],
+      displayImages: [{ ...composerImage, key: imageKey }],
+    }), 1);
+    const imageEntry = {
+      images: [queuedImage],
+      displayImages: [{ ...queuedImage, key: imageKey }],
+    };
+    assert.equal(manager.canRestoreAttachments(imageEntry), true);
+    assert.equal(manager.restoreAttachments(imageEntry), 1);
+    assert.deepEqual(manager.getPendingImages().map((image) => image.data), [composerImage.data, queuedImage.data]);
+    assert.notEqual(manager.getDisplayImages()[0].key, manager.getDisplayImages()[1].key);
+    assert.equal(manager.restoreAttachments(imageEntry), 0, "the restored image remains de-duplicated");
+
+    const fileKey = "same.txt|4|42";
+    const composerFile = { name: "same.txt", media_type: "text/plain", data: "YmJiYg==" };
+    const queuedFile = { name: "same.txt", media_type: "text/plain", data: "YWFhYQ==" };
+    assert.equal(manager.restoreAttachments({
+      files: [composerFile],
+      displayFiles: [{ ...composerFile, key: fileKey }],
+    }), 1);
+    const fileEntry = {
+      files: [queuedFile],
+      displayFiles: [{ ...queuedFile, key: fileKey }],
+    };
+    assert.equal(manager.canRestoreAttachments(fileEntry), true);
+    assert.equal(manager.restoreAttachments(fileEntry), 1);
+    assert.deepEqual(manager.getPendingFiles().map((file) => file.data), [composerFile.data, queuedFile.data]);
+    assert.notEqual(manager.getDisplayFiles()[0].key, manager.getDisplayFiles()[1].key);
+    assert.equal(manager.restoreAttachments(fileEntry), 0, "the restored document remains de-duplicated");
+  });
+
+  it("keeps a queued document intact while a colliding composer document is still loading", () => {
+    const OriginalFileReader = globalThis.FileReader;
+    const readers = [];
+    globalThis.FileReader = class {
+      readAsDataURL(file) { this.file = file; readers.push(this); }
+      finish() {
+        this.result = `data:application/octet-stream;base64,${this.file._bytes.toString("base64")}`;
+        this.onload?.();
+      }
+    };
+    try {
+      const key = "same.txt|4|42";
+      const queued = {
+        files: [{ name: "same.txt", media_type: "text/plain", data: "YWFhYQ==" }],
+        displayFiles: [{ key }],
+      };
+      manager.addFiles([makeFile("same.txt", { size: 4, lastModified: 42, bytes: "bbbb" })]);
+      assert.equal(manager.isProcessing(), true);
+      assert.equal(manager.canRestoreAttachments(queued), false);
+      assert.equal(manager.restoreAttachments(queued), 0);
+      assert.equal(manager.getFileCount(), 0);
+
+      readers[0].finish();
+      assert.equal(manager.canRestoreAttachments(queued), true);
+      assert.equal(manager.restoreAttachments(queued), 1);
+      assert.deepEqual(manager.getPendingFiles().map((file) => file.data), ["YmJiYg==", "YWFhYQ=="]);
+    } finally {
+      globalThis.FileReader = OriginalFileReader;
+    }
+  });
+
+  it("keeps a queued image intact while a colliding composer image is still decoding", () => {
+    const OriginalImage = globalThis.Image;
+    const originalCreateElement = globalThis.document.createElement;
+    const images = [];
+    globalThis.Image = class {
+      constructor() { this.width = 1; this.height = 1; images.push(this); }
+      set src(value) { this._src = value; }
+      finish() { this.onload?.(); }
+    };
+    globalThis.document.createElement = (tag) => tag === "canvas"
+      ? {
+          getContext: () => ({ drawImage() {} }),
+          toDataURL: (type) => `data:${type};base64,YmJiYg==`,
+        }
+      : originalCreateElement(tag);
+    try {
+      const key = "same.png|4|42";
+      const queued = {
+        images: [{ media_type: "image/png", data: "YWFhYQ==" }],
+        displayImages: [{ key }],
+      };
+      manager.addFiles([makeFile("same.png", { type: "image/png", size: 4, lastModified: 42 })]);
+      assert.equal(manager.isProcessing(), true);
+      assert.equal(manager.canRestoreAttachments(queued), false);
+      assert.equal(manager.restoreAttachments(queued), 0);
+      assert.equal(manager.getImageCount(), 0);
+
+      images[0].finish();
+      assert.equal(manager.canRestoreAttachments(queued), true);
+      assert.equal(manager.restoreAttachments(queued), 1);
+      assert.deepEqual(manager.getPendingImages().map((image) => image.data), ["YmJiYg==", "YWFhYQ=="]);
+    } finally {
+      globalThis.Image = OriginalImage;
+      globalThis.document.createElement = originalCreateElement;
+    }
+  });
+
+  it("reserves in-flight document reads during queue restore preflight", () => {
+    const OriginalFileReader = globalThis.FileReader;
+    const readers = [];
+    globalThis.FileReader = class {
+      readAsDataURL(file) { this.file = file; readers.push(this); }
+      finish() {
+        this.result = `data:application/octet-stream;base64,${this.file._bytes.toString("base64")}`;
+        this.onload?.();
+      }
+    };
+    try {
+      manager.addFiles(Array.from({ length: 10 }, (_, i) => makeFile(`f${i}.txt`, {
+        size: 1,
+        lastModified: i,
+        bytes: String(i),
+      })));
+      readers.slice(0, 9).forEach((reader) => reader.finish());
+      assert.equal(manager.getFileCount(), 9);
+      assert.equal(manager.isProcessing(), true);
+      const queued = {
+        files: [{ name: "queued.txt", media_type: "text/plain", data: "cQ==" }],
+        displayFiles: [{ key: "queued.txt|1|99" }],
+      };
+      assert.equal(manager.canRestoreAttachments(queued), false);
+      assert.equal(manager.restoreAttachments(queued), 0);
+      readers[9].finish();
+      assert.equal(manager.getFileCount(), 10);
+    } finally {
+      globalThis.FileReader = OriginalFileReader;
+    }
+  });
+
   it("pasted images receive distinct identities that survive a queue edit round trip", async () => {
     // Pasted images have no name/mtime; two of the same type and size must not
     // collapse into one after being queued and restored into the composer.

@@ -443,20 +443,45 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     }
   }
 
+  // Snapshot identities are metadata-only. Reuse one only when it still
+  // identifies the same complete payload; otherwise give the restored item a
+  // payload-confirmed fallback key instead of silently dropping it.
+  function restoreKey(kind, label, data, shownKey, seen) {
+    if (!shownKey) return fallbackRestoreKey(kind, label, data, seen);
+    const existing = seen.has(shownKey) ? seen.get(shownKey) : pendingPayloadFor(shownKey);
+    return existing === undefined || existing === data
+      ? shownKey
+      : fallbackRestoreKey(kind, label, data, seen);
+  }
+
+  // An in-flight picker/drop file owns its metadata key before its payload is
+  // available. Keep a queue entry intact until that payload can be compared;
+  // choosing a fallback now could duplicate an identical attachment.
+  function hasUnresolvedRestoreKey(shownKey, seen) {
+    return Boolean(shownKey)
+      && !seen.has(shownKey)
+      && queuedIdentities.has(shownKey)
+      && pendingPayloadFor(shownKey) === undefined;
+  }
+
   // Compute what restoreAttachments() would add without mutating state.
-  // Keys come from the display snapshots (file identity or paste key); an
-  // entry without one gets a key confirmed against the complete payload.
+  // Keys come from the display snapshots (file identity or paste key), but
+  // are confirmed against the complete payload before they are reused.
   function planRestore(entry) {
     const images = Array.isArray(entry?.images) ? entry.images : [];
     const displayImages = Array.isArray(entry?.displayImages) ? entry.displayImages : [];
     const files = Array.isArray(entry?.files) ? entry.files : [];
     const displayFiles = Array.isArray(entry?.displayFiles) ? entry.displayFiles : [];
     const seen = new Map(); // key -> payload planned in this entry
-    const plan = { images: [], files: [], overflow: null };
+    const plan = { images: [], files: [], overflow: null, waiting: false };
     images.forEach((img, index) => {
       if (!img?.data || !img?.media_type) return;
       const shown = displayImages[index] || {};
-      const key = shown.key || fallbackRestoreKey("image", img.media_type, img.data, seen);
+      if (hasUnresolvedRestoreKey(shown.key, seen)) {
+        plan.waiting = true;
+        return;
+      }
+      const key = restoreKey("image", img.media_type, img.data, shown.key, seen);
       if (queuedIdentities.has(key) || seen.has(key)) return;
       seen.set(key, img.data);
       plan.images.push({
@@ -469,9 +494,13 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     files.forEach((file, index) => {
       if (!file?.data || !file?.name) return;
       const shown = displayFiles[index] || {};
-      const key = shown.key || fallbackRestoreKey("file", file.name, file.data, seen);
+      if (hasUnresolvedRestoreKey(shown.key, seen)) {
+        plan.waiting = true;
+        return;
+      }
+      const key = restoreKey("file", file.name, file.data, shown.key, seen);
       if (queuedIdentities.has(key) || seen.has(key)) return;
-      if (!plan.overflow && pendingFiles.length + plan.files.length >= MAX_FILE_COUNT) {
+      if (!plan.overflow && pendingFiles.length + pendingDocumentReads + plan.files.length >= MAX_FILE_COUNT) {
         plan.overflow = file.name;
         return;
       }
@@ -517,6 +546,10 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
      */
     canRestoreAttachments(entry) {
       const plan = planRestore(entry);
+      if (plan.waiting) {
+        setStatus("info", t("chat.file_processing"));
+        return false;
+      }
       if (plan.overflow) {
         setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: plan.overflow }));
         return false;
@@ -535,6 +568,10 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
      */
     restoreAttachments(entry) {
       const plan = planRestore(entry);
+      if (plan.waiting) {
+        setStatus("info", t("chat.file_processing"));
+        return 0;
+      }
       if (plan.overflow) {
         setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: plan.overflow }));
         return 0;
