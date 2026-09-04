@@ -39,7 +39,7 @@ function _drainQueue(explicitAnima, explicitThread) {
   if (!anima) return;
   const mgr = _mgr();
   const q = mgr.getPendingQueue(anima, thread);
-  if (q.length === 0) return;
+  if (q.length === 0 || q[0].requiresExplicitRetry) return;
   const next = mgr.dequeue(anima, thread);
   wsShowPendingIndicator();
   if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
@@ -113,6 +113,31 @@ function _enqueueInput() {
   if (dom.convInput) { dom.convInput.value = ""; dom.convInput.style.height = "auto"; }
   wsSaveDraft(); im?.clearImages();
   return entry;
+}
+
+function _recoverFailedEntry(anima, thread, text, images, displayImages, files, displayFiles) {
+  const entry = { text, images, displayImages, files, displayFiles };
+  const dom = _getDom();
+  const im = _getImageManager();
+  const current = _animaThread();
+  const isCurrent = current.anima === anima && current.thread === thread;
+  const hasAttachments = images.length > 0 || files.length > 0;
+  const canRestore = !hasAttachments || Boolean(im?.canRestoreAttachments?.(entry));
+
+  // A transport failure may follow an accepted server request. Keep the
+  // entry for an explicit user retry, never an automatic duplicate send.
+  if (isCurrent && dom.convInput && !dom.convInput.value.trim() && canRestore) {
+    dom.convInput.value = text;
+    dom.convInput.style.height = "auto";
+    dom.convInput.style.height = Math.min(dom.convInput.scrollHeight, isMobileView() ? 100 : 120) + "px";
+    if (hasAttachments) im?.restoreAttachments(entry);
+    wsSaveDraft();
+    dom.convInput.focus();
+  } else {
+    _mgr().enqueue(anima, thread, { ...entry, requiresExplicitRetry: true });
+    if (isCurrent) wsShowPendingIndicator();
+  }
+  wsUpdateSendButton(_mgr().isStreamingFor(anima, thread));
 }
 
 let _convLatestZone = "all";
@@ -333,6 +358,7 @@ async function _sendConversation(text, overrideImages = null) {
   renderConvMessages();
 
   if (!success && error && error.name !== "AbortError") {
+    _recoverFailedEntry(anima, thread, text, images, displayImages, files, displayFiles);
     logger.error("Conversation stream error", { anima, error: error.message });
     setExpression("troubled");
   }
@@ -485,8 +511,9 @@ export function wsShowPendingIndicator() {
   if (dom.convPendingLabel) dom.convPendingLabel.textContent = t("chat.queue_count", { count: q.length });
   dom.convPendingList.innerHTML = q.map((p, i) => {
     const txt = escapeHtml(p.text.length > 50 ? p.text.slice(0, 50) + "…" : p.text);
-    const img = p.images?.length ? ` <span style="opacity:0.6">${t("chat.image_count", { count: p.images.length })}</span>` : "";
-    return `<div class="pending-queue-item" data-idx="${i}"><span class="pending-queue-item-num">${i + 1}.</span><span class="pending-queue-item-text">${txt || t("chat.image_only")}${img}</span><button class="pending-queue-item-del" data-idx="${i}" type="button">✕</button></div>`;
+    const attachmentCount = (p.images?.length || 0) + (p.files?.length || 0);
+    const attachment = attachmentCount ? ` <span style="opacity:0.6">${t("chat.attachment_count", { count: attachmentCount })}</span>` : "";
+    return `<div class="pending-queue-item" data-idx="${i}"><span class="pending-queue-item-num">${i + 1}.</span><span class="pending-queue-item-text">${txt || t("chat.attachments_only")}${attachment}</span><button class="pending-queue-item-del" data-idx="${i}" type="button">✕</button></div>`;
   }).join("");
   dom.convPending.style.display = "";
   dom.convPendingList.onclick = (e) => {

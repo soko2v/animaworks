@@ -11,6 +11,7 @@ const logger = createLogger("image-input");
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB per image
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per document
 const MAX_FILE_COUNT = 10; // documents per message (server enforces the same limit)
+const MAX_FILE_PAYLOAD_SIZE = 20 * 1024 * 1024; // encoded document payload limit enforced by the server
 const MAX_DIMENSION = 1568; // Max pixel dimension (Anthropic recommendation)
 const SUPPORTED_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const HEIC_TYPES = new Set(["image/heic", "image/heif"]);
@@ -125,6 +126,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
   const queuedIdentities = new Set(); // fileIdentity() of every attached or in-flight file
   let pasteSequence = 0; // pasted images have no file identity; allocate a unique one
   let pendingDocumentReads = 0;
+  let pendingDocumentPayloadChars = 0;
   let processingCount = 0;
   let status = null;
   let rejectedSinceLastSubmit = false;
@@ -145,6 +147,12 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     return stickyError ? { kind: "error", message: stickyError } : { kind: "success", message };
   }
 
+  function duplicateStatus(name) {
+    return stickyError
+      ? { kind: "error", message: stickyError }
+      : { kind: "info", message: t("chat.file_duplicate_client", { name: name || "" }) };
+  }
+
   function renderedPreviewCount() {
     return previewContainer?.querySelectorAll?.(".image-preview-item")?.length || 0;
   }
@@ -155,7 +163,41 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     if (identity) queuedIdentities.delete(identity);
   }
 
-  function processImageFile(file, identity = "") {
+  function filePayloadChars(file) {
+    const size = Number(file?.size);
+    return Number.isFinite(size) && size > 0 ? Math.ceil(size / 3) * 4 : 0;
+  }
+
+  function attachedFilePayloadChars() {
+    return pendingFiles.reduce((total, file) => total + String(file.data || "").length, 0);
+  }
+
+  function allocateFileIdentity(file) {
+    const sourceIdentity = fileIdentity(file);
+    const requiresPayloadComparison = Array.from(queuedIdentities)
+      .some((identity) => identityMatchesSource(identity, sourceIdentity));
+    let identity = sourceIdentity;
+    for (let suffix = 2; queuedIdentities.has(identity); suffix += 1) {
+      identity = `${sourceIdentity}#${suffix}`;
+    }
+    return { identity, sourceIdentity, requiresPayloadComparison };
+  }
+
+  function identityMatchesSource(identity, sourceIdentity) {
+    return identity === sourceIdentity || String(identity || "").startsWith(`${sourceIdentity}#`);
+  }
+
+  function hasMatchingImagePayload(sourceIdentity, mediaType, data) {
+    return pendingImages.some((image) => identityMatchesSource(image.key, sourceIdentity)
+      && image.media_type === mediaType && image.data === data);
+  }
+
+  function hasMatchingDocumentPayload(sourceIdentity, mediaType, name, data) {
+    return pendingFiles.some((file) => identityMatchesSource(file.key, sourceIdentity)
+      && file.media_type === mediaType && file.name === name && file.data === data);
+  }
+
+  function processImageFile(file, identity = "", sourceIdentity = identity, requiresPayloadComparison = false) {
     if (!file) return;
     const inputType = resolvedFileType(file);
     const isHeic = HEIC_TYPES.has(inputType);
@@ -206,6 +248,15 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
           throw new Error(t("chat.image_converted_too_large"));
         }
 
+        // Metadata is only a candidate match. A second selection with the
+        // same name/size/mtime is a duplicate only after its full payload is
+        // known to be identical.
+        if (requiresPayloadComparison && hasMatchingImagePayload(sourceIdentity, outputType, base64Data)) {
+          releaseIdentity(identity);
+          status = duplicateStatus(file.name);
+          return;
+        }
+
         pendingImages.push({
           data: base64Data,
           media_type: outputType,
@@ -246,23 +297,19 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     stickyError = null;
     for (const file of Array.from(files || [])) {
       if (!file) continue;
-      const identity = fileIdentity(file);
-      if (queuedIdentities.has(identity)) {
-        setStatus("info", t("chat.file_duplicate_client", { name: file.name || "" }));
-        continue;
-      }
+      const { identity, sourceIdentity, requiresPayloadComparison } = allocateFileIdentity(file);
       const extension = fileExtension(file.name);
       if (DOCUMENT_TYPES.has(extension)) {
-        processDocumentFile(file, extension, identity);
+        processDocumentFile(file, extension, identity, sourceIdentity, requiresPayloadComparison);
       } else if (resolvedFileType(file).startsWith("image/")) {
-        processImageFile(file, identity);
+        processImageFile(file, identity, sourceIdentity, requiresPayloadComparison);
       } else {
         setStatus("error", t("chat.file_unsupported_client", { name: file.name || "" }));
       }
     }
   }
 
-  function processDocumentFile(file, extension, identity = "") {
+  function processDocumentFile(file, extension, identity = "", sourceIdentity = identity, requiresPayloadComparison = false) {
     if (file.size > MAX_FILE_SIZE) {
       setStatus("error", t("chat.file_too_large_client", {
         size: (file.size / 1024 / 1024).toFixed(1),
@@ -273,9 +320,15 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: file.name || "" }));
       return;
     }
+    const payloadChars = filePayloadChars(file);
+    if (attachedFilePayloadChars() + pendingDocumentPayloadChars + payloadChars > MAX_FILE_PAYLOAD_SIZE) {
+      setStatus("error", t("chat.file_payload_too_large_client", { name: file.name || "" }));
+      return;
+    }
     const mediaType = DOCUMENT_TYPES.get(extension);
     if (identity) queuedIdentities.add(identity);
     pendingDocumentReads += 1;
+    pendingDocumentPayloadChars += payloadChars;
     processingCount += 1;
     setStatus("info", t("chat.file_processing"));
     const reader = new FileReader();
@@ -284,6 +337,19 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         const result = String(reader.result || "");
         const base64Data = result.split(",")[1];
         if (!base64Data) throw new Error(t("chat.file_read_failed"));
+        const reservedOtherPayload = Math.max(0, pendingDocumentPayloadChars - payloadChars);
+        if (attachedFilePayloadChars() + reservedOtherPayload + base64Data.length > MAX_FILE_PAYLOAD_SIZE) {
+          releaseIdentity(identity);
+          setStatus("error", t("chat.file_payload_too_large_client", { name: file.name || "" }));
+          return;
+        }
+        // As with images, the metadata key only narrows the comparison. Do
+        // not discard a distinct document that happens to share it.
+        if (requiresPayloadComparison && hasMatchingDocumentPayload(sourceIdentity, mediaType, file.name, base64Data)) {
+          releaseIdentity(identity);
+          status = duplicateStatus(file.name);
+          return;
+        }
         pendingFiles.push({ data: base64Data, media_type: mediaType, name: file.name, key: identity });
         rejectedSinceLastSubmit = false;
         status = successStatus(t("chat.file_ready", { count: pendingFiles.length }));
@@ -293,6 +359,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         setStatus("error", error?.message || t("chat.file_read_failed"));
       } finally {
         pendingDocumentReads -= 1;
+        pendingDocumentPayloadChars = Math.max(0, pendingDocumentPayloadChars - payloadChars);
         processingCount -= 1;
         renderPreviews();
       }
@@ -300,6 +367,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     reader.onerror = () => {
       releaseIdentity(identity);
       pendingDocumentReads -= 1;
+      pendingDocumentPayloadChars = Math.max(0, pendingDocumentPayloadChars - payloadChars);
       processingCount -= 1;
       setStatus("error", t("chat.file_read_failed"));
     };
@@ -473,7 +541,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     const files = Array.isArray(entry?.files) ? entry.files : [];
     const displayFiles = Array.isArray(entry?.displayFiles) ? entry.displayFiles : [];
     const seen = new Map(); // key -> payload planned in this entry
-    const plan = { images: [], files: [], overflow: null, waiting: false };
+    const plan = { images: [], files: [], overflow: null, payloadOverflow: null, filePayloadChars: 0, waiting: false };
     images.forEach((img, index) => {
       if (!img?.data || !img?.media_type) return;
       const shown = displayImages[index] || {};
@@ -504,8 +572,15 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         plan.overflow = file.name;
         return;
       }
+      const payloadChars = String(file.data).length;
+      if (!plan.payloadOverflow
+        && attachedFilePayloadChars() + pendingDocumentPayloadChars + plan.filePayloadChars + payloadChars > MAX_FILE_PAYLOAD_SIZE) {
+        plan.payloadOverflow = file.name;
+        return;
+      }
       seen.set(key, file.data);
       plan.files.push({ data: file.data, media_type: file.media_type || "", name: file.name, key });
+      plan.filePayloadChars += payloadChars;
     });
     return plan;
   }
@@ -554,6 +629,10 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: plan.overflow }));
         return false;
       }
+      if (plan.payloadOverflow) {
+        setStatus("error", t("chat.file_payload_too_large_client", { name: plan.payloadOverflow }));
+        return false;
+      }
       return true;
     },
 
@@ -574,6 +653,10 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       }
       if (plan.overflow) {
         setStatus("error", t("chat.file_count_limit_client", { max: MAX_FILE_COUNT, name: plan.overflow }));
+        return 0;
+      }
+      if (plan.payloadOverflow) {
+        setStatus("error", t("chat.file_payload_too_large_client", { name: plan.payloadOverflow }));
         return 0;
       }
       plan.images.forEach((img) => { queuedIdentities.add(img.key); pendingImages.push(img); });

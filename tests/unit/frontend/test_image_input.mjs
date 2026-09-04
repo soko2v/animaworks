@@ -222,6 +222,52 @@ describe("image-input document drag & drop", () => {
     assert.equal(manager.getFileCount(), 2);
   });
 
+  it("keeps documents with colliding metadata when their bytes differ", async () => {
+    manager.addFiles([
+      makeFile("same.txt", { size: 4, lastModified: 42, bytes: "aaaa" }),
+      makeFile("same.txt", { size: 4, lastModified: 42, bytes: "bbbb" }),
+    ]);
+    await flush();
+    assert.deepEqual(manager.getPendingFiles().map((file) => file.data), ["YWFhYQ==", "YmJiYg=="]);
+    assert.notEqual(manager.getDisplayFiles()[0].key, manager.getDisplayFiles()[1].key);
+
+    // If the first attachment is removed, the remaining suffixed key must
+    // still make an exact re-selection a duplicate rather than add it again.
+    manager.removeFile(0);
+    manager.addFiles([makeFile("same.txt", { size: 4, lastModified: 42, bytes: "bbbb" })]);
+    await flush();
+    assert.deepEqual(manager.getPendingFiles().map((file) => file.data), ["YmJiYg=="]);
+  });
+
+  it("keeps images with colliding metadata when their converted payloads differ", async () => {
+    const OriginalImage = globalThis.Image;
+    const originalCreateElement = globalThis.document.createElement;
+    const payloads = ["YWFhYQ==", "YmJiYg=="];
+    globalThis.Image = class {
+      constructor() { this.width = 1; this.height = 1; }
+      set src(_value) { queueMicrotask(() => this.onload?.()); }
+    };
+    globalThis.document.createElement = (tag) => tag === "canvas"
+      ? {
+          getContext: () => ({ drawImage() {} }),
+          toDataURL: (type) => `data:${type};base64,${payloads.shift()}`,
+        }
+      : originalCreateElement(tag);
+    try {
+      manager.addFiles([
+        makeFile("same.png", { type: "image/png", size: 4, lastModified: 42 }),
+        makeFile("same.png", { type: "image/png", size: 4, lastModified: 42 }),
+      ]);
+      await flush();
+      await flush();
+    } finally {
+      globalThis.Image = OriginalImage;
+      globalThis.document.createElement = originalCreateElement;
+    }
+    assert.deepEqual(manager.getPendingImages().map((image) => image.data), ["YWFhYQ==", "YmJiYg=="]);
+    assert.notEqual(manager.getDisplayImages()[0].key, manager.getDisplayImages()[1].key);
+  });
+
   it("removing a document allows re-attaching it and updates callbacks", async () => {
     const file = makeFile("a.txt");
     container.dispatch("drop", dropEvent([file, makeFile("b.csv")]));
@@ -286,6 +332,36 @@ describe("image-input document drag & drop", () => {
     assert.equal(manager.getFileCount(), 10);
     assert.equal(manager.getStatus()?.kind, "error");
     assert.match(manager.getStatus()?.message, /chat\.file_count_limit_client/);
+  });
+
+  it("rejects documents that would exceed the server's encoded aggregate limit", async () => {
+    const eightMiB = 8 * 1024 * 1024;
+    manager.addFiles([
+      makeFile("first.txt", { size: eightMiB, lastModified: 1 }),
+      makeFile("second.txt", { size: eightMiB, lastModified: 2 }),
+    ]);
+    await flush();
+    assert.equal(manager.getFileCount(), 1);
+    assert.equal(manager.getStatus()?.kind, "error");
+    assert.match(manager.getStatus()?.message, /chat\.file_payload_too_large_client/);
+  });
+
+  it("keeps a queued restore all-or-none when its document payload would exceed the aggregate limit", () => {
+    const elevenMiB = "Y".repeat(11 * 1024 * 1024);
+    const entry = {
+      files: [
+        { name: "first.txt", media_type: "text/plain", data: elevenMiB },
+        { name: "second.txt", media_type: "text/plain", data: elevenMiB },
+      ],
+      displayFiles: [
+        { key: "first.txt|11m|1" },
+        { key: "second.txt|11m|2" },
+      ],
+    };
+    assert.equal(manager.canRestoreAttachments(entry), false);
+    assert.equal(manager.restoreAttachments(entry), 0);
+    assert.equal(manager.getFileCount(), 0);
+    assert.match(manager.getStatus()?.message, /chat\.file_payload_too_large_client/);
   });
 
   it("reports read failures and frees the slot for a retry", async () => {

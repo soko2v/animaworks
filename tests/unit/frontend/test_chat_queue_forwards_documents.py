@@ -124,3 +124,51 @@ def test_chat_page_pinned_sends_keep_their_target_when_a_meeting_is_active() -> 
     source = _CHAT_PAGE.read_text(encoding="utf-8")
     assert "if (!overrideImages?.targetAnima && ctx.controllers.meeting?.isActive?.())" in source
     assert "if (ctx.controllers.meeting?.isActive?.()) {\n      sendMeetingChat(message, overrideImages);" not in source
+
+
+def test_chat_page_requeues_a_pinned_entry_if_the_drain_races_a_new_stream() -> None:
+    """The delayed regular-chat drain must not drop the dequeued entry on a race."""
+    source = _CHAT_PAGE.read_text(encoding="utf-8")
+    busy = source.index("if (mgr.isStreamingFor(name, tid))")
+    next_branch = source.index("const currentAnima", busy)
+    branch = source[busy:next_branch]
+    assert "if (overrideImages?.targetAnima)" in branch
+    assert "requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles)" in branch
+    assert "function requeuePinnedEntry" in source
+    assert "return { text: message, images, displayImages, files, displayFiles };" in source
+
+
+@pytest.mark.parametrize(
+    ("path", "recovery"),
+    [
+        (_CHAT_PAGE, "recoverFailedEntry(name, tid, message, images, displayImages, files, displayFiles)"),
+        (_WORKSPACE, "_recoverFailedEntry(anima, thread, text, images, displayImages, files, displayFiles)"),
+    ],
+    ids=[_CHAT_PAGE.name, _WORKSPACE.name],
+)
+def test_transport_failure_keeps_the_exact_attachment_entry_for_user_retry(path: Path, recovery: str) -> None:
+    """A failed stream must restore or queue the original document/image entry, never discard it."""
+    source = path.read_text(encoding="utf-8")
+    assert recovery in source
+    assert "displayImages" in source
+    assert "displayFiles" in source
+    assert "canRestoreAttachments" in source
+    assert "restoreAttachments(entry)" in source
+    assert "requiresExplicitRetry: true" in source
+
+
+def test_automatic_drains_stop_before_a_failed_entry_that_requires_an_explicit_retry() -> None:
+    """A later stream completion must not silently retry an ambiguous failed request."""
+    workspace = _WORKSPACE.read_text(encoding="utf-8")
+    chat_page = _CHAT_PAGE.read_text(encoding="utf-8")
+    assert "q.length === 0 || q[0].requiresExplicitRetry" in workspace
+    assert "!pendingQueue[0].requiresExplicitRetry" in chat_page
+
+
+def test_workspace_pending_indicator_describes_document_only_entries_as_attachments() -> None:
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    indicator = source[source.index("export function wsShowPendingIndicator") :]
+    assert "p.files?.length" in indicator
+    assert 't("chat.attachments_only")' in indicator
+    assert 't("chat.attachment_count"' in indicator
+    assert 't("chat.image_only")' not in indicator

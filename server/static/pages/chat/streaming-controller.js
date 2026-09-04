@@ -207,6 +207,10 @@ export function createStreamingController(ctx) {
   }
 
   function interruptAndSendPending() {
+    const name = state.selectedAnima;
+    const tid = state.selectedThreadId;
+    const next = name ? mgr.getPendingQueue(name, tid)[0] : null;
+    if (next?.requiresExplicitRetry) next.requiresExplicitRetry = false;
     stopStreaming();
   }
 
@@ -283,6 +287,41 @@ export function createStreamingController(ctx) {
     stopStreaming();
   }
 
+  function queuedEntry(message, images, displayImages, files, displayFiles) {
+    return { text: message, images, displayImages, files, displayFiles };
+  }
+
+  function requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles) {
+    mgr.enqueue(name, tid, queuedEntry(message, images, displayImages, files, displayFiles));
+    if (state.selectedAnima === name && state.selectedThreadId === tid) showPendingIndicator();
+    updateSendButton();
+  }
+
+  function recoverFailedEntry(name, tid, message, images, displayImages, files, displayFiles) {
+    const entry = queuedEntry(message, images, displayImages, files, displayFiles);
+    const hasAttachments = images.length > 0 || files.length > 0;
+    const input = $("chatPageInput");
+    const isCurrent = state.selectedAnima === name && state.selectedThreadId === tid;
+    const canRestore = !hasAttachments || Boolean(state.imageInputManager?.canRestoreAttachments?.(entry));
+
+    // A failed connection can be ambiguous server-side, so restore the exact
+    // entry for an explicit user retry instead of automatically retransmitting.
+    if (isCurrent && input && !input.value.trim() && canRestore) {
+      input.value = entry.text;
+      input.style.height = "auto";
+      input.style.height = Math.min(input.scrollHeight, chatInputMaxHeight()) + "px";
+      if (hasAttachments) state.imageInputManager?.restoreAttachments(entry);
+      saveDraft(name, input.value, tid);
+      input.focus();
+    } else {
+      mgr.enqueue(name, tid, { ...entry, requiresExplicitRetry: true });
+      if (isCurrent) showPendingIndicator();
+      updateSendButton();
+      return;
+    }
+    updateSendButton();
+  }
+
   async function sendChat(message, overrideImages = null) {
     // A queued item is pinned to the Anima/thread it was written in; it must
     // keep that target even if the user entered a meeting while the drain
@@ -301,12 +340,18 @@ export function createStreamingController(ctx) {
     const tid = overrideImages?.targetThread || state.selectedThreadId;
     if (!name || (!message.trim() && images.length === 0 && files.length === 0)) return;
     if (mgr.isStreamingFor(name, tid)) {
+      if (overrideImages?.targetAnima) {
+        requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles);
+      }
       logger.warn("Blocked: this thread is already streaming", { anima: name, thread: tid });
       return;
     }
 
     const currentAnima = state.animas.find(p => p.name === name);
     if (currentAnima?.needs_repair || currentAnima?.bootstrap_state?.state === "needs_repair") {
+      if (overrideImages?.targetAnima) {
+        requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles);
+      }
       const msgs = $("chatPageMessages");
       if (msgs) {
         const el = document.createElement("div");
@@ -318,6 +363,9 @@ export function createStreamingController(ctx) {
       return;
     }
     if (currentAnima?.status === "bootstrapping" || currentAnima?.bootstrapping) {
+      if (overrideImages?.targetAnima) {
+        requeuePinnedEntry(name, tid, message, images, displayImages, files, displayFiles);
+      }
       const msgs = $("chatPageMessages");
       if (msgs) {
         const el = document.createElement("div");
@@ -620,7 +668,8 @@ export function createStreamingController(ctx) {
           ctx.controllers.anima.renderAnimaTabs();
           ctx.controllers.thread.renderThreadTabs();
         } finally {
-          if (mgr.getPendingQueue(name, tid).length > 0) {
+          const pendingQueue = mgr.getPendingQueue(name, tid);
+          if (pendingQueue.length > 0 && !pendingQueue[0].requiresExplicitRetry) {
             const next = mgr.dequeue(name, tid);
             showPendingIndicator();
             if (mgr.getPendingQueue(name, tid).length === 0) hidePendingIndicator();
@@ -633,6 +682,7 @@ export function createStreamingController(ctx) {
     ctx.controllers.renderer.renderChat(!ctx.controllers.renderer.isUserDetached());
 
     if (!success && error && error.name !== "AbortError") {
+      recoverFailedEntry(name, tid, message, images, displayImages, files, displayFiles);
       logger.error("Chat stream error", { anima: name, error: error.message, name: error.name });
     }
   }
@@ -938,7 +988,8 @@ export function createStreamingController(ctx) {
           ctx.controllers.anima.renderAnimaTabs();
           ctx.controllers.thread.renderThreadTabs();
         } finally {
-          if (mgr.getPendingQueue(animaName, tid).length > 0) {
+          const pendingQueue = mgr.getPendingQueue(animaName, tid);
+          if (pendingQueue.length > 0 && !pendingQueue[0].requiresExplicitRetry) {
             const next = mgr.dequeue(animaName, tid);
             showPendingIndicator();
             if (mgr.getPendingQueue(animaName, tid).length === 0) hidePendingIndicator();
