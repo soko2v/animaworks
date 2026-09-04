@@ -157,6 +157,29 @@ def test_transport_failure_keeps_the_exact_attachment_entry_for_user_retry(path:
     assert "requiresExplicitRetry: true" in source
 
 
+@pytest.mark.parametrize(
+    ("path", "start", "end"),
+    [
+        (_CHAT_PAGE, "function recoverFailedEntry", "async function sendChat"),
+        (_WORKSPACE, "function _recoverFailedEntry", "let _convLatestZone"),
+    ],
+    ids=[_CHAT_PAGE.name, _WORKSPACE.name],
+)
+def test_transport_failure_does_not_merge_its_retry_with_new_composer_attachments(
+    path: Path, start: str, end: str
+) -> None:
+    """A new attachment added during a failed request must remain a separate composition."""
+    source = path.read_text(encoding="utf-8")
+    start_index = source.index(start)
+    recovery = source[start_index : source.index(end, start_index)]
+    assert "const composerHasAttachments =" in recovery
+    assert "getImageCount?.()" in recovery
+    assert "getFileCount?.()" in recovery
+    assert "isProcessing?.()" in recovery
+    assert "const composerIsEmpty =" in recovery
+    assert "composerIsEmpty && canRestore" in recovery
+
+
 def test_automatic_drains_stop_before_a_failed_entry_that_requires_an_explicit_retry() -> None:
     """A later stream completion must not silently retry an ambiguous failed request."""
     workspace = _WORKSPACE.read_text(encoding="utf-8")

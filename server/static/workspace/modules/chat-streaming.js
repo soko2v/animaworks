@@ -123,10 +123,16 @@ function _recoverFailedEntry(anima, thread, text, images, displayImages, files, 
   const isCurrent = current.anima === anima && current.thread === thread;
   const hasAttachments = images.length > 0 || files.length > 0;
   const canRestore = !hasAttachments || Boolean(im?.canRestoreAttachments?.(entry));
+  const composerHasAttachments =
+    (im?.getImageCount?.() || 0) > 0
+    || (im?.getFileCount?.() || 0) > 0
+    || Boolean(im?.isProcessing?.());
+  const composerIsEmpty = !dom.convInput?.value?.trim() && !composerHasAttachments;
 
   // A transport failure may follow an accepted server request. Keep the
   // entry for an explicit user retry, never an automatic duplicate send.
-  if (isCurrent && dom.convInput && !dom.convInput.value.trim() && canRestore) {
+  // Do not merge it with attachments added while that request was in flight.
+  if (isCurrent && dom.convInput && composerIsEmpty && canRestore) {
     dom.convInput.value = text;
     dom.convInput.style.height = "auto";
     dom.convInput.style.height = Math.min(dom.convInput.scrollHeight, isMobileView() ? 100 : 120) + "px";

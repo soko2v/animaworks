@@ -303,10 +303,17 @@ export function createStreamingController(ctx) {
     const input = $("chatPageInput");
     const isCurrent = state.selectedAnima === name && state.selectedThreadId === tid;
     const canRestore = !hasAttachments || Boolean(state.imageInputManager?.canRestoreAttachments?.(entry));
+    const composerHasAttachments =
+      (state.imageInputManager?.getImageCount?.() || 0) > 0
+      || (state.imageInputManager?.getFileCount?.() || 0) > 0
+      || Boolean(state.imageInputManager?.isProcessing?.());
+    const composerIsEmpty = !input?.value?.trim() && !composerHasAttachments;
 
     // A failed connection can be ambiguous server-side, so restore the exact
     // entry for an explicit user retry instead of automatically retransmitting.
-    if (isCurrent && input && !input.value.trim() && canRestore) {
+    // Do not merge it with attachments the user added while the failed request
+    // was in flight; that would turn two intentional messages into one retry.
+    if (isCurrent && input && composerIsEmpty && canRestore) {
       input.value = entry.text;
       input.style.height = "auto";
       input.style.height = Math.min(input.scrollHeight, chatInputMaxHeight()) + "px";
