@@ -218,10 +218,19 @@ describe("streamChat", () => {
 
   it("should call onError and reject for terminal error events", async () => {
     const chunks = [
+      sseEvent("stream_start", { response_id: "response-that-must-not-reconnect" }),
       sseEvent("error", { code: "IPC_TIMEOUT", message: "timeout" }),
     ];
 
-    globalThis.fetch = createMockFetch(chunks);
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount++;
+      return {
+        ok: true,
+        status: 200,
+        body: createMockBody(chunks),
+      };
+    };
 
     let errorData = null;
     await assert.rejects(
@@ -233,6 +242,7 @@ describe("streamChat", () => {
 
     // Under Node tests, i18n is stubbed to return the key itself
     assert.strictEqual(errorData.message, "sse.ipc_timeout");
+    assert.strictEqual(fetchCount, 1, "a terminal server error must not reconnect or resend the request");
   });
 
   it("should call onBootstrap for bootstrap events", async () => {

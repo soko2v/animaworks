@@ -197,6 +197,31 @@ def test_automatic_drains_stop_before_a_failed_entry_that_requires_an_explicit_r
     assert "!pendingQueue[0].requiresExplicitRetry" in chat_page
 
 
+def test_terminal_stream_failure_does_not_drain_another_entry_before_recovery() -> None:
+    """The failure callback must block onFinally's automatic drain.
+
+    ``streamChat`` now rejects terminal SSE error/bootstrap-busy responses.  Its
+    caller's ``onFinally`` runs before the failed attachment is restored, so a
+    queue drain there would otherwise send a later entry ahead of a manual
+    retry and obscure the original failed submission.
+    """
+    workspace = _WORKSPACE.read_text(encoding="utf-8")
+    chat_page = _CHAT_PAGE.read_text(encoding="utf-8")
+    assert "let transportFailure = false;" in workspace
+    assert "transportFailure = true;" in workspace
+    assert "if (!transportFailure) _drainQueue(anima, thread, isTargetActive());" in workspace
+    assert "let transportFailure = false;" in chat_page
+    assert "transportFailure = true;" in chat_page
+    assert "if (!transportFailure && pendingQueue.length > 0" in chat_page
+
+
+def test_page_stream_finalizer_does_not_save_a_different_thread_draft() -> None:
+    """Finishing a pinned background send must not store the visible draft under its old thread."""
+    source = _CHAT_PAGE.read_text(encoding="utf-8")
+    assert "const isVisible = () => state.selectedAnima === name && state.selectedThreadId === tid;" in source
+    assert "if (inputEl && isVisible())" in source
+
+
 def test_workspace_pending_indicator_describes_document_only_entries_as_attachments() -> None:
     source = _WORKSPACE.read_text(encoding="utf-8")
     indicator = source[source.index("export function wsShowPendingIndicator") :]
