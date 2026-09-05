@@ -490,10 +490,17 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     processImageFiles(e.dataTransfer?.files || []);
   });
 
-  // Payload currently attached under *key*, or undefined when the key is free.
-  function pendingPayloadFor(key) {
-    const hit = pendingImages.find((img) => img.key === key) || pendingFiles.find((file) => file.key === key);
-    return hit ? hit.data : undefined;
+  // Attachment currently held under *key*, or undefined when the key is free.
+  function pendingAttachmentFor(key) {
+    return pendingImages.find((img) => img.key === key) || pendingFiles.find((file) => file.key === key);
+  }
+
+  // An explicit key is metadata-only. Confirm every payload field available to
+  // the composer before treating a collision as the same attachment.
+  function sameAttachmentPayload(existing, expected) {
+    if (!existing || existing.data !== expected.data) return false;
+    if ((existing.media_type || "") !== expected.mediaType) return false;
+    return expected.kind !== "file" || existing.name === expected.label;
   }
 
   // Key for a restored attachment whose snapshot carries no identity. The
@@ -501,12 +508,13 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
   // the complete payload, so two distinct payloads that share a fingerprint
   // get distinct keys instead of one being silently dropped. Returns a key
   // that is either free or already holds this exact payload.
-  function fallbackRestoreKey(kind, label, data, seen) {
+  function fallbackRestoreKey(kind, label, mediaType, data, seen) {
     const base = `restored|${kind}|${label}|${fingerprint(data)}`;
+    const expected = { kind, label, mediaType, data };
     let key = base;
     for (let n = 2; ; n += 1) {
-      const existing = seen.has(key) ? seen.get(key) : pendingPayloadFor(key);
-      if (existing === undefined || existing === data) return key;
+      const existing = seen.has(key) ? seen.get(key) : pendingAttachmentFor(key);
+      if (existing === undefined || sameAttachmentPayload(existing, expected)) return key;
       key = `${base}#${n}`;
     }
   }
@@ -514,12 +522,13 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
   // Snapshot identities are metadata-only. Reuse one only when it still
   // identifies the same complete payload; otherwise give the restored item a
   // payload-confirmed fallback key instead of silently dropping it.
-  function restoreKey(kind, label, data, shownKey, seen) {
-    if (!shownKey) return fallbackRestoreKey(kind, label, data, seen);
-    const existing = seen.has(shownKey) ? seen.get(shownKey) : pendingPayloadFor(shownKey);
-    return existing === undefined || existing === data
+  function restoreKey(kind, label, mediaType, data, shownKey, seen) {
+    if (!shownKey) return fallbackRestoreKey(kind, label, mediaType, data, seen);
+    const expected = { kind, label, mediaType, data };
+    const existing = seen.has(shownKey) ? seen.get(shownKey) : pendingAttachmentFor(shownKey);
+    return existing === undefined || sameAttachmentPayload(existing, expected)
       ? shownKey
-      : fallbackRestoreKey(kind, label, data, seen);
+      : fallbackRestoreKey(kind, label, mediaType, data, seen);
   }
 
   // An in-flight picker/drop file owns its metadata key before its payload is
@@ -529,7 +538,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     return Boolean(shownKey)
       && !seen.has(shownKey)
       && queuedIdentities.has(shownKey)
-      && pendingPayloadFor(shownKey) === undefined;
+      && pendingAttachmentFor(shownKey) === undefined;
   }
 
   // Compute what restoreAttachments() would add without mutating state.
@@ -549,9 +558,9 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         plan.waiting = true;
         return;
       }
-      const key = restoreKey("image", img.media_type, img.data, shown.key, seen);
+      const key = restoreKey("image", img.media_type, img.media_type, img.data, shown.key, seen);
       if (queuedIdentities.has(key) || seen.has(key)) return;
-      seen.set(key, img.data);
+      seen.set(key, { data: img.data, media_type: img.media_type });
       plan.images.push({
         data: img.data,
         media_type: img.media_type,
@@ -566,7 +575,8 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         plan.waiting = true;
         return;
       }
-      const key = restoreKey("file", file.name, file.data, shown.key, seen);
+      const mediaType = file.media_type || "";
+      const key = restoreKey("file", file.name, mediaType, file.data, shown.key, seen);
       if (queuedIdentities.has(key) || seen.has(key)) return;
       if (!plan.overflow && pendingFiles.length + pendingDocumentReads + plan.files.length >= MAX_FILE_COUNT) {
         plan.overflow = file.name;
@@ -578,7 +588,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         plan.payloadOverflow = file.name;
         return;
       }
-      seen.set(key, file.data);
+      seen.set(key, { data: file.data, media_type: mediaType, name: file.name });
       plan.files.push({ data: file.data, media_type: file.media_type || "", name: file.name, key });
       plan.filePayloadChars += payloadChars;
     });

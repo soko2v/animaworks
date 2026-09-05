@@ -587,6 +587,16 @@ describe("image-input document drag & drop", () => {
     assert.deepEqual(manager.getPendingFiles().map((file) => file.data), [composerFile.data, queuedFile.data]);
     assert.notEqual(manager.getDisplayFiles()[0].key, manager.getDisplayFiles()[1].key);
     assert.equal(manager.restoreAttachments(fileEntry), 0, "the restored document remains de-duplicated");
+
+    const differentMime = { ...queuedFile, media_type: "text/csv" };
+    assert.equal(manager.restoreAttachments({
+      files: [differentMime],
+      displayFiles: [{ ...differentMime, key: fileKey }],
+    }), 1, "matching key and bytes do not hide a payload with a different media type");
+    assert.equal(manager.restoreAttachments({
+      files: [differentMime],
+      displayFiles: [{ ...differentMime, key: fileKey }],
+    }), 0, "matching key and complete payload are still de-duplicated");
   });
 
   it("keeps a queued document intact while a colliding composer document is still loading", () => {
