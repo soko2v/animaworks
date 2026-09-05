@@ -492,15 +492,19 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
 
   // Attachment currently held under *key*, or undefined when the key is free.
   function pendingAttachmentFor(key) {
-    return pendingImages.find((img) => img.key === key) || pendingFiles.find((file) => file.key === key);
+    const image = pendingImages.find((item) => item.key === key);
+    if (image) return { kind: "image", attachment: image };
+    const file = pendingFiles.find((item) => item.key === key);
+    return file ? { kind: "file", attachment: file } : undefined;
   }
 
   // An explicit key is metadata-only. Confirm every payload field available to
   // the composer before treating a collision as the same attachment.
   function sameAttachmentPayload(existing, expected) {
-    if (!existing || existing.data !== expected.data) return false;
-    if ((existing.media_type || "") !== expected.mediaType) return false;
-    return expected.kind !== "file" || existing.name === expected.label;
+    if (!existing || existing.kind !== expected.kind) return false;
+    if (existing.attachment.data !== expected.data) return false;
+    if ((existing.attachment.media_type || "") !== expected.mediaType) return false;
+    return expected.kind !== "file" || existing.attachment.name === expected.label;
   }
 
   // Key for a restored attachment whose snapshot carries no identity. The
@@ -560,7 +564,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       }
       const key = restoreKey("image", img.media_type, img.media_type, img.data, shown.key, seen);
       if (queuedIdentities.has(key) || seen.has(key)) return;
-      seen.set(key, { data: img.data, media_type: img.media_type });
+      seen.set(key, { kind: "image", attachment: { data: img.data, media_type: img.media_type } });
       plan.images.push({
         data: img.data,
         media_type: img.media_type,
@@ -588,7 +592,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         plan.payloadOverflow = file.name;
         return;
       }
-      seen.set(key, { data: file.data, media_type: mediaType, name: file.name });
+      seen.set(key, { kind: "file", attachment: { data: file.data, media_type: mediaType, name: file.name } });
       plan.files.push({ data: file.data, media_type: file.media_type || "", name: file.name, key });
       plan.filePayloadChars += payloadChars;
     });

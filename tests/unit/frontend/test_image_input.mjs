@@ -599,6 +599,21 @@ describe("image-input document drag & drop", () => {
     }), 0, "matching key and complete payload are still de-duplicated");
   });
 
+  it("restoreAttachments includes attachment kind in explicit-key payload identity", () => {
+    const key = "shared|4|42";
+    const data = "YWFhYQ==";
+    const file = { name: "same.bin", media_type: "application/octet-stream", data };
+    const image = { media_type: "application/octet-stream", data };
+
+    assert.equal(manager.restoreAttachments({ files: [file], displayFiles: [{ ...file, key }] }), 1);
+    assert.equal(manager.restoreAttachments({ images: [image], displayImages: [{ ...image, key }] }), 1);
+    assert.equal(manager.getFileCount(), 1);
+    assert.equal(manager.getImageCount(), 1);
+    assert.notEqual(manager.getDisplayFiles()[0].key, manager.getDisplayImages()[0].key);
+    assert.equal(manager.restoreAttachments({ files: [file], displayFiles: [{ ...file, key }] }), 0);
+    assert.equal(manager.restoreAttachments({ images: [image], displayImages: [{ ...image, key }] }), 0);
+  });
+
   it("keeps a queued document intact while a colliding composer document is still loading", () => {
     const OriginalFileReader = globalThis.FileReader;
     const readers = [];
