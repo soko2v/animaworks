@@ -44,8 +44,8 @@ class SchedulerMixin:
     def _check_schedule_freshness(self, name: str) -> bool:
         """Check if cron.md or heartbeat.md changed since last setup.
 
-        If a change is detected, reloads the schedule and returns True.
-        Returns False when no change is detected or the anima is unknown.
+        Reload on either file changing, but only a cron.md change marks the
+        currently firing cron stale. Heartbeat-only edits must not drop it.
         """
         anima = self.animas.get(name)
         if not anima:
@@ -76,7 +76,7 @@ class SchedulerMixin:
                 hb_mt,
             )
             self.reload_anima_schedule(name)
-            return True
+            return cron_mt != prev[0]
         return False
 
     def _setup_heartbeat(self, anima: DigitalAnima) -> None:

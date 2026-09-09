@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.lifecycle.scheduler import SchedulerMixin
+from core.schemas import CronTask
 from core.supervisor.scheduler_manager import SchedulerManager
 
 
@@ -59,7 +63,7 @@ class TestCheckScheduleFreshness:
         assert result is True
         mock_reload.assert_called_once_with("test")
 
-    def test_heartbeat_change_triggers_reload(self, scheduler_mgr: SchedulerManager, tmp_path: Path) -> None:
+    def test_heartbeat_change_reloads_without_marking_cron_stale(self, scheduler_mgr: SchedulerManager, tmp_path: Path) -> None:
         (tmp_path / "heartbeat.md").write_text("# v1")
         scheduler_mgr._record_schedule_mtimes()
 
@@ -68,7 +72,7 @@ class TestCheckScheduleFreshness:
 
         with patch.object(scheduler_mgr, "reload_schedule") as mock_reload:
             result = scheduler_mgr._check_schedule_freshness()
-        assert result is True
+        assert result is False
         mock_reload.assert_called_once()
 
     def test_deleted_cron_triggers_reload(self, scheduler_mgr: SchedulerManager, tmp_path: Path) -> None:
@@ -86,3 +90,47 @@ class TestCheckScheduleFreshness:
         """When files never existed, no reload needed."""
         scheduler_mgr._record_schedule_mtimes()
         assert scheduler_mgr._check_schedule_freshness() is False
+
+
+@pytest.mark.parametrize("lifecycle", [False, True])
+@pytest.mark.parametrize("changed", ["heartbeat", "cron", "both", "none"])
+@pytest.mark.asyncio
+async def test_due_cron_survives_only_unrelated_heartbeat_edits(tmp_path: Path, lifecycle: bool, changed: str) -> None:
+    for name in ("cron", "heartbeat"):
+        (tmp_path / f"{name}.md").write_text("synthetic")
+    task = CronTask(name="synthetic", schedule="0 9 * * *", description="no real execution")
+    if lifecycle:
+        manager = SchedulerMixin()
+        anima = MagicMock()
+        anima.memory.anima_dir = tmp_path
+        manager.animas = {"test": anima}
+        manager._schedule_mtimes = {}
+        manager._record_schedule_mtimes("test", tmp_path)
+        manager.reload_anima_schedule = MagicMock()
+        run = AsyncMock()
+        manager._run_cron_and_broadcast = run
+    else:
+        manager = SchedulerManager(anima=MagicMock(), anima_name="test", anima_dir=tmp_path, emit_event=MagicMock())
+        manager._record_schedule_mtimes()
+        manager._awaiting_initial_setup = MagicMock(return_value=False)
+        manager._log_cron_event = MagicMock()
+        manager.reload_schedule = MagicMock()
+        run = AsyncMock()
+        manager._run_cron_task = run
+    for name in ("cron", "heartbeat"):
+        if changed in (name, "both"):
+            path = tmp_path / f"{name}.md"
+            stamp = path.stat().st_mtime + 10
+            os.utime(path, (stamp, stamp))
+    if lifecycle:
+        await manager._cron_wrapper("test", task)
+        reload_mock = manager.reload_anima_schedule
+    else:
+        await manager.cron_tick(task)
+        reload_mock = manager.reload_schedule
+    await asyncio.sleep(0)
+    if changed in ("cron", "both"):
+        run.assert_not_called()
+    else:
+        run.assert_awaited_once()
+    assert reload_mock.call_count == (changed != "none")

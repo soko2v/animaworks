@@ -1160,8 +1160,8 @@ class SchedulerManager:
     def _check_schedule_freshness(self) -> bool:
         """Check if cron.md or heartbeat.md changed since last setup.
 
-        If a change is detected, reloads the schedule and returns True.
-        Returns False when no change is detected.
+        Reload on either file changing, but only a cron.md change marks the
+        currently firing cron stale. Heartbeat-only edits must not drop it.
         """
         cron_path = self._anima_dir / "cron.md"
         hb_path = self._anima_dir / "heartbeat.md"
@@ -1174,7 +1174,8 @@ class SchedulerManager:
         except OSError:
             hb_mtime = 0.0
 
-        if cron_mtime != self._cron_md_mtime or hb_mtime != self._heartbeat_md_mtime:
+        cron_changed = cron_mtime != self._cron_md_mtime
+        if cron_changed or hb_mtime != self._heartbeat_md_mtime:
             logger.info(
                 "Schedule file changed for %s (cron mtime %.0f->%.0f, hb mtime %.0f->%.0f), reloading",
                 self._anima_name,
@@ -1184,7 +1185,7 @@ class SchedulerManager:
                 hb_mtime,
             )
             self.reload_schedule(self._anima_name)
-            return True
+            return cron_changed
         return False
 
     # ── Cleanup ──────────────────────────────────────────────────
