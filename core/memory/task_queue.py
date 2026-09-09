@@ -113,6 +113,13 @@ def _execution_holds(path: Path) -> set[str] | None:
             row = json.loads(line)
             if not isinstance(row, dict):
                 return None
+            if row.get("_event") == "execution_hold_group":
+                tids = row.get("task_ids")
+                if (not isinstance(tids, list) or not tids
+                        or any(not isinstance(tid, str) or not tid.strip() for tid in tids)):
+                    return None
+                holds.update(tids)
+                continue
             if row.get("_event") == "execution_hold" or row.get("status") in ("blocked", "failed"):
                 tid = row.get("task_id")
                 if not isinstance(tid, str) or not tid.strip():
@@ -236,8 +243,13 @@ class TaskQueueManager:
             existing = _execution_holds(self._queue_path)
             if existing is None:
                 raise TaskPersistenceError("Untrusted execution hold ledger")
-            for tid in sorted(task_ids - existing):
-                self._append_unlocked({"_event": "execution_hold", "task_id": tid})
+            missing = sorted(task_ids - existing)
+            if missing:
+                # One complete record cannot expose a valid subset of the
+                # branch after process death. A torn record is untrusted and
+                # fences the whole ledger. Failure before any write remains
+                # a caller recovery concern; this is not power-loss atomicity.
+                self._append_unlocked({"_event": "execution_hold_group", "task_ids": missing})
 
     def _build_task_entry(
         self,
@@ -593,7 +605,7 @@ class TaskQueueManager:
             if not task_id:
                 continue
 
-            if raw.get("_event") == "execution_hold":
+            if raw.get("_event") in ("execution_hold", "execution_hold_group"):
                 # Safety evidence is independent of display/terminal state.
                 continue
 
