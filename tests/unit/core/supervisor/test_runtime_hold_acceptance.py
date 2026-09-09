@@ -14,6 +14,153 @@ from core.platform.processing_lease import processing_lease_path
 from core.supervisor.pending_executor import PendingTaskExecutor, TaskExecutionHeld
 
 
+@pytest.mark.parametrize("status", ["blocked", "failed"])
+@pytest.mark.parametrize("latest", ["pending", "in_progress", "done", "cancelled"])
+def test_compaction_preserves_hold_independent_of_display(tmp_path, status, latest):
+    manager = TaskQueueManager(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    entry = {"task_id": "held", "source": "human", "original_instruction": "synthetic",
+             "assignee": "synthetic", "summary": "", "status": status,
+             "ts": "2026-09-09T00:00:00+09:00", "updated_at": "2026-09-09T00:00:00+09:00"}
+    rows = [entry, {"_event": "update", "task_id": "held", "status": latest},
+            {**entry, "task_id": "completed", "status": "done"}]
+    manager.queue_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    assert legacy_execution_hold(tmp_path, "held")
+    assert manager.compact() == (2 if latest in ("done", "cancelled") else 1)
+    assert legacy_execution_hold(tmp_path, "held")
+    current = manager.get_task_by_id("held")
+    assert (current.status if current else None) == (None if latest in ("done", "cancelled") else latest)
+    # Recreate ID and force another rewrite; neither action grants approval.
+    manager._append({**entry, "status": "pending"})
+    manager._append({**entry, "task_id": "another", "status": "done"})
+    assert manager.compact() == 1
+    assert legacy_execution_hold(tmp_path, "held")
+    assert not legacy_execution_hold(tmp_path, "other")
+    rows = [json.loads(line) for line in manager.queue_path.read_text().splitlines()]
+    assert sum(row.get("_event") == "execution_hold" for row in rows) == 1
+
+
+@pytest.mark.parametrize("bad", ["{", "[]", '{"status":"blocked"}',
+                                '{"_event":"execution_hold","task_id":null}'])
+def test_compaction_retains_untrusted_evidence(tmp_path, bad):
+    manager = TaskQueueManager(tmp_path)
+    manager.queue_path.parent.mkdir()
+    manager.queue_path.write_text(bad + "\n")
+    before = manager.queue_path.read_bytes()
+    assert manager.compact() == 0
+    assert manager.queue_path.read_bytes() == before
+    assert not manager.archive_path.exists()
+    assert legacy_execution_hold(tmp_path, "task")
+
+
+@pytest.mark.parametrize("row", [{"task_id": "task", "status": "blocked"},
+                                 {"task_id": "task", "status": "failed"},
+                                 {"task_id": "task", "_event": "execution_hold"}, []])
+def test_archived_hold_is_enforced_with_missing_live_ledger(tmp_path, row):
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state/task_queue_archive.jsonl").write_text(json.dumps(row) + "\n")
+    assert legacy_execution_hold(tmp_path, "task")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_status", ["blocked", "failed"])
+@pytest.mark.parametrize("isolated", [False, True])
+async def test_command_background_hold_retains_claim(tmp_path, legacy_status, isolated):
+    from core.background import BackgroundTaskManager, TaskStatus
+    from core.supervisor.task_runner import execute_background_contract
+
+    state = tmp_path / "state"
+    pending = state / "background_tasks/pending"
+    processing = pending / "processing"
+    processing.mkdir(parents=True)
+    ledger = state / "task_queue.jsonl"
+    ledger.write_text(json.dumps({"task_id": "task", "status": "pending"}) + "\n")
+    desc = {"task_id": "task", "task_type": "command", "tool_name": "synthetic-never-run"}
+    path = (pending if isolated else processing) / "task.json"
+    path.write_text(json.dumps(desc))
+    expected_descriptor = path.read_bytes()
+    if not isolated:
+        processing_lease_path(path).write_text('{"evidence":"synthetic claim"}')
+    manager = BackgroundTaskManager(tmp_path, result_memory_retention_minutes=10,
+                                    max_completed_tasks_in_memory=100)
+    manager.on_complete = AsyncMock()
+    anima = MagicMock()
+    anima.anima_dir = tmp_path
+    anima.agent.background_manager = manager
+    shutdown = asyncio.Event()
+    executor = PendingTaskExecutor(anima=anima, anima_name="synthetic", anima_dir=tmp_path,
+                                   shutdown_event=shutdown)
+    executor._background_isolated = isolated
+    executor._maybe_run_orphan_sweep = AsyncMock()
+    executor._recover_processing = MagicMock()
+    def set_hold():
+        with ledger.open("a") as stream:
+            stream.write(json.dumps({"_event": "update", "task_id": "task", "status": legacy_status}) + "\n")
+    with patch("subprocess.run") as command:
+        if isolated:
+            async def child(**kwargs):
+                assert kwargs["payload"]["task_id"] == "task"
+                set_hold()  # Arrives after root admission, before child execution.
+                result = await execute_background_contract(anima, kind="command", payload=kwargs["payload"])
+                shutdown.set()
+                executor.wake()
+                return result
+            executor._task_runner_supervisor = MagicMock()
+            executor._task_runner_supervisor.run_background = AsyncMock(side_effect=child)
+            await executor.watcher_loop()
+            executor._task_runner_supervisor.run_background.assert_awaited_once()
+        else:
+            job = await executor.execute_pending_task(desc)
+            executor._track_command_claim(job, task_id="task", processing_path=path)
+            set_hold()  # Background thread has not started yet.
+            with pytest.raises(TaskExecutionHeld):
+                await job
+            await asyncio.sleep(0)  # Run the claim completion callback.
+        command.assert_not_called()
+    held = list(manager._tasks.values())
+    assert len(held) == 1 and held[0].status == TaskStatus.HELD
+    assert held[0].completed_at is None and held[0].result is None
+    assert manager._load_task(held[0].task_id).status == TaskStatus.HELD
+    manager.on_complete.assert_not_awaited()
+    kept = processing / "task.json"
+    assert kept.read_bytes() == expected_descriptor
+    assert processing_lease_path(kept).exists()
+    assert legacy_execution_hold(tmp_path, "task")
+    assert "task" not in executor._active_task_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["blocked", "failed", "pending"])
+async def test_command_child_boundary(tmp_path, status):
+    from types import SimpleNamespace
+
+    from core.supervisor.task_runner import execute_background_contract
+
+    (tmp_path / "state").mkdir()
+    ledger = tmp_path / "state/task_queue.jsonl"
+    ledger.write_text(json.dumps({"task_id": "task", "status": status}) + "\n")
+    before = ledger.read_bytes()
+    with patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="synthetic", stderr="")) as command:
+        result = await execute_background_contract(SimpleNamespace(anima_dir=tmp_path), kind="command",
+            payload={"task_id": "task", "tool_name": "synthetic-never-run"})
+    assert command.call_count == (1 if status == "pending" else 0)
+    assert result.get("execution_held", False) is (status != "pending")
+    assert result["success"] is (status == "pending")
+    assert ledger.read_bytes() == before
+
+
+def test_compaction_requires_os_lock(tmp_path):
+    manager = TaskQueueManager(tmp_path)
+    manager.queue_path.parent.mkdir()
+    manager.queue_path.write_text('{"task_id":"task","status":"blocked"}\n')
+    before = manager.queue_path.read_bytes()
+    with patch("core.platform.locks.acquire_file_lock", side_effect=OSError("synthetic lock error")):
+        assert manager.compact() == 0
+    assert manager.queue_path.read_bytes() == before
+    assert not manager.archive_path.exists()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_status", ["blocked", "failed"])
 @pytest.mark.parametrize("as_update", [False, True])

@@ -30,6 +30,10 @@ class ExecutionError(AnimaWorksError):
     """LLM execution errors."""
 
 
+class TaskExecutionHeld(AnimaWorksError, RuntimeError):
+    """Dispatch refused; preserve execution evidence rather than retrying."""
+
+
 class LLMAPIError(ExecutionError):
     """LLM API call failure (network, auth, rate limit)."""
 

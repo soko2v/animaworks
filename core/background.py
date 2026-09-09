@@ -26,7 +26,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from core.exceptions import AnimaWorksError  # noqa: F401
+from core.exceptions import (
+    AnimaWorksError,  # noqa: F401
+    TaskExecutionHeld,
+)
 
 logger = logging.getLogger("animaworks.background")
 
@@ -39,6 +42,7 @@ class TaskStatus(str, Enum):  # noqa: UP042
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    HELD = "held"
 
 
 @dataclass
@@ -321,6 +325,10 @@ class BackgroundTaskManager:
                 task.task_id,
                 task.tool_name,
             )
+        except TaskExecutionHeld:
+            task.status = TaskStatus.HELD
+            task.error = "Execution held; explicit release required"
+            raise
         except Exception as e:
             task.status = TaskStatus.FAILED
             task.error = f"{type(e).__name__}: {e}"
@@ -333,7 +341,7 @@ class BackgroundTaskManager:
         finally:
             self._save_task(task)
             self._async_tasks.pop(task.task_id, None)
-            if self.on_complete:
+            if self.on_complete and task.status != TaskStatus.HELD:
                 try:
                     await self.on_complete(task)
                 except Exception:
@@ -359,6 +367,10 @@ class BackgroundTaskManager:
                 task.task_id,
                 task.tool_name,
             )
+        except TaskExecutionHeld:
+            task.status = TaskStatus.HELD
+            task.error = "Execution held; explicit release required"
+            raise
         except Exception as e:
             task.status = TaskStatus.FAILED
             task.error = f"{type(e).__name__}: {e}"
@@ -371,7 +383,7 @@ class BackgroundTaskManager:
         finally:
             self._save_task(task)
             self._async_tasks.pop(task.task_id, None)
-            if self.on_complete:
+            if self.on_complete and task.status != TaskStatus.HELD:
                 try:
                     await self.on_complete(task)
                 except Exception:

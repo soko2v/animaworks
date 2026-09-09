@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from core.config.resolver import resolve_process_model_config
-from core.exceptions import ToolExecutionError
+from core.exceptions import TaskExecutionHeld, ToolExecutionError
 from core.i18n import t
 from core.memory.task_queue import legacy_execution_hold
 from core.platform.processing_lease import (
@@ -43,10 +43,6 @@ logger = logging.getLogger(__name__)
 
 class TaskExecError(RuntimeError):
     """Raised when a TaskExec LLM session encounters a non-recoverable error."""
-
-
-class TaskExecutionHeld(RuntimeError):
-    """Dispatch refused; preserve ledger and processing evidence, not a failure."""
 
 
 _PENDING_WATCHER_POLL_INTERVAL = 3.0
@@ -393,12 +389,16 @@ class PendingTaskExecutor:
 
         def _done(done: asyncio.Task[None]) -> None:
             touch_task.cancel()
+            error = None if done.cancelled() else done.exception()
+            held = isinstance(error, TaskExecutionHeld) or legacy_execution_hold(self._anima_dir, task_id)
             try:
-                _unlink_processing_descriptor(processing_path)
+                if not held:
+                    _unlink_processing_descriptor(processing_path)
             except OSError:
                 logger.warning("Failed to finalize command task file: %s", processing_path, exc_info=True)
             finally:
-                _remove_processing_lease(processing_path)
+                if not held:
+                    _remove_processing_lease(processing_path)
                 self._active_task_ids.discard(task_id)
                 self.wake()
 
@@ -1938,6 +1938,9 @@ class PendingTaskExecutor:
             """Execute the tool via CLI subprocess (same as direct execution)."""
             import subprocess
 
+            if legacy_execution_hold(self._anima_dir, str(task_desc.get("task_id") or "")):
+                raise TaskExecutionHeld("Command execution held")
+
             # name may be composite (e.g. "transcribe:audio"); extract module name
             module_name = name.split(":")[0] if ":" in name else name
             cmd = ["animaworks-tool", module_name]
@@ -1991,8 +1994,11 @@ class PendingTaskExecutor:
 
         assert self._task_runner_supervisor is not None
         task_id = str(task_desc.get("task_id") or "unknown")
+        if legacy_execution_hold(self._anima_dir, task_id):
+            raise TaskExecutionHeld("Command execution held")
         attempt = self._next_attempt(task_id)
         payload = {
+            "task_id": task_id,
             "tool_name": task_desc.get("tool_name", ""),
             "subcommand": task_desc.get("subcommand", ""),
             "raw_args": task_desc.get("raw_args", []),
@@ -2009,13 +2015,16 @@ class PendingTaskExecutor:
                 )
 
         try:
-            return await self._task_runner_supervisor.run_background(
+            result = await self._task_runner_supervisor.run_background(
                 kind="command",
                 payload=payload,
                 attempt=attempt,
                 display_lane="background",
                 on_spawned=_on_spawned,
             )
+            if result.get("execution_held") is True:
+                raise TaskExecutionHeld("Child command execution held")
+            return result
         except TaskRunnerError as exc:
             logger.warning(
                 "[%s] Isolated background command failed: id=%s err=%s",
@@ -2079,6 +2088,8 @@ class PendingTaskExecutor:
             self._sync_task_queue(task_id, status, summary=summary)
             if status == "done":
                 await self._handle_goal_completion(task_desc, result)
+        except TaskExecutionHeld:
+            raise
         except Exception as exc:
             if self._shutdown_event.is_set():
                 logger.info(

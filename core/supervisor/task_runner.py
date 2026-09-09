@@ -261,6 +261,10 @@ async def execute_background_contract(
         import subprocess
 
         from core.exceptions import ToolExecutionError
+        from core.memory.task_queue import legacy_execution_hold
+
+        if legacy_execution_hold(anima.anima_dir, str(payload.get("task_id") or "")):
+            return {"task_type": "command", "result": "", "success": False, "execution_held": True}
 
         tool_name = str(payload.get("tool_name") or "")
         subcommand = str(payload.get("subcommand") or "")

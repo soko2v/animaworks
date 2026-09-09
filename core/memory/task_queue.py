@@ -95,6 +95,34 @@ def _compat_status(status: str, task_id: str) -> str:
     return status
 
 
+def _execution_holds(path: Path) -> set[str] | None:
+    """Read sticky hold IDs; None means evidence cannot be trusted."""
+    if path.is_symlink():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    except (OSError, UnicodeError):
+        return None
+    holds: set[str] = set()
+    try:
+        for line in content.splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                return None
+            if row.get("_event") == "execution_hold" or row.get("status") in ("blocked", "failed"):
+                tid = row.get("task_id")
+                if not isinstance(tid, str) or not tid.strip():
+                    return None
+                holds.add(tid)
+    except (ValueError, TypeError):
+        return None
+    return holds
+
+
 def legacy_execution_hold(anima_dir: Path, task_id: str) -> bool:
     """Fence legacy holds without the display layer's pending conversion.
 
@@ -103,26 +131,10 @@ def legacy_execution_hold(anima_dir: Path, task_id: str) -> bool:
     Absent ledgers retain upstream support for unregistered legacy commands;
     this compatibility fence is not a complete execution authorization gate.
     """
-    path = anima_dir / "state" / "task_queue.jsonl"
-    if path.is_symlink():
-        return True
-    try:
-        content = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return False
-    except (OSError, UnicodeError):
-        return True
-    try:
-        for line in content.splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict):
-                return True
-            if row.get("task_id") == task_id and row.get("status") in ("blocked", "failed"):
-                return True
-    except (ValueError, TypeError):
-        return True
+    for name in ("task_queue.jsonl", "task_queue_archive.jsonl"):
+        holds = _execution_holds(anima_dir / "state" / name)
+        if holds is None or task_id in holds:
+            return True
     return False
 
 
@@ -566,6 +578,10 @@ class TaskQueueManager:
             if not task_id:
                 continue
 
+            if raw.get("_event") == "execution_hold":
+                # Safety evidence is independent of display/terminal state.
+                continue
+
             if raw.get("_event") == "update":
                 # Status update event
                 existing = tasks.get(task_id)
@@ -934,6 +950,18 @@ class TaskQueueManager:
         then removed from the queue.
         Returns the number of tasks removed.
         """
+        try:
+            with self._locked_queue(require_lock=True):
+                return self._compact_unlocked()
+        except OSError:
+            logger.warning("Task queue compaction deferred: I/O or lock unavailable")
+            return 0
+
+    def _compact_unlocked(self) -> int:
+        holds = _execution_holds(self._queue_path)
+        if holds is None:
+            logger.warning("Task queue compaction deferred: untrusted hold evidence")
+            return 0
         tasks = self._load_all()
         active: dict[str, TaskEntry] = {}
         terminal: dict[str, TaskEntry] = {}
@@ -952,6 +980,10 @@ class TaskQueueManager:
             with tmp_path.open("w", encoding="utf-8") as f:
                 for entry in active.values():
                     f.write(json.dumps(entry.model_dump(), ensure_ascii=False) + "\n")
+                # Preserve holds even for terminal/removed tasks and reused IDs.
+                # A later status update or compaction is not an approval.
+                for tid in sorted(holds):
+                    f.write(json.dumps({"_event": "execution_hold", "task_id": tid}) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
             tmp_path.replace(self._queue_path)
@@ -965,7 +997,7 @@ class TaskQueueManager:
     # ── Internal ─────────────────────────────────────────────────
 
     @contextmanager
-    def _locked_queue(self) -> Iterator[None]:
+    def _locked_queue(self, *, require_lock: bool = False) -> Iterator[None]:
         self._queue_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self._queue_path.with_suffix(self._queue_path.suffix + ".lock")
         thread_lock = _process_lock(lock_path)
@@ -973,6 +1005,8 @@ class TaskQueueManager:
             try:
                 lock_file = lock_path.open("a+", encoding="utf-8")
             except OSError:
+                if require_lock:
+                    raise
                 logger.debug("Task queue lock file unavailable for %s", lock_path, exc_info=True)
                 yield
                 return
@@ -984,6 +1018,8 @@ class TaskQueueManager:
                     acquire_file_lock(lock_file, exclusive=True)
                     locked = True
                 except OSError:
+                    if require_lock:
+                        raise
                     logger.debug("OS file lock unavailable for %s", lock_path, exc_info=True)
                 try:
                     yield
