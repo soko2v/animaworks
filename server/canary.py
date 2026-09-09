@@ -14,7 +14,9 @@ import asyncio
 import json
 import os
 import pwd
+import select
 import stat
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -248,3 +250,78 @@ def _create_canary_app(*, probe_supervisor=None) -> FastAPI:
         app.include_router(create_chat_router(), prefix="/api")
     app.add_middleware(_AuthCanaryGate, roots=roots, chat_probe=probe_supervisor is not None)
     return app
+
+
+def _read_authorization_pipe(fd: int) -> str:
+    """Consume a bounded inherited pipe, never a credential file or terminal."""
+    if fd < 3:
+        raise ValueError("Dedicated authorization pipe required")
+    try:
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise ValueError("Dedicated authorization pipe required")
+        os.set_inheritable(fd, False)
+        os.set_blocking(fd, False)
+        raw = bytearray()
+        deadline = time.monotonic() + 5
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                raise ValueError("Authorization pipe unavailable")
+            chunk = os.read(fd, 8193 - len(raw))
+            if not chunk:
+                break
+            raw.extend(chunk)
+            if len(raw) > 8192:
+                raise ValueError("Authorization pipe unavailable")
+        token = raw.decode("ascii")
+        if not token or any(ord(c) <= 32 or ord(c) >= 127 for c in token):
+            raise ValueError("Authorization pipe unavailable")
+        return token
+    except (OSError, UnicodeError):
+        raise ValueError("Authorization pipe unavailable") from None
+    finally:
+        os.close(fd)
+
+
+def main(argv=None) -> int:
+    """Approval-bound direct entry; no resolver, restart, or normal CLI startup.
+
+    An approved operator passes authorization through an inherited anonymous
+    pipe, closes its write end, and supplies only the descriptor number in argv.
+    This does not itself authorize resolving or copying actual credentials.
+    Run with a cleared environment and the isolated HOME/DATA contract above.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Isolated one-shot upgrade canary")
+    for name in ("executable", "probe-home", "probe-cwd", "socket-path"):
+        parser.add_argument("--" + name, required=True, type=Path)
+    parser.add_argument("--authorization-fd", required=True, type=int)
+    parser.add_argument("--port", required=True, type=int)
+    args = parser.parse_args(argv)
+    token = ""
+    try:
+        if not 1024 <= args.port <= 65535:
+            raise ValueError("Invalid port")
+        _validate_roots()
+        token = _read_authorization_pipe(args.authorization_fd)
+        app = create_chat_canary_app(
+            executable=args.executable, probe_home=args.probe_home,
+            probe_cwd=args.probe_cwd, socket_path=args.socket_path, oauth_token=token,
+        )
+        token = ""
+        import uvicorn
+
+        uvicorn.run(app, host="127.0.0.1", port=args.port, workers=1,
+                    reload=False, proxy_headers=False, access_log=False,
+                    log_config=None, log_level="critical", lifespan="on")
+        return 0
+    except (Exception, SystemExit):
+        # Provider/ASGI setup exceptions must not expose authorization or config.
+        return 2
+    finally:
+        token = ""
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

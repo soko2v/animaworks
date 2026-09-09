@@ -50,6 +50,96 @@ def client_for(app, host="127.0.0.1", headers=None):
     )
 
 
+@pytest.mark.parametrize("payload", [b"synthetic-only", b"", b"bad\nvalue", b"x" * 8193, b"\xff"])
+def test_authorization_pipe_consumed_and_bounded(payload):
+    from server.canary import _read_authorization_pipe
+
+    read_fd, write_fd = os.pipe()
+    # Large payload uses a writer thread so pipe capacity cannot deadlock setup.
+    import threading
+
+    def write():
+        try:
+            os.write(write_fd, payload)
+        except BrokenPipeError:
+            pass
+        finally:
+            os.close(write_fd)
+
+    writer = threading.Thread(target=write)
+    writer.start()
+    try:
+        if payload == b"synthetic-only":
+            assert _read_authorization_pipe(read_fd) == "synthetic-only"
+        else:
+            with pytest.raises(ValueError):
+                _read_authorization_pipe(read_fd)
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
+    finally:
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+
+
+def test_authorization_rejects_file_and_stdin(tmp_path):
+    from server.canary import _read_authorization_pipe
+
+    file = tmp_path / "synthetic"
+    file.write_text("synthetic-only")
+    fd = os.open(file, os.O_RDONLY)
+    with pytest.raises(ValueError):
+        _read_authorization_pipe(fd)
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    with pytest.raises(ValueError):
+        _read_authorization_pipe(0)
+
+
+def test_authorization_timeout_does_not_wait_for_eof(monkeypatch):
+    from server.canary import _read_authorization_pipe
+
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr("server.canary.select.select", lambda *args: ([], [], []))
+    try:
+        with pytest.raises(ValueError):
+            _read_authorization_pipe(read_fd)
+    finally:
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_direct_launcher_fixed_listener_and_redaction(canary, monkeypatch, capsys, failure):
+    import server.canary as module
+
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"synthetic-only")
+    os.close(write_fd)
+    app = object()
+    calls = []
+
+    def factory(**kwargs):
+        assert kwargs["oauth_token"] == "synthetic-only"
+        if failure:
+            raise RuntimeError("synthetic-only must not be printed")
+        return app
+
+    monkeypatch.setattr(module, "create_chat_canary_app", factory)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: calls.append((args, kwargs)))
+    result = module.main([
+        "--executable", "/synthetic-cli", "--probe-home", "/synthetic-home",
+        "--probe-cwd", "/synthetic-cwd", "--socket-path", "/synthetic-socket",
+        "--authorization-fd", str(read_fd), "--port", "18502",
+    ])
+    assert result == (2 if failure else 0)
+    if not failure:
+        assert calls == [((app,), dict(host="127.0.0.1", port=18502, workers=1,
+                                      reload=False, proxy_headers=False, access_log=False,
+                                      log_config=None, log_level="critical", lifespan="on"))]
+    else:
+        assert not calls
+    assert "synthetic-only" not in str(capsys.readouterr())
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["success", "failure", "occupied", "overlap"])
 async def test_explicit_chat_factory_lifecycle(canary, case):
