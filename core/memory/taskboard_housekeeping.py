@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from core.memory.task_queue import legacy_execution_hold
 from core.platform.processing_lease import is_processing_lease_live, processing_lease_path
 from core.time_utils import ensure_aware, now_local, today_local
 
@@ -89,6 +90,8 @@ def _cleanup_pending_processing(
                 if not valid_json:
                     unreadable += 1
                 task_id = _task_id_from_payload(payload, path) if valid_json else ""
+                if legacy_execution_hold(anima_dir, task_id or path.stem):
+                    continue
                 target = _move_with_collision(path, failed_dir, collision_label="recovered")
                 lease_path = processing_lease_path(path)
                 if lease_path.exists():

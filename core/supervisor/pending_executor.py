@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 from core.config.resolver import resolve_process_model_config
 from core.exceptions import ToolExecutionError
 from core.i18n import t
+from core.memory.task_queue import legacy_execution_hold
 from core.platform.processing_lease import (
     is_processing_lease_live,
     processing_lease_path,
@@ -42,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 class TaskExecError(RuntimeError):
     """Raised when a TaskExec LLM session encounters a non-recoverable error."""
+
+
+class TaskExecutionHeld(RuntimeError):
+    """Dispatch refused; preserve ledger and processing evidence, not a failure."""
 
 
 _PENDING_WATCHER_POLL_INTERVAL = 3.0
@@ -248,6 +253,8 @@ class PendingTaskExecutor:
         in_progress forever.  Leave it in pending/ and retry on the next poll.
         """
         task_id = str(task_desc.get("task_id") or pending_path.stem).strip()
+        if legacy_execution_hold(self._anima_dir, task_id):
+            return True
         if pending_path.stem != task_id:
             # Non-canonical filename with a duplicated task_id is a genuine
             # duplicate descriptor; let the claim path drop it.
@@ -279,6 +286,9 @@ class PendingTaskExecutor:
     ) -> str | None:
         """Create a lease and register a task id, dropping duplicates."""
         task_id = str(task_desc.get("task_id") or processing_path.stem).strip()
+
+        if legacy_execution_hold(self._anima_dir, task_id):
+            return None
 
         # C-03: refuse re-claim of the same attempt recorded on an existing lease.
         existing = read_processing_lease(processing_path)
@@ -465,6 +475,8 @@ class PendingTaskExecutor:
         from core.execution._sanitize import ORIGIN_ANIMA
 
         task_id, title, _description = _task_activity_identity(task_desc)
+        if legacy_execution_hold(self._anima_dir, task_id):
+            return
         # A queue entry that was already cancelled (e.g. superseded by a newer
         # request) had its runner killed on purpose and nobody is waiting on it.
         entry = self._get_task_queue_entry(task_id)
@@ -536,6 +548,8 @@ class PendingTaskExecutor:
         try:
             from core.memory.task_queue import TaskQueueManager
 
+            if legacy_execution_hold(self._anima_dir, task_id):
+                return
             manager = TaskQueueManager(self._anima_dir)
             entry = manager.get_task_by_id(task_id)
             if entry and entry.status != status and entry.status in _QUEUE_STICKY_STATUSES:
@@ -728,6 +742,9 @@ class PendingTaskExecutor:
                 if not task_id:
                     task_id = orphan.stem
 
+                if legacy_execution_hold(anima_dir, task_id):
+                    continue
+
             try:
                 _unlink_processing_descriptor(orphan)
                 logger.warning("Dropped orphaned processing descriptor: %s", orphan.name)
@@ -770,6 +787,7 @@ class PendingTaskExecutor:
     ) -> None:
         """Run a claimed single LLM task without blocking the coordinator."""
         task_id = str(task_desc.get("task_id") or processing_path.stem).strip()
+        held = False
         touch_task = asyncio.create_task(
             self._touch_processing_descriptor(processing_path),
             name=f"task-touch-{self._anima_name}-{task_id}",
@@ -780,6 +798,8 @@ class PendingTaskExecutor:
                 exec_kwargs["processing_path"] = processing_path
             await self.execute_pending_task(task_desc, **exec_kwargs)
             _unlink_processing_descriptor(processing_path)
+        except TaskExecutionHeld:
+            held = True
         except asyncio.CancelledError:
             if self._shutdown_event.is_set():
                 logger.info(
@@ -822,7 +842,7 @@ class PendingTaskExecutor:
             await asyncio.gather(touch_task, return_exceptions=True)
             # A replacement root must see a still-live isolated child; removing
             # its lease here allowed restart recovery to dispatch the same task.
-            if not (self._shutdown_event.is_set() and processing_path.exists()):
+            if not held and not (self._shutdown_event.is_set() and processing_path.exists()):
                 _remove_processing_lease(processing_path)
             self._active_task_ids.discard(task_id)
             # A pre-leased slot is normally released by _execute_llm_task.  If
@@ -958,6 +978,7 @@ class PendingTaskExecutor:
                     if claimed_task_id is None:
                         continue
                     claim_transferred = False
+                    held = False
                     try:
                         logger.info(
                             "Picked up pending task: id=%s tool=%s subcmd=%s anima=%s",
@@ -979,6 +1000,8 @@ class PendingTaskExecutor:
                             claim_transferred = True
                         else:
                             _unlink_processing_descriptor(processing_path)
+                    except TaskExecutionHeld:
+                        held = True
                     except Exception:
                         logger.exception(
                             "Error processing pending task file: %s",
@@ -988,7 +1011,8 @@ class PendingTaskExecutor:
                     finally:
                         if not claim_transferred:
                             self._active_task_ids.discard(claimed_task_id)
-                            _remove_processing_lease(processing_path)
+                            if not held:
+                                _remove_processing_lease(processing_path)
 
                 # Scan LLM pending tasks — group batch tasks, execute serial ones
                 for path in self._order_pending_claims(list(llm_pending_dir.glob("*.json"))):
@@ -1313,6 +1337,8 @@ class PendingTaskExecutor:
     ) -> str:
         """Run one LLM task under a worker lease."""
         task_id = task_desc.get("task_id", "unknown")
+        if legacy_execution_hold(self._anima_dir, task_id):
+            raise TaskExecutionHeld("Legacy execution hold; explicit release not implemented")
         leased_here = worker_slot is None
         slot = worker_slot or await self._acquire_worker(task_id)
         try:
@@ -1832,6 +1858,8 @@ class PendingTaskExecutor:
 
         Routes by task_type: 'llm' → _execute_llm_task, else command subprocess.
         """
+        if legacy_execution_hold(self._anima_dir, str(task_desc.get("task_id") or "")):
+            raise TaskExecutionHeld("Legacy execution hold; explicit release not implemented")
         task_type = task_desc.get("task_type", "command")
 
         if task_type == "llm":

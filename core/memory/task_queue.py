@@ -95,6 +95,37 @@ def _compat_status(status: str, task_id: str) -> str:
     return status
 
 
+def legacy_execution_hold(anima_dir: Path, task_id: str) -> bool:
+    """Fence legacy holds without the display layer's pending conversion.
+
+    A later pending update is NOT approval. There is intentionally no release
+    API yet. Unreadable/corrupt existing ledgers are held conservatively.
+    Absent ledgers retain upstream support for unregistered legacy commands;
+    this compatibility fence is not a complete execution authorization gate.
+    """
+    path = anima_dir / "state" / "task_queue.jsonl"
+    if path.is_symlink():
+        return True
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError):
+        return True
+    try:
+        for line in content.splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                return True
+            if row.get("task_id") == task_id and row.get("status") in ("blocked", "failed"):
+                return True
+    except (ValueError, TypeError):
+        return True
+    return False
+
+
 def _descriptor_ids(anima_dir: Path) -> set[str]:
     """Return the set of task_ids that have a pending descriptor file.
 
