@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.supervisor.canary import CanaryChatSession, CanaryIPCService
+from core.supervisor.canary import CanaryChatSession, CanaryIPCService, ClaudeTextProbe
 from core.supervisor.ipc import IPCRequest
 
 
@@ -22,6 +22,110 @@ def request(**changes):
     }
     params.update(changes)
     return IPCRequest(id="synthetic", method="process_message", params=params)
+
+
+@pytest.fixture
+def cli_probe(tmp_path):
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    home.mkdir(mode=0o700)
+    cwd.mkdir(mode=0o700)
+    executable = tmp_path / "synthetic-cli"
+    executable.write_text("#!/bin/sh\nexit 1\n")
+    executable.chmod(0o700)
+    return ClaudeTextProbe(executable, home, cwd, oauth_token="synthetic-not-a-credential")
+
+
+def test_cli_exact_toolless_spec_and_no_ambient_env(cli_probe, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-must-not-leak")
+    monkeypatch.setenv("NODE_OPTIONS", "untrusted")
+    args, env = cli_probe._launch_spec()
+    assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--mcp-config") + 1] == '{"mcpServers":{}}'
+    assert "--strict-mcp-config" in args and "--disable-slash-commands" in args
+    assert args[args.index("--setting-sources") + 1] == ""
+    assert args[args.index("--settings") + 1] == '{"disableAllHooks":true}'
+    assert args[args.index("--max-turns") + 1] == "1"
+    assert "--fallback-model" not in args and "--resume" not in args
+    assert env["CLAUDE_CODE_MAX_RETRIES"] == "0"
+    assert "ANTHROPIC_API_KEY" not in env and "NODE_OPTIONS" not in env
+    assert cli_probe._token not in " ".join(args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [False, True])
+async def test_real_synthetic_cli_one_shot(cli_probe, bad):
+    import json
+
+    result = {"type": "result", "subtype": "success", "is_error": False,
+              "num_turns": 1, "result": "CANARY_OK", "permission_denials": []}
+    if bad:
+        result["permission_denials"] = [{"tool": "Bash"}]
+    cli_probe.executable.write_text("#!/bin/sh\ncat >/dev/null\nprintf '%s' '" + json.dumps(result) + "'\n")
+    if bad:
+        with pytest.raises(ValueError, match="Canary admission closed"):
+            await cli_probe("Reply with CANARY_OK only.")
+    else:
+        assert await cli_probe("Reply with CANARY_OK only.") == "CANARY_OK"
+    assert cli_probe._token == ""
+    with pytest.raises(ValueError):
+        await cli_probe("Reply with CANARY_OK only.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["public_home", "nonempty_cwd", "linked_cli", "public_cli"])
+async def test_cli_rejects_unsafe_roots_before_spawn(cli_probe, kind, monkeypatch):
+    if kind == "public_home":
+        cli_probe.home.chmod(0o755)
+    elif kind == "nonempty_cwd":
+        (cli_probe.cwd / ".mcp.json").write_text("{}")
+    elif kind == "public_cli":
+        cli_probe.executable.chmod(0o777)
+    else:
+        link = cli_probe.executable.with_name("link")
+        link.symlink_to(cli_probe.executable)
+        cli_probe.executable = link
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(ValueError):
+        await cli_probe("Reply with CANARY_OK only.")
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cli_cancel_during_spawn_reaps_owned_process(cli_probe, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+    process = SimpleNamespace(pid=123456789, returncode=None, wait=AsyncMock(return_value=-9))
+
+    async def spawn(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return process
+
+    kills = []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: kills.append(pid))
+    task = asyncio.create_task(cli_probe("Reply with CANARY_OK only."))
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert kills == [process.pid]
+    process.wait.assert_awaited_once()
+    assert cli_probe._token == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("script", [
+    "printf 'not-json'", "printf '[]'", "exit 1",
+    "dd if=/dev/zero bs=4096 count=20 2>/dev/null",
+])
+async def test_cli_errors_bounded_and_never_retried(cli_probe, script):
+    cli_probe.executable.write_text("#!/bin/sh\ncat >/dev/null\n" + script + "\n")
+    for _ in range(2):
+        with pytest.raises(ValueError, match="Canary admission closed"):
+            await cli_probe("Reply with CANARY_OK only.")
 
 
 @pytest.mark.asyncio

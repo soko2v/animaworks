@@ -9,14 +9,126 @@ constructed here. The spent latch is deliberately not reset after any outcome.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pwd
+import signal
 import socket
 import stat
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from core.supervisor.ipc import IPCRequest, IPCResponse, IPCServer
+
+
+class ClaudeTextProbe:
+    """Single explicit CLI call; not a public launcher or credential resolver.
+
+    Only use with operator-approved isolated credentials after critical review.
+    The executable and managed machine policy remain trusted. CLI flag acceptance
+    is not proof of native behavior; actual tool/retry acceptance is still needed.
+    No normal executor, SDK auth retry, fallback, or inherited environment is used.
+    """
+
+    def __init__(self, executable: Path, home: Path, cwd: Path, *, oauth_token: str) -> None:
+        self.executable, self.home, self.cwd = executable, home, cwd
+        # Obtain only via the approved resolver. Never persist, log or put in argv.
+        if not isinstance(oauth_token, str) or not oauth_token or "\x00" in oauth_token:
+            raise ValueError("Explicit resolved probe authorization required")
+        self._token = oauth_token
+        self._spent = False
+
+    def _launch_spec(self) -> tuple[list[str], dict[str, str]]:
+        production = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".animaworks"
+        for path in (self.home, self.cwd):
+            info = path.lstat()
+            if (
+                not path.is_absolute() or path.resolve() != path
+                or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or path == production
+                or production in path.parents or path in production.parents
+                or any(path.iterdir())
+            ):
+                raise ValueError("Empty private isolated probe directories required")
+        if self.home == self.cwd or self.home in self.cwd.parents or self.cwd in self.home.parents:
+            raise ValueError("Separate probe directories required")
+        info = self.executable.lstat()
+        if (
+            not self.executable.is_absolute() or self.executable.resolve() != self.executable
+            or not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
+            or info.st_mode & 0o022 or not os.access(self.executable, os.X_OK)
+        ):
+            raise ValueError("Trusted absolute probe executable required")
+        argv = [
+            str(self.executable), "--print", "--output-format", "json",
+            "--model", "claude-fable-5-1", "--max-turns", "1",
+            "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
+            "--disable-slash-commands", "--no-session-persistence",
+            "--permission-mode", "dontAsk", "--system-prompt", "Reply with CANARY_OK only.",
+        ]
+        # In particular, never inherit proxy/base URL, NODE_OPTIONS, telemetry,
+        # API keys, plugins, provider selection, or normal Anima data paths.
+        env = {
+            "PATH": "/usr/bin:/bin", "HOME": str(self.home),
+            "CLAUDE_CONFIG_DIR": str(self.home),
+            "CLAUDE_CODE_MAX_RETRIES": "0", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "DISABLE_AUTOUPDATER": "1", "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1",
+            "CLAUDE_CODE_OAUTH_TOKEN": self._token,
+        }
+        return argv, env
+
+    async def __call__(self, message: str) -> str:
+        if self._spent or message != "Reply with CANARY_OK only.":
+            raise ValueError("Canary admission closed")
+        self._spent = True
+        process = None
+        try:
+            argv, env = self._launch_spec()
+            async with asyncio.timeout(50):
+                spawning = asyncio.create_task(asyncio.create_subprocess_exec(
+                    *argv, cwd=self.cwd, env=env, start_new_session=True,
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL, limit=65536,
+                ))
+                try:
+                    process = await asyncio.shield(spawning)
+                except asyncio.CancelledError:
+                    # Do not lose ownership if cancellation races process creation.
+                    process = await spawning
+                    raise
+                process.stdin.write(message.encode())
+                await process.stdin.drain()
+                process.stdin.close()
+                raw = bytearray()
+                while chunk := await process.stdout.read(4096):
+                    raw.extend(chunk)
+                    if len(raw) > 65536:
+                        raise ValueError("Probe output limit")
+                code = await process.wait()
+                result = json.loads(raw)
+                if (
+                    code != 0 or not isinstance(result, dict)
+                    or result.get("type") != "result" or result.get("subtype") != "success"
+                    or result.get("is_error") is not False
+                    or type(result.get("num_turns")) is not int or result["num_turns"] != 1
+                    or result.get("result") != "CANARY_OK"
+                    or result.get("permission_denials") != []
+                ):
+                    raise ValueError("Probe unsuccessful")
+                return "CANARY_OK"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ValueError("Canary admission closed") from None
+        finally:
+            self._token = ""
+            if process is not None and process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.wait()
 
 
 class CanaryChatSession:
