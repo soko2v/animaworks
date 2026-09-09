@@ -21,6 +21,10 @@ from pathlib import Path
 from core.supervisor.ipc import IPCRequest, IPCResponse, IPCServer
 
 
+class CanaryCleanupUnverified(ValueError):
+    """Fatal ownership failure; never convert into a clean terminal verdict."""
+
+
 class ClaudeTextProbe:
     """Single explicit CLI call; not a public launcher or credential resolver.
 
@@ -37,6 +41,7 @@ class ClaudeTextProbe:
             raise ValueError("Explicit resolved probe authorization required")
         self._token = oauth_token
         self._spent = False
+        self.cleanup_unverified = False
 
     def _launch_spec(self) -> tuple[list[str], dict[str, str]]:
         production = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".animaworks"
@@ -124,6 +129,7 @@ class ClaudeTextProbe:
         finally:
             self._token = ""
             if process is not None:
+                self.cleanup_unverified = True
                 try:
                     # A successful/reaped group leader may leave live children.
                     # This group belongs to our start_new_session child, not the
@@ -133,12 +139,13 @@ class ClaudeTextProbe:
                     pass
                 except OSError:
                     # Never report a clean shutdown if the host denies cleanup.
-                    raise ValueError("Canary cleanup unverified") from None
+                    raise CanaryCleanupUnverified("Canary cleanup unverified") from None
                 try:
                     async with asyncio.timeout(5):
                         await process.wait()
                 except TimeoutError:
-                    raise ValueError("Canary cleanup unverified") from None
+                    raise CanaryCleanupUnverified("Canary cleanup unverified") from None
+                self.cleanup_unverified = False
 
 
 class CanaryChatSession:
@@ -151,6 +158,8 @@ class CanaryChatSession:
     def __init__(self, complete: Callable[[str], Awaitable[str]]) -> None:
         self._complete = complete
         self._spent = False
+        self.succeeded = False
+        self.cleanup_unverified = False
 
     async def handle(self, request: IPCRequest) -> IPCResponse:
         denied = IPCResponse(id=request.id, error={"code": "canary_closed", "message": "Canary admission closed"})
@@ -169,7 +178,11 @@ class CanaryChatSession:
                 result = await self._complete(expected["message"])
             if not isinstance(result, str) or result.strip() != "CANARY_OK":
                 return denied
+            self.succeeded = True
             return IPCResponse(id=request.id, result={"response": "CANARY_OK"})
+        except CanaryCleanupUnverified:
+            self.cleanup_unverified = True
+            return denied
         except asyncio.CancelledError:
             # Disconnect/cancellation does not authorize another provider call.
             raise
@@ -189,12 +202,24 @@ class CanaryIPCService:
 
     def __init__(self, path: Path, complete: Callable[[str], Awaitable[str]]) -> None:
         self.path = path
-        self._ipc = IPCServer(path, CanaryChatSession(complete).handle)
+        self._complete = complete
+        self._session = CanaryChatSession(complete)
+        self._ipc = IPCServer(path, self._session.handle)
         self._server: asyncio.Server | None = None
         self._connections: set[asyncio.Task] = set()
+        self._writers: set[asyncio.StreamWriter] = set()
         self._identity: tuple[int, int] | None = None
         self._started = False
         self._closed = False
+        self._stopped_clean = False
+
+    def passed(self) -> bool:
+        return self._stopped_clean and self._session.succeeded and not self._cleanup_failed()
+
+    def _cleanup_failed(self) -> bool:
+        return self._session.cleanup_unverified or (
+            isinstance(self._complete, ClaudeTextProbe) and self._complete.cleanup_unverified
+        )
 
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -203,10 +228,12 @@ class CanaryIPCService:
             await writer.wait_closed()
             return
         self._connections.add(task)
+        self._writers.add(writer)
         try:
             await self._ipc._handle_connection(reader, writer)
         finally:
             self._connections.discard(task)
+            self._writers.discard(writer)
 
     async def start(self) -> None:
         if self._started or self._closed:
@@ -244,6 +271,10 @@ class CanaryIPCService:
         if self._server is not None:
             self._server.close()
         tasks = list(self._connections)
+        # Close before cancellation: a provider may translate cancellation into
+        # a redacted response, but the IPC loop must not await another peer line.
+        for writer in list(self._writers):
+            writer.close()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -258,3 +289,6 @@ class CanaryIPCService:
             except FileNotFoundError:
                 pass
             self._identity = None
+        if self._cleanup_failed():
+            raise CanaryCleanupUnverified("Canary cleanup unverified")
+        self._stopped_clean = True

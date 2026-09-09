@@ -218,11 +218,15 @@ def create_chat_canary_app(*, executable: Path, probe_home: Path, probe_cwd: Pat
             yield
         finally:
             supervisor.active = False
-            await service.stop()
-            probe._token = ""
+            try:
+                await ipc.close()
+                await service.stop()
+            finally:
+                probe._token = ""
 
     app = _create_canary_app(probe_supervisor=supervisor)
     app.router.lifespan_context = lifespan
+    app.state.canary_passed = service.passed
     return app
 
 
@@ -315,7 +319,9 @@ def main(argv=None) -> int:
         uvicorn.run(app, host="127.0.0.1", port=args.port, workers=1,
                     reload=False, proxy_headers=False, access_log=False,
                     log_config=None, log_level="critical", lifespan="on")
-        return 0
+        # Uvicorn can return normally after lifespan failure. Require the
+        # explicit chat-success AND clean-shutdown verdict, not its return.
+        return 0 if app.state.canary_passed() else 2
     except (Exception, SystemExit):
         # Provider/ASGI setup exceptions must not expose authorization or config.
         return 2

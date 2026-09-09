@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.supervisor.canary import CanaryChatSession, CanaryIPCService, ClaudeTextProbe
+from core.supervisor.canary import CanaryChatSession, CanaryCleanupUnverified, CanaryIPCService, ClaudeTextProbe
 from core.supervisor.ipc import IPCRequest
 
 
@@ -49,6 +49,55 @@ def test_cli_exact_toolless_spec_and_no_ambient_env(cli_probe, monkeypatch):
     assert env["CLAUDE_CODE_MAX_RETRIES"] == "0"
     assert "ANTHROPIC_API_KEY" not in env and "NODE_OPTIONS" not in env
     assert cli_probe._token not in " ".join(args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_cancel", [False, True])
+async def test_cleanup_denial_is_fatal_and_stop_does_not_wait_for_peer(cli_probe, monkeypatch, during_cancel):
+    import json
+
+    entered = asyncio.Event()
+    reply = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                        "num_turns": 1, "result": "CANARY_OK", "permission_denials": []}).encode()
+    chunks = [reply, b""]
+
+    async def read(n):
+        entered.set()
+        if during_cancel:
+            await asyncio.Event().wait()
+        return chunks.pop(0)
+
+    process = SimpleNamespace(pid=123456789,
+        stdin=SimpleNamespace(write=lambda b: None, drain=AsyncMock(), close=lambda: None),
+        stdout=SimpleNamespace(read=read), wait=AsyncMock(return_value=0))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+
+    def denied(*args):
+        raise PermissionError("synthetic-secret")
+
+    monkeypatch.setattr(os, "killpg", denied)
+    with tempfile.TemporaryDirectory(prefix="aw-fatal-", dir="/tmp") as directory:
+        service = CanaryIPCService(Path(directory).resolve() / "p.sock", cli_probe)
+        await service.start()
+        reader, writer = await asyncio.open_unix_connection(service.path)
+        try:
+            writer.write((request().to_json() + "\n").encode())
+            await writer.drain()
+            await asyncio.wait_for(entered.wait(), 3)
+            if not during_cancel:
+                response = await asyncio.wait_for(reader.readline(), 3)
+                assert b"canary_closed" in response and b"synthetic-secret" not in response
+            with pytest.raises(CanaryCleanupUnverified):
+                await asyncio.wait_for(service.stop(), 3)
+            assert cli_probe.cleanup_unverified and cli_probe._token == ""
+            assert not service.passed() and not service._connections
+            assert not service.path.exists()
+            assert await asyncio.wait_for(reader.read(), 3) == b""
+            with pytest.raises(CanaryCleanupUnverified):
+                await service.stop()
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
 
 @pytest.mark.asyncio

@@ -107,19 +107,21 @@ def test_authorization_timeout_does_not_wait_for_eof(monkeypatch):
         os.close(write_fd)
 
 
-@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("failure", [False, True, "no_verdict"])
 def test_direct_launcher_fixed_listener_and_redaction(canary, monkeypatch, capsys, failure):
     import server.canary as module
 
     read_fd, write_fd = os.pipe()
     os.write(write_fd, b"synthetic-only")
     os.close(write_fd)
-    app = object()
+    from types import SimpleNamespace
+
+    app = SimpleNamespace(state=SimpleNamespace(canary_passed=lambda: failure is False))
     calls = []
 
     def factory(**kwargs):
         assert kwargs["oauth_token"] == "synthetic-only"
-        if failure:
+        if failure is True:
             raise RuntimeError("synthetic-only must not be printed")
         return app
 
@@ -131,7 +133,7 @@ def test_direct_launcher_fixed_listener_and_redaction(canary, monkeypatch, capsy
         "--authorization-fd", str(read_fd), "--port", "18502",
     ])
     assert result == (2 if failure else 0)
-    if not failure:
+    if failure is not True:
         assert calls == [((app,), dict(host="127.0.0.1", port=18502, workers=1,
                                       reload=False, proxy_headers=False, access_log=False,
                                       log_config=None, log_level="critical", lifespan="on"))]
@@ -173,6 +175,7 @@ async def test_explicit_chat_factory_lifecycle(canary, case):
             assert endpoint.read_text() == "preserve"
         else:
             assert not endpoint.exists()
+            assert not app.state.canary_passed()
             async with app.router.lifespan_context(app):
                 assert endpoint.is_socket()
                 async with client_for(app) as client:
@@ -188,6 +191,7 @@ async def test_explicit_chat_factory_lifecycle(canary, case):
                     })).status_code == 503
                     assert (await client.get("/health")).json()["ready"] is False
             assert not endpoint.exists()
+            assert app.state.canary_passed() is (case == "success")
         with pytest.raises(ValueError, match="already consumed"):
             async with app.router.lifespan_context(app):
                 pytest.fail("Must not restart")
