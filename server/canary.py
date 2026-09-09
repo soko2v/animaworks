@@ -15,6 +15,7 @@ import json
 import os
 import pwd
 import stat
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -155,6 +156,72 @@ class _AuthCanaryGate:
 def create_auth_canary_app() -> FastAPI:
     """Authentication-only preparation; no model/runner or release endpoint."""
     return _create_canary_app()
+
+
+def create_chat_canary_app(*, executable: Path, probe_home: Path, probe_cwd: Path,
+                           socket_path: Path, oauth_token: str) -> FastAPI:
+    """Explicit, approval-bound bootstrap; never call through normal serve.
+
+    Authorization must be supplied in memory by an approved resolver, not CLI
+    arguments or a token file. Construction does not call the model. One app
+    lifespan only; no automatic restart/retry or normal supervisor is created.
+    This factory is not authorization to obtain production credentials.
+    """
+    from core.supervisor.canary import CanaryIPCService, ClaudeTextProbe
+    from core.supervisor.ipc import IPCClient, IPCRequest
+
+    roots = _validate_roots()
+    paths = [*roots, probe_home.resolve(), probe_cwd.resolve(), socket_path.parent.resolve()]
+    production = Path(os.environ["ANIMAWORKS_CANARY_PRODUCTION_ROOT"]).resolve()
+    if any(_overlaps(p, production) for p in paths):
+        raise ValueError("Probe overlaps production")
+    if any(_overlaps(a, b) for i, a in enumerate(paths) for b in paths[i + 1:]):
+        raise ValueError("Separate canary directories required")
+    probe = ClaudeTextProbe(executable, probe_home, probe_cwd, oauth_token=oauth_token)
+    probe._launch_spec()  # Validate without starting a process or exposing the spec.
+    service = CanaryIPCService(socket_path, probe)
+    ipc = IPCClient(socket_path)
+
+    class ProbeSupervisor:
+        active = False
+
+        def is_bootstrapping(self, name):
+            return not self.active or name != "h2-canary"
+
+        async def send_request(self, *, anima_name, method, params, timeout):
+            if not self.active or anima_name != "h2-canary":
+                raise RuntimeError("Canary admission closed")
+            try:
+                result = await ipc.send_request(IPCRequest("probe", method, params), timeout=65)
+                if result.error:
+                    raise ValueError("Canary admission closed")
+                return result.result
+            except Exception:
+                raise RuntimeError("Canary admission closed") from None
+
+    supervisor = ProbeSupervisor()
+    consumed = False
+
+    @asynccontextmanager
+    async def lifespan(app):
+        nonlocal consumed
+        if consumed:
+            raise ValueError("Canary launch already consumed")
+        consumed = True
+        try:
+            if _validate_roots() != roots:
+                raise ValueError("Canary roots changed")
+            await service.start()
+            supervisor.active = True
+            yield
+        finally:
+            supervisor.active = False
+            await service.stop()
+            probe._token = ""
+
+    app = _create_canary_app(probe_supervisor=supervisor)
+    app.router.lifespan_context = lifespan
+    return app
 
 
 def _create_canary_app(*, probe_supervisor=None) -> FastAPI:

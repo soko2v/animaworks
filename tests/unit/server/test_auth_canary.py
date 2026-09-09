@@ -51,6 +51,59 @@ def client_for(app, host="127.0.0.1", headers=None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["success", "failure", "occupied", "overlap"])
+async def test_explicit_chat_factory_lifecycle(canary, case):
+    from server.canary import create_chat_canary_app
+
+    root = canary[0].parent
+    home, cwd = root / "probe-home", root / "probe-cwd"
+    home.mkdir(mode=0o700)
+    cwd.mkdir(mode=0o700)
+    executable = root / "synthetic-cli"
+    reply = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                        "num_turns": 1, "result": "CANARY_OK", "permission_denials": []})
+    executable.write_text("#!/bin/sh\ncat >/dev/null\nprintf '%s' '" + reply + "'\n"
+                          + ("exit 1\n" if case == "failure" else ""))
+    executable.chmod(0o700)
+    with tempfile.TemporaryDirectory(prefix="aw-f-", dir="/tmp") as directory:
+        endpoint = Path(directory).resolve() / "probe.sock"
+        if case == "occupied":
+            endpoint.write_text("preserve")
+        if case == "overlap":
+            with pytest.raises(ValueError, match="Separate"):
+                create_chat_canary_app(executable=executable, probe_home=canary[0],
+                                       probe_cwd=cwd, socket_path=endpoint, oauth_token="synthetic")
+            return
+        app = create_chat_canary_app(executable=executable, probe_home=home,
+                                    probe_cwd=cwd, socket_path=endpoint, oauth_token="synthetic")
+        if case == "occupied":
+            with pytest.raises(ValueError, match="already exists"):
+                async with app.router.lifespan_context(app):
+                    pytest.fail("Existing endpoint must not be adopted")
+            assert endpoint.read_text() == "preserve"
+        else:
+            assert not endpoint.exists()
+            async with app.router.lifespan_context(app):
+                assert endpoint.is_socket()
+                async with client_for(app) as client:
+                    assert (await client.post("/api/auth/login", json={
+                        "username": "operator", "password": "synthetic-password",
+                    })).status_code == 200
+                    response = await client.post("/api/animas/h2-canary/chat", json={
+                        "message": "Reply with CANARY_OK only.",
+                    })
+                    assert response.status_code == (200 if case == "success" else 500)
+                    assert (await client.post("/api/animas/h2-canary/chat", json={
+                        "message": "Reply with CANARY_OK only.",
+                    })).status_code == 503
+                    assert (await client.get("/health")).json()["ready"] is False
+            assert not endpoint.exists()
+        with pytest.raises(ValueError, match="already consumed"):
+            async with app.router.lifespan_context(app):
+                pytest.fail("Must not restart")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["success", "parallel", "provider_error", "cancelled", "native_cli"])
 async def test_authenticated_route_real_ipc_one_shot(canary, outcome):
     """Real synthetic password session and Unix IPC, no real provider."""
