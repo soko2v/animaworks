@@ -64,6 +64,68 @@ async def test_legacy_hold_stops_dispatch(tmp_path, legacy_status, as_update, ta
     anima.agent.background_manager.submit.assert_not_called()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["child", "low_level", "core", "serial", "parallel"])
+@pytest.mark.parametrize("status", ["blocked", "failed"])
+async def test_child_and_batch_hold_boundaries(tmp_path, route, status):
+    from core.supervisor.task_runner import execute_task_contract
+
+    state = tmp_path / "state"
+    state.mkdir()
+    ledger = state / "task_queue.jsonl"
+    ledger.write_text(json.dumps({"task_id": "task", "status": status}) + "\n")
+    before = ledger.read_bytes()
+    anima = MagicMock(name="synthetic")
+    anima.name = "synthetic"
+    anima.anima_dir = tmp_path
+    anima._active_parallel_tasks = {}
+    executor = PendingTaskExecutor(anima=anima, anima_name="synthetic",
+                                   anima_dir=tmp_path, shutdown_event=asyncio.Event())
+    executor._save_task_result = MagicMock()
+    executor._handle_goal_completion = AsyncMock()
+    desc = {"task_id": "task", "task_type": "llm"}
+    if route == "child":
+        result = await execute_task_contract(anima, desc)
+        assert result == {"task_type": "llm", "result": "", "success": False, "execution_held": True}
+    else:
+        with pytest.raises(TaskExecutionHeld):
+            if route == "low_level":
+                await executor._run_llm_task(desc)
+            elif route == "core":
+                await executor._run_llm_task_under_agent_session_context(desc)
+            elif route == "serial":
+                await executor._execute_serial_batch_task(desc, {}, "batch")
+            else:
+                await executor._execute_parallel_task(desc, {}, "batch")
+    executor._save_task_result.assert_not_called()
+    executor._handle_goal_completion.assert_not_awaited()
+    anima.agent.run_cycle_streaming.assert_not_called()
+    assert anima._active_parallel_tasks == {}
+    assert ledger.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_child_hold_wire_retains_claimed_evidence(tmp_path):
+    state = tmp_path / "state"
+    processing = state / "pending/processing"
+    processing.mkdir(parents=True)
+    (state / "task_queue.jsonl").write_text(json.dumps({"task_id": "task", "status": "pending"}) + "\n")
+    desc = {"task_id": "task", "task_type": "llm"}
+    path = processing / "task.json"
+    path.write_text(json.dumps(desc))
+    processing_lease_path(path).write_text('{"evidence":"held child"}')
+    before = {p: p.read_bytes() for p in state.rglob("*") if p.is_file()}
+    executor = PendingTaskExecutor(anima=MagicMock(), anima_name="synthetic",
+                                   anima_dir=tmp_path, shutdown_event=asyncio.Event())
+    executor._task_runner_supervisor = MagicMock()
+    executor._task_runner_supervisor.run_task = AsyncMock(return_value={
+        "task_type": "llm", "success": False, "result": "", "execution_held": True})
+    executor._execute_llm_task = executor._run_llm_task_isolated
+    await executor._execute_claimed_llm_task(desc, path, None)
+    executor._task_runner_supervisor.run_task.assert_awaited_once()
+    assert {p: p.read_bytes() for p in state.rglob("*") if p.is_file()} == before
+
+
 @pytest.mark.parametrize("caller", ["executor", "callback", "housekeeping"])
 @pytest.mark.parametrize("status", ["blocked", "failed"])
 def test_dead_lease_does_not_release_hold(tmp_path, caller, status):

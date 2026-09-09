@@ -208,6 +208,7 @@ async def execute_task_contract(anima: DigitalAnima, task_desc: dict[str, Any]) 
     from core.supervisor.pending_executor import (
         _NON_COMPLETING_SENTINELS,
         PendingTaskExecutor,
+        TaskExecutionHeld,
     )
 
     shutdown = asyncio.Event()
@@ -220,7 +221,12 @@ async def execute_task_contract(anima: DigitalAnima, task_desc: dict[str, Any]) 
     completed_results = task_desc.get("_completed_results")
     if not isinstance(completed_results, dict):
         completed_results = None
-    result = await executor._run_llm_task(task_desc, completed_results)
+    try:
+        result = await executor._run_llm_task(task_desc, completed_results)
+    except TaskExecutionHeld:
+        # Transport the hold as a distinct outcome, never as success or a
+        # generic child crash that root recovery could interpret as retryable.
+        return {"task_type": "llm", "result": "", "success": False, "execution_held": True}
     return {
         "task_type": "llm",
         "result": result,

@@ -1377,6 +1377,8 @@ class PendingTaskExecutor:
 
         task_id, title, _description = _task_activity_identity(task_desc)
         submitted_by = str(task_desc.get("submitted_by") or "unknown")
+        if legacy_execution_hold(self._anima_dir, task_id):
+            raise TaskExecutionHeld("Legacy execution hold; explicit release not implemented")
         trigger = f"task:{task_id}"
         task_meta = {
             "task_id": task_id,
@@ -1522,6 +1524,8 @@ class PendingTaskExecutor:
         Returns the result summary string.
         """
         task_id, title, description = _task_activity_identity(task_desc)
+        if legacy_execution_hold(self._anima_dir, task_id):
+            raise TaskExecutionHeld("Legacy execution hold; explicit release not implemented")
         context = task_desc.get("context", "")
         acceptance_criteria = task_desc.get("acceptance_criteria", [])
         constraints = task_desc.get("constraints", [])
@@ -2162,6 +2166,8 @@ class PendingTaskExecutor:
                 "May have PARTIALLY EXECUTED; verify actual completion state before re-delegating."
             ) from exc
 
+        if isolated.get("execution_held") is True:
+            raise TaskExecutionHeld("Child execution held; retain processing evidence")
         result = isolated.get("result")
         if not isinstance(result, str):
             result = str(result) if result is not None else ""
