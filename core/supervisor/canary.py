@@ -128,6 +128,9 @@ class ClaudeTextProbe:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except OSError:
+                    # Never report a clean shutdown if the host denies cleanup.
+                    raise ValueError("Canary cleanup unverified") from None
                 await process.wait()
 
 

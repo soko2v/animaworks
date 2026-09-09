@@ -119,13 +119,26 @@ async def test_cli_cancel_during_spawn_reaps_owned_process(cli_probe, monkeypatc
 @pytest.mark.asyncio
 @pytest.mark.parametrize("script", [
     "printf 'not-json'", "printf '[]'", "exit 1",
-    "dd if=/dev/zero bs=4096 count=20 2>/dev/null",
 ])
 async def test_cli_errors_bounded_and_never_retried(cli_probe, script):
     cli_probe.executable.write_text("#!/bin/sh\ncat >/dev/null\n" + script + "\n")
     for _ in range(2):
         with pytest.raises(ValueError, match="Canary admission closed"):
             await cli_probe("Reply with CANARY_OK only.")
+
+
+@pytest.mark.asyncio
+async def test_cli_oversized_output_reports_cleanup_denial(cli_probe, monkeypatch):
+    # Synthetic denial must stay distinguishable from verified termination.
+    cli_probe.executable.write_text("#!/bin/sh\ncat >/dev/null\ndd if=/dev/zero bs=4096 count=20 2>/dev/null\n")
+
+    def denied(*args):
+        raise PermissionError("synthetic cleanup denial")
+
+    monkeypatch.setattr(os, "killpg", denied)
+    with pytest.raises(ValueError, match="Canary (cleanup unverified|admission closed)"):
+        await cli_probe("Reply with CANARY_OK only.")
+    assert cli_probe._token == ""
 
 
 @pytest.mark.asyncio
