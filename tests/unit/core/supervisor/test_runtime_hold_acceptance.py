@@ -241,6 +241,56 @@ async def test_batch_watcher_retains_unfinished_evidence(tmp_path, parallel, out
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("prior_state", ["in_progress", "done"])
+async def test_split_batch_without_durable_hold_preserves_unknown_dependency(tmp_path, parallel, prior_state):
+    manager = TaskQueueManager(tmp_path)
+    manager.add_task(source="human", original_instruction="synthetic", assignee="synthetic",
+                     summary="synthetic", task_id="previous-root")
+    manager.update_status("previous-root", status=prior_state)
+    # A failed write leaves no hold event. Even a stale done display/result is
+    # not attempt-scoped completion evidence for this later arrival.
+    with patch.object(manager, "_append_unlocked", side_effect=OSError("zero bytes")):
+        with pytest.raises(OSError):
+            manager.record_execution_holds({"previous-root"})
+    assert not legacy_execution_hold(tmp_path, "previous-root")
+    tasks = [{"task_id": "child", "depends_on": ["previous-root"], "parallel": parallel},
+             {"task_id": "grandchild", "depends_on": ["child"], "parallel": parallel},
+             {"task_id": "independent", "parallel": parallel}]
+    processing = tmp_path / "state/pending/processing"
+    processing.mkdir(parents=True)
+    for td in tasks[:2]:
+        path = processing / (td["task_id"] + ".json")
+        path.write_text(json.dumps(td))
+        processing_lease_path(path).write_text('{"synthetic":"claim"}')
+    results = tmp_path / "state/task_results"
+    results.mkdir()
+    (results / "previous-root.md").write_text("stale success")
+    before = {p: p.read_bytes() for p in processing.iterdir()}
+    ledger_before = manager.queue_path.read_bytes()
+    for _ in range(2):
+        executor = PendingTaskExecutor(anima=MagicMock(), anima_name="synthetic", anima_dir=tmp_path,
+                                       shutdown_event=asyncio.Event())
+        executor._execute_parallel_task = AsyncMock(return_value="ok")
+        executor._execute_serial_batch_task = AsyncMock(return_value="ok")
+        executor._return_task_to_pending = MagicMock()
+        assert await executor._dispatch_batch("later-arrival", tasks) == {"independent"}
+        calls = (executor._execute_parallel_task.await_args_list +
+                 executor._execute_serial_batch_task.await_args_list)
+        assert [call.args[0]["task_id"] for call in calls] == ["independent"]
+        executor._return_task_to_pending.assert_not_called()
+        executor._batch_processing_paths = {
+            td["task_id"]: processing / (td["task_id"] + ".json") for td in tasks[:2]
+        }
+        executor._active_task_ids.update(td["task_id"] for td in tasks)
+        await executor._execute_claimed_batch("later-arrival", tasks)
+        executor._return_task_to_pending.assert_not_called()
+        assert not executor._active_task_ids
+        assert {p: p.read_bytes() for p in processing.iterdir()} == before
+        assert manager.queue_path.read_bytes() == ledger_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True])
 async def test_split_batch_inherits_durable_external_dependency_hold(tmp_path, parallel):
     manager = TaskQueueManager(tmp_path)
     manager.record_execution_holds({"previous-root"})

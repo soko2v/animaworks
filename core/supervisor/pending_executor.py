@@ -1193,9 +1193,13 @@ class PendingTaskExecutor:
         while remaining:
             ready = [td for td in remaining if _deps_satisfied(td, completed, unfinished)]
             if not ready:
+                # No completion evidence exists for an external dependency.
+                # A missing hold event may mean its persistence failed. Preserve
+                # these claims without ordinary retry metadata until an explicit
+                # attempt-scoped dependency/resume contract is available.
                 for td in remaining:
                     unfinished.add(td["task_id"])
-                    self._return_task_to_pending(td, _DEPENDENCY_UNFINISHED, stop_kind="dependency")
+                logger.warning("[%s] Batch has unresolved dependencies; retaining claims", self._anima_name)
                 break
 
             parallel_ready = [td for td in ready if td.get("parallel")]
