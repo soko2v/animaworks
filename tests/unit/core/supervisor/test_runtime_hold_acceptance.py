@@ -94,9 +94,13 @@ async def test_command_background_hold_retains_claim(tmp_path, legacy_status, is
     executor._background_isolated = isolated
     executor._maybe_run_orphan_sweep = AsyncMock()
     executor._recover_processing = MagicMock()
+    expected = {}
     def set_hold():
         with ledger.open("a") as stream:
             stream.write(json.dumps({"_event": "update", "task_id": "task", "status": legacy_status}) + "\n")
+        expected[ledger] = ledger.read_bytes()
+        lease = processing_lease_path(processing / "task.json")
+        expected[lease] = lease.read_bytes()
     with patch("subprocess.run") as command:
         if isolated:
             async def child(**kwargs):
@@ -126,6 +130,7 @@ async def test_command_background_hold_retains_claim(tmp_path, legacy_status, is
     kept = processing / "task.json"
     assert kept.read_bytes() == expected_descriptor
     assert processing_lease_path(kept).exists()
+    assert all(p.read_bytes() == data for p, data in expected.items())
     assert legacy_execution_hold(tmp_path, "task")
     assert "task" not in executor._active_task_ids
 
@@ -159,6 +164,27 @@ def test_compaction_requires_os_lock(tmp_path):
         assert manager.compact() == 0
     assert manager.queue_path.read_bytes() == before
     assert not manager.archive_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_llm_wrapper_does_not_absorb_child_hold(tmp_path):
+    anima = MagicMock()
+    anima._background_lock = asyncio.Lock()
+    anima._status_slots = {}
+    anima._task_slots = {}
+    anima._active_background_workers = {}
+    executor = PendingTaskExecutor(anima=anima, anima_name="synthetic", anima_dir=tmp_path,
+                                   shutdown_event=asyncio.Event())
+    executor._task_isolated = False
+    executor._run_llm_task = AsyncMock(side_effect=TaskExecutionHeld("synthetic child hold"))
+    executor._return_task_to_pending = MagicMock()
+    executor._sync_task_queue = MagicMock()
+    with pytest.raises(TaskExecutionHeld):
+        await executor._execute_llm_task({"task_id": "task", "task_type": "llm"})
+    executor._run_llm_task.assert_awaited_once()
+    executor._return_task_to_pending.assert_not_called()
+    executor._sync_task_queue.assert_not_called()
+    assert not anima._background_lock.locked()
 
 
 @pytest.mark.asyncio
