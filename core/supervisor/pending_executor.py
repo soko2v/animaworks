@@ -185,6 +185,7 @@ class PendingTaskExecutor:
         self._shutdown_event = shutdown_event
         self._wake_event = asyncio.Event()
         self._batch_tasks: dict[str, list[dict[str, Any]]] = {}
+        self._batch_processing_paths: dict[str, Path] = {}
         self._active_dispatch_tasks: set[asyncio.Task[None]] = set()
         self._active_task_ids: set[str] = set()
         self._task_runner_supervisor = task_runner_supervisor
@@ -869,8 +870,16 @@ class PendingTaskExecutor:
         (observed 2026-09-03: a 6-task batch sat behind one CI-polling task).
         """
         try:
-            await self._dispatch_batch(batch_id, tasks)
+            completed = await self._dispatch_batch(batch_id, tasks)
+            for task_id in completed or ():
+                path = self._batch_processing_paths.get(task_id)
+                if path is not None and not legacy_execution_hold(self._anima_dir, task_id):
+                    _unlink_processing_descriptor(path)
         finally:
+            # Unfinished claims remain on disk; releasing in-memory ownership
+            # is not permission to erase evidence or authorize a retry.
+            for task in tasks:
+                self._batch_processing_paths.pop(task.get("task_id", ""), None)
             self._active_task_ids.difference_update(str(task.get("task_id") or "").strip() for task in tasks)
 
     def _run_orphan_sweep(self) -> int:
@@ -1056,6 +1065,7 @@ class PendingTaskExecutor:
                     try:
                         batch_id = task_desc.get("batch_id")
                         if batch_id:
+                            self._batch_processing_paths[claimed_task_id] = processing_path
                             self._batch_tasks.setdefault(batch_id, []).append(task_desc)
                             claim_transferred = True
                             logger.info(
@@ -1090,8 +1100,6 @@ class PendingTaskExecutor:
                             else:
                                 await self._execute_claimed_llm_task(task_desc, processing_path, None)
                                 claim_transferred = True
-                        if batch_id:
-                            _unlink_processing_descriptor(processing_path)
                     except Exception:
                         logger.exception(
                             "Error processing LLM pending task file: %s",
@@ -1167,7 +1175,7 @@ class PendingTaskExecutor:
         self,
         batch_id: str,
         tasks: list[dict[str, Any]],
-    ) -> None:
+    ) -> set[str]:
         """Dispatch a batch of tasks respecting DAG dependencies.
 
         Independent parallel tasks run under ``_task_semaphore``.
@@ -1191,10 +1199,11 @@ class PendingTaskExecutor:
             )
             for td in tasks:
                 self._return_task_to_pending(td, "cycle_in_batch", stop_kind="cycle_in_batch")
-            return
+            return set()
 
         completed: dict[str, str] = {}  # task_id -> result_summary
         unfinished: set[str] = set()
+        held: set[str] = set()
         remaining = list(order)
 
         while remaining:
@@ -1207,6 +1216,15 @@ class PendingTaskExecutor:
 
             parallel_ready = [td for td in ready if td.get("parallel")]
             serial_ready = [td for td in ready if not td.get("parallel")]
+
+            # Preserve the whole held dependency chain, without ordinary retry
+            # metadata or failure notifications. Unrelated branches can proceed.
+            for td in ready:
+                if any(dep in held for dep in td.get("depends_on", [])):
+                    held.add(td["task_id"])
+                    unfinished.add(td["task_id"])
+                    remaining.remove(td)
+                    (parallel_ready if td.get("parallel") else serial_ready).remove(td)
 
             # Skip parallel tasks whose dependencies never completed
             for td in list(parallel_ready):
@@ -1222,7 +1240,12 @@ class PendingTaskExecutor:
                 results = await asyncio.gather(*coros, return_exceptions=True)
                 for task, result in zip(parallel_ready, results, strict=False):
                     remaining.remove(task)
-                    if isinstance(result, Exception):
+                    if isinstance(result, TaskExecutionHeld):
+                        held.add(task["task_id"])
+                        unfinished.add(task["task_id"])
+                    elif isinstance(result, asyncio.CancelledError):
+                        unfinished.add(task["task_id"])
+                    elif isinstance(result, Exception):
                         logger.error(
                             "[%s] Parallel task %s failed: %s",
                             self._anima_name,
@@ -1258,6 +1281,9 @@ class PendingTaskExecutor:
                         unfinished.add(task["task_id"])
                     else:
                         completed[task["task_id"]] = result or ""
+                except TaskExecutionHeld:
+                    held.add(task["task_id"])
+                    unfinished.add(task["task_id"])
                 except Exception as exc:
                     logger.error(
                         "[%s] Serial batch task %s failed: %s",
@@ -1279,6 +1305,7 @@ class PendingTaskExecutor:
             len(completed),
             len(unfinished),
         )
+        return set(completed)
 
     async def _execute_parallel_task(
         self,
@@ -1301,7 +1328,9 @@ class PendingTaskExecutor:
                 "depends_on": task_desc.get("depends_on", []),
             }
             try:
-                result = await self._run_task_in_worker(task_desc, completed_results)
+                claim = self._batch_processing_paths.get(task_id)
+                kwargs = {"processing_path": claim} if claim is not None else {}
+                result = await self._run_task_in_worker(task_desc, completed_results, **kwargs)
                 status, summary = _classify_task_result(result)
                 self._save_task_result(task_id, result)
                 self._sync_task_queue(task_id, status, summary=summary)
@@ -1319,7 +1348,9 @@ class PendingTaskExecutor:
     ) -> str:
         """Execute a serial batch task under _background_lock."""
         task_id = task_desc.get("task_id", "unknown")
-        result = await self._run_task_in_worker(task_desc, completed_results)
+        claim = self._batch_processing_paths.get(task_id)
+        kwargs = {"processing_path": claim} if claim is not None else {}
+        result = await self._run_task_in_worker(task_desc, completed_results, **kwargs)
         status, summary = _classify_task_result(result)
         self._save_task_result(task_id, result)
         self._sync_task_queue(task_id, status, summary=summary)

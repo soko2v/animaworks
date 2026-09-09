@@ -14,6 +14,118 @@ from core.platform.processing_lease import processing_lease_path
 from core.supervisor.pending_executor import PendingTaskExecutor, TaskExecutionHeld
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("outcome", ["held", "success", "crash"])
+async def test_batch_watcher_retains_unfinished_evidence(tmp_path, parallel, outcome):
+    pending = tmp_path / "state/pending"
+    pending.mkdir(parents=True)
+    tasks = [
+        {"task_id": "root", "depends_on": []},
+        {"task_id": "child", "depends_on": ["root"]},
+        {"task_id": "grandchild", "depends_on": ["child"]},
+        {"task_id": "independent", "depends_on": []},
+    ]
+    for task in tasks:
+        task.update(task_type="llm", batch_id="synthetic", parallel=parallel)
+        (pending / f'{task["task_id"]}.json').write_text(json.dumps(task))
+    ledger = tmp_path / "state/task_queue.jsonl"
+    ledger.write_text("".join(json.dumps({"task_id": t["task_id"], "status": "pending"}) + "\n"
+                              for t in tasks))
+    before_ledger = ledger.read_bytes()
+    descriptors = {t["task_id"]: (pending / f'{t["task_id"]}.json').read_bytes() for t in tasks}
+    anima = MagicMock()
+    anima._task_semaphore = asyncio.Semaphore(2)
+    anima._active_parallel_tasks = {}
+    shutdown = asyncio.Event()
+    executor = PendingTaskExecutor(anima=anima, anima_name="synthetic", anima_dir=tmp_path,
+                                   shutdown_event=shutdown)
+    executor._recover_processing = MagicMock()
+    executor._maybe_run_orphan_sweep = AsyncMock()
+    executor._return_task_to_pending = MagicMock()
+    executor._save_task_result = MagicMock()
+    executor._sync_task_queue = MagicMock()
+    executor._handle_goal_completion = AsyncMock()
+    called = []
+    leases = {}
+
+    async def worker(task, completed_results, **kwargs):
+        tid = task["task_id"]
+        assert kwargs["processing_path"] == pending / "processing" / f"{tid}.json"
+        called.append(tid)
+        shutdown.set()
+        executor.wake()
+        # A claimed batch must retain evidence BEFORE executing any member.
+        for item in tasks:
+            path = pending / "processing" / f'{item["task_id"]}.json'
+            assert path.read_bytes() == descriptors[item["task_id"]]
+            leases.setdefault(item["task_id"], processing_lease_path(path).read_bytes())
+        if tid == "root":
+            if outcome == "held":
+                # Child wire hold is authoritative even without a local ledger update.
+                raise TaskExecutionHeld("synthetic child hold")
+            if outcome == "crash":
+                raise RuntimeError("synthetic crash")
+        return "synthetic result"
+
+    executor._run_task_in_worker = AsyncMock(side_effect=worker)
+    await asyncio.wait_for(executor.watcher_loop(), timeout=3)
+    assert called == (["root", "independent", "child", "grandchild"] if outcome == "success"
+                      else ["root", "independent"])
+    assert ledger.read_bytes() == before_ledger
+    assert not executor._active_task_ids
+    completed = {"independent"} | ({"root", "child", "grandchild"} if outcome == "success" else set())
+    assert {c.args[0] for c in executor._save_task_result.call_args_list} == completed
+    for tid, data in descriptors.items():
+        path = pending / "processing" / f"{tid}.json"
+        if tid in completed:
+            assert not path.exists() and not processing_lease_path(path).exists()
+        else:
+            assert path.read_bytes() == data
+            assert processing_lease_path(path).read_bytes() == leases[tid]
+    if outcome == "held":
+        executor._return_task_to_pending.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_cancelled_claimed_batch_keeps_all_evidence(tmp_path, parallel):
+    processing = tmp_path / "state/pending/processing"
+    processing.mkdir(parents=True)
+    anima = MagicMock()
+    anima._task_semaphore = asyncio.Semaphore(2)
+    anima._active_parallel_tasks = {}
+    executor = PendingTaskExecutor(anima=anima, anima_name="synthetic", anima_dir=tmp_path,
+                                   shutdown_event=asyncio.Event())
+    tasks = [{"task_id": "root", "parallel": parallel},
+             {"task_id": "child", "parallel": parallel, "depends_on": ["root"]}]
+    before = {}
+    for task in tasks:
+        path = processing / f'{task["task_id"]}.json'
+        path.write_text(json.dumps(task))
+        processing_lease_path(path).write_text('{"synthetic":"evidence"}')
+        before[path] = path.read_bytes()
+        before[processing_lease_path(path)] = processing_lease_path(path).read_bytes()
+        executor._batch_processing_paths[task["task_id"]] = path
+        executor._active_task_ids.add(task["task_id"])
+    entered = asyncio.Event()
+    async def worker(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+    executor._run_task_in_worker = AsyncMock(side_effect=worker)
+    executor._save_task_result = MagicMock()
+    executor._return_task_to_pending = MagicMock()
+    dispatch = asyncio.create_task(executor._execute_claimed_batch("synthetic", tasks))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    dispatch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+    assert all(path.read_bytes() == data for path, data in before.items())
+    assert not executor._active_task_ids and not executor._batch_processing_paths
+    executor._save_task_result.assert_not_called()
+    executor._return_task_to_pending.assert_not_called()
+
+
 @pytest.mark.parametrize("status", ["blocked", "failed"])
 @pytest.mark.parametrize("latest", ["pending", "in_progress", "done", "cancelled"])
 def test_compaction_preserves_hold_independent_of_display(tmp_path, status, latest):
