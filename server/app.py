@@ -1052,7 +1052,13 @@ def create_app(
     shared_dir: Path,
     *,
     force_startup_repair_all_vectordb: bool = False,
+    maintenance: bool = False,
 ) -> FastAPI:
+    if maintenance:
+        from server.maintenance import create_maintenance_app
+
+        return create_maintenance_app()
+
     app = FastAPI(title="AnimaWorks", version=_get_app_version(), lifespan=lifespan)
 
     ws_manager = WebSocketManager()
