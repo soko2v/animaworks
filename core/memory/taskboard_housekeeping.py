@@ -83,7 +83,7 @@ def _cleanup_pending_processing(
                     continue
                 if is_processing_lease_live(path, expected_anima=anima_dir.name):
                     live_leases_skipped += 1
-                    logger.info("Skipping stale processing task with live lease: %s", path)
+                    logger.info("Skipping stale processing task with live or inconclusive lease: %s", path)
                     continue
                 payload, valid_json = _read_json_object(path)
                 if not valid_json:

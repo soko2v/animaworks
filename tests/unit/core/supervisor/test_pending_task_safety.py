@@ -177,7 +177,7 @@ class TestLLMPendingFileLifecycle:
 class TestRecoverProcessing:
     """Orphaned descriptors in processing/ return their tasks to pending."""
 
-    def test_recovers_orphaned_files(self, tmp_path: Path) -> None:
+    def test_preserves_files_without_lease_evidence(self, tmp_path: Path) -> None:
         processing_dir = tmp_path / "processing"
         processing_dir.mkdir()
 
@@ -186,7 +186,7 @@ class TestRecoverProcessing:
 
         PendingTaskExecutor._recover_processing(processing_dir)
 
-        assert not list(processing_dir.glob("*.json"))
+        assert len(list(processing_dir.glob("*.json"))) == 2
 
     def test_no_op_when_processing_dir_missing(self, tmp_path: Path) -> None:
         PendingTaskExecutor._recover_processing(tmp_path / "processing")
@@ -259,7 +259,7 @@ class TestRecoverProcessing:
             assert is_processing_lease_live(descriptor, expected_anima="test-anima")
 
     @pytest.mark.parametrize("malformed", ["invalid_utf8", "huge_json_integer", "huge_pid"])
-    def test_malformed_lease_is_not_live(self, tmp_path: Path, malformed: str) -> None:
+    def test_malformed_lease_blocks_recovery(self, tmp_path: Path, malformed: str) -> None:
         descriptor = tmp_path / f"{malformed}.json"
         descriptor.write_text('{"task_id":"malformed"}', encoding="utf-8")
         if malformed == "invalid_utf8":
@@ -277,11 +277,10 @@ class TestRecoverProcessing:
                 pid=10**100,
             )
 
-        assert not is_processing_lease_live(descriptor, expected_anima="test-anima")
+        assert is_processing_lease_live(descriptor, expected_anima="test-anima")
 
     def test_crash_returns_layer2_task_to_pending(self, tmp_path: Path) -> None:
-        # A descriptor left in processing/ means the run died without declaring:
-        # the ledger entry goes back to pending with a crash stamp.
+        # A conclusively dead lease permits the upstream crash-return behavior.
         from core.memory.task_queue import TaskQueueManager
 
         anima_dir = tmp_path / "anima"
@@ -299,7 +298,10 @@ class TestRecoverProcessing:
         processing_dir.mkdir()
         (processing_dir / f"{entry.task_id}.json").write_text(f'{{"task_id":"{entry.task_id}"}}')
 
-        PendingTaskExecutor._recover_processing(processing_dir, anima_dir)
+        write_processing_lease(processing_dir / f"{entry.task_id}.json",
+                               anima="anima", task_id=entry.task_id, pid=12345)
+        with patch("core.platform.processing_lease._pid_exists", return_value=False):
+            PendingTaskExecutor._recover_processing(processing_dir, anima_dir)
 
         assert not list(processing_dir.glob("*.json"))
         # No descriptor is regenerated: the owner picks it up from its pending list.
@@ -335,8 +337,8 @@ class TestRecoverProcessing:
         assert tqm.get_task_by_id(entry.task_id).status == "done"
 
     @pytest.mark.asyncio
-    async def test_watcher_loop_recovers_on_startup(self, tmp_path: Path) -> None:
-        """watcher_loop recovers processing/ orphans before entering main loop."""
+    async def test_watcher_loop_preserves_missing_leases_on_startup(self, tmp_path: Path) -> None:
+        """Startup must not discard ambiguous command or LLM descriptors."""
         executor = _make_executor(tmp_path)
 
         cmd_processing = executor._anima_dir / "state" / "background_tasks" / "pending" / "processing"
@@ -350,8 +352,8 @@ class TestRecoverProcessing:
         with patch("core.supervisor.pending_executor.asyncio.wait_for", side_effect=_stop_after_first(executor)):
             await executor.watcher_loop()
 
-        assert not list(cmd_processing.glob("*.json"))
-        assert not list(llm_processing.glob("*.json"))
+        assert (cmd_processing / "orphan-cmd.json").exists()
+        assert (llm_processing / "orphan-llm.json").exists()
 
 
 @pytest.mark.asyncio

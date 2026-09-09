@@ -5,11 +5,13 @@ import os
 import time
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from core.memory.housekeeping import run_housekeeping
 from core.memory.task_queue import TaskQueueManager
+from core.platform.processing_lease import write_processing_lease
 from core.taskboard.store import TaskBoardStore
 from core.time_utils import now_local
 
@@ -70,13 +72,18 @@ async def test_taskboard_housekeeping_remediates_stale_runtime_artifacts_end_to_
     old_ts = time.time() - (25 * 3600)
     os.utime(state_path, (old_ts, old_ts))
 
-    results = await run_housekeeping(
-        data_dir,
-        pending_processing_stale_hours=24,
-        background_running_stale_hours=48,
-        current_state_stale_hours=24,
-        taskboard_suppressed_retention_days=30,
+    write_processing_lease(
+        anima_dir / "state" / "pending" / "processing" / "recover-task.json",
+        anima="sakura", task_id="recover-task", pid=12345,
     )
+    with patch("core.platform.processing_lease._pid_exists", return_value=False):
+        results = await run_housekeeping(
+            data_dir,
+            pending_processing_stale_hours=24,
+            background_running_stale_hours=48,
+            current_state_stale_hours=24,
+            taskboard_suppressed_retention_days=30,
+        )
 
     taskboard = results["taskboard_stale"]
     assert taskboard["processing_recovered"] == 1

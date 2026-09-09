@@ -702,9 +702,9 @@ class PendingTaskExecutor:
     ) -> None:
         """Return orphaned processing descriptors to their owners on startup.
 
-        A descriptor left in processing/ means the run died without declaring an
-        outcome.  Drop the descriptor and put the ledger entry back to pending
-        with a crash stamp; nothing is re-enqueued or retried automatically.
+        Only conclusively dead leases permit dropping a descriptor and returning
+        the ledger entry to pending with a crash stamp. Missing or inconclusive
+        evidence is preserved; nothing is re-enqueued or retried automatically.
         """
         if not processing_dir.exists():
             return
@@ -712,7 +712,7 @@ class PendingTaskExecutor:
             expected_anima = anima_dir.name if anima_dir is not None else None
             if is_processing_lease_live(orphan, expected_anima=expected_anima):
                 logger.warning(
-                    "live lease detected, skipping recovery: %s",
+                    "live or inconclusive lease, skipping recovery: %s",
                     orphan.name,
                 )
                 continue

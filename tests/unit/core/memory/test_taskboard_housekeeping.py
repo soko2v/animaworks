@@ -52,7 +52,9 @@ def test_stale_processing_moves_to_failed_dir_and_requeues_to_pending(tmp_path: 
         age_hours=25,
     )
 
-    result = cleanup_taskboard_stale_artifacts(data_dir, 24, 48, 24, 30)
+    write_processing_lease(processing, anima="sakura", task_id="task-processing", pid=12345)
+    with patch("core.platform.processing_lease._pid_exists", return_value=False):
+        result = cleanup_taskboard_stale_artifacts(data_dir, 24, 48, 24, 30)
 
     assert result["processing_recovered"] == 1
     assert result["processing_queue_synced"] == 1
@@ -135,7 +137,7 @@ def test_stale_processing_with_dead_lease_is_recovered(tmp_path: Path) -> None:
     assert queue.get_task_by_id("dead-processing").status == "pending"
 
 
-def test_unreadable_processing_file_is_moved_without_queue_sync(tmp_path: Path) -> None:
+def test_unreadable_processing_file_without_lease_is_preserved(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     anima_dir = _anima_dir(data_dir)
     path = anima_dir / "state" / "pending" / "processing" / "bad.json"
@@ -146,11 +148,11 @@ def test_unreadable_processing_file_is_moved_without_queue_sync(tmp_path: Path) 
 
     result = cleanup_taskboard_stale_artifacts(data_dir, 24, 48, 24, 30)
 
-    assert result["processing_recovered"] == 1
-    assert result["processing_unreadable"] == 1
+    assert result["processing_recovered"] == 0
+    assert result["processing_live_leases_skipped"] == 1
     assert result["processing_queue_synced"] == 0
-    assert not path.exists()
-    assert (anima_dir / "state" / "pending" / "failed" / "bad.json").exists()
+    assert path.read_text() == "{bad json"
+    assert not (anima_dir / "state" / "pending" / "failed" / "bad.json").exists()
 
 
 def test_deferred_wakes_elapsed_snooze_and_fails_stale_unsnoozed_file(tmp_path: Path) -> None:

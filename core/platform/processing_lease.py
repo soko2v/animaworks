@@ -121,8 +121,6 @@ def write_processing_lease(
         start_time = process_start_time
         if start_time is None and task_pid is not None:
             start_time = _process_create_time(int(task_pid))
-        if start_time is None:
-            start_time = time.time()
         payload.update(
             {
                 "schema_version": 2,
@@ -131,7 +129,8 @@ def write_processing_lease(
                 "pgid": int(pgid),
                 "root_epoch": root_epoch,
                 "attempt": int(attempt),
-                "process_start_time": float(start_time),
+                # A guessed timestamp can falsely prove PID reuse on recovery.
+                "process_start_time": float(start_time) if start_time is not None else None,
             }
         )
         _atomic_write_json(lease_path, payload)
@@ -194,8 +193,7 @@ def _validate_common_fields(payload: dict[str, Any], expected_anima: str | None)
 def _pid_exists(pid: int) -> bool | None:
     """Return True/False when known, ``None`` when existence is uncertain.
 
-    Overflow/ValueError (e.g. absurdly large PIDs) are treated as dead so
-    malformed leases do not block recovery.
+    Invalid or unrepresentable PIDs are inconclusive, not proof of death.
     """
     try:
         os.kill(pid, 0)
@@ -205,7 +203,7 @@ def _pid_exists(pid: int) -> bool | None:
     except PermissionError:
         return True
     except (OverflowError, ValueError):
-        return False
+        return None
     except OSError:
         return None
 
@@ -227,24 +225,24 @@ def classify_processing_lease(
 ) -> LeaseLiveness:
     """Classify a lease as ``live``, ``dead``, or ``unknown``.
 
-    ``unknown`` means the process may still be running but platform signals
-    were inconclusive — callers must not kill or recover those descriptors.
+    ``unknown`` includes missing/invalid identity evidence and inconclusive
+    platform signals — callers must not kill or recover those descriptors.
     """
     lease_path = processing_lease_path(descriptor_path)
     try:
         payload = json.loads(lease_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
-        return "dead"
+        return "unknown"
     if not isinstance(payload, dict):
-        return "dead"
+        return "unknown"
     if not _validate_common_fields(payload, expected_anima):
-        return "dead"
+        return "unknown"
 
     schema_version = payload.get("schema_version")
-    if schema_version == 2:
+    if type(schema_version) is int and schema_version == 2:
         return _classify_v2(payload, expected_root_epoch=expected_root_epoch)
-    if schema_version is not None and schema_version != 1:
-        return "dead"
+    if schema_version is not None and (type(schema_version) is not int or schema_version != 1):
+        return "unknown"
     return _classify_v1(payload)
 
 
@@ -278,17 +276,17 @@ def _classify_v2(
     anima = str(payload["anima"])
 
     if not _is_positive_int(task_pid):
-        return "dead"
+        return "unknown"
     if not _is_positive_int(pgid):
-        return "dead"
+        return "unknown"
     if not isinstance(root_epoch, str) or not root_epoch:
-        return "dead"
+        return "unknown"
     if not isinstance(job_id, str) or not job_id:
-        return "dead"
+        return "unknown"
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
-        return "dead"
+        return "unknown"
     if not _is_finite_number(process_start_time):
-        return "dead"
+        return "unknown"
 
     if expected_root_epoch is not None and root_epoch != expected_root_epoch:
         # Stale generation: still verify the recorded child identity before
@@ -302,10 +300,13 @@ def _classify_v2(
         return "unknown"
 
     current_start = _process_create_time(int(task_pid))
-    if current_start is not None:
-        if _centisecond(current_start) != _centisecond(float(process_start_time)):
+    if not _is_finite_number(current_start):
+        return "unknown"
+    try:
+        if _centisecond(current_start) != _centisecond(process_start_time):
             return "dead"
-    # If create_time is unavailable, fall through to cmdline checks.
+    except (OverflowError, ValueError):
+        return "unknown"
 
     try:
         cmdline = _read_proc_cmdline(int(task_pid))
@@ -322,9 +323,9 @@ def is_processing_lease_live(
 ) -> bool:
     """Return whether a descriptor's lease belongs to a live executor.
 
-    Missing, malformed, dead, and PID-reused leases return ``False``.  When
-    the platform cannot conclusively classify the process (``unknown``), the
-    result is conservatively ``True`` so callers do not reclaim live work.
+    Only conclusively dead or PID-reused leases return ``False``. Missing,
+    malformed, or inconclusive evidence returns conservatively ``True`` so
+    callers preserve work. This boolean is not proof of a live process.
     """
     status = classify_processing_lease(
         descriptor_path,

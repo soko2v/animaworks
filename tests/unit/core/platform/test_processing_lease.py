@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from core.platform.processing_lease import (
     classify_processing_lease,
     is_processing_lease_live,
@@ -65,6 +67,17 @@ def test_v2_round_trip_fields(tmp_path: Path) -> None:
     assert payload["attempt"] == 1
     assert payload["process_start_time"] == start
     assert read_processing_lease(descriptor) == payload
+
+
+def test_v2_writer_does_not_invent_unavailable_start_time(tmp_path: Path) -> None:
+    descriptor = tmp_path / "task.json"
+    with patch("core.platform.processing_lease._process_create_time", return_value=None):
+        write_processing_lease(
+            descriptor, anima="sakura", task_id="task", pid=os.getpid(),
+            job_id="job", task_pid=os.getpid(), pgid=os.getpid(), root_epoch="epoch", attempt=1,
+        )
+    assert read_processing_lease(descriptor)["process_start_time"] is None
+    assert classify_processing_lease(descriptor) == "unknown"
 
 
 def test_v2_live_with_task_runner_cmdline(tmp_path: Path) -> None:
@@ -190,9 +203,56 @@ def test_unreadable_proc_is_unknown_treated_as_live(tmp_path: Path) -> None:
         assert is_processing_lease_live(descriptor, expected_anima="sakura")
 
 
-def test_malformed_lease_is_dead(tmp_path: Path) -> None:
+def test_malformed_lease_is_unknown(tmp_path: Path) -> None:
     descriptor = tmp_path / "bad.json"
     descriptor.write_text("{}", encoding="utf-8")
     processing_lease_path(descriptor).write_bytes(b"\xff\xfe")
-    assert classify_processing_lease(descriptor) == "dead"
-    assert not is_processing_lease_live(descriptor)
+    assert classify_processing_lease(descriptor) == "unknown"
+    assert is_processing_lease_live(descriptor)
+
+
+@pytest.mark.parametrize("raw", [None, b"", b"{", b"[]", b"null", b"{}", b"\xff"])
+def test_absent_or_invalid_identity_is_unknown(tmp_path: Path, raw: bytes | None) -> None:
+    descriptor = tmp_path / "task.json"
+    if raw is not None:
+        processing_lease_path(descriptor).write_bytes(raw)
+    assert classify_processing_lease(descriptor) == "unknown"
+    assert is_processing_lease_live(descriptor)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("pid", False), ("pid", -1), ("task_pid", 10**100),
+    ("anima", "other"), ("leased_at", float("nan")), ("task_id", ""),
+    ("schema_version", True), ("schema_version", 2.0), ("schema_version", 3),
+    ("task_pid", 0), ("pgid", 0), ("root_epoch", ""), ("job_id", ""),
+    ("attempt", False), ("process_start_time", float("inf")),
+    ("process_start_time", 1e308),
+])
+def test_invalid_v2_fields_are_unknown(tmp_path: Path, field: str, value: object) -> None:
+    descriptor = tmp_path / "task.json"
+    lease = write_processing_lease(
+        descriptor, anima="sakura", task_id="task", pid=os.getpid(),
+        job_id="job", task_pid=os.getpid(), pgid=os.getpid(), root_epoch="epoch",
+        attempt=1, process_start_time=1.0,
+    )
+    payload = json.loads(lease.read_text())
+    payload[field] = value
+    lease.write_text(json.dumps(payload))
+    with patch("core.platform.processing_lease._process_create_time", return_value=1.0):
+        assert classify_processing_lease(descriptor, expected_anima="sakura") == "unknown"
+
+
+@pytest.mark.parametrize("start", [None, float("nan"), float("inf")])
+def test_v2_unavailable_start_time_does_not_fall_back_to_cmdline(tmp_path: Path, start) -> None:
+    descriptor = tmp_path / "task.json"
+    write_processing_lease(
+        descriptor, anima="sakura", task_id="task", pid=os.getpid(),
+        job_id="job", task_pid=os.getpid(), pgid=os.getpid(), root_epoch="epoch",
+        attempt=1, process_start_time=1.0,
+    )
+    with (
+        patch("core.platform.processing_lease._process_create_time", return_value=start),
+        patch("core.platform.processing_lease._read_proc_cmdline") as cmdline,
+    ):
+        assert classify_processing_lease(descriptor) == "unknown"
+        cmdline.assert_not_called()
