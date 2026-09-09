@@ -123,15 +123,22 @@ class ClaudeTextProbe:
             raise ValueError("Canary admission closed") from None
         finally:
             self._token = ""
-            if process is not None and process.returncode is None:
+            if process is not None:
                 try:
+                    # A successful/reaped group leader may leave live children.
+                    # This group belongs to our start_new_session child, not the
+                    # caller's session. ESRCH is normal when it is already empty.
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 except OSError:
                     # Never report a clean shutdown if the host denies cleanup.
                     raise ValueError("Canary cleanup unverified") from None
-                await process.wait()
+                try:
+                    async with asyncio.timeout(5):
+                        await process.wait()
+                except TimeoutError:
+                    raise ValueError("Canary cleanup unverified") from None
 
 
 class CanaryChatSession:

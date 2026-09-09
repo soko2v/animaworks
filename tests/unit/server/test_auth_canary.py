@@ -51,12 +51,12 @@ def client_for(app, host="127.0.0.1", headers=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["success", "parallel", "provider_error", "cancelled"])
+@pytest.mark.parametrize("outcome", ["success", "parallel", "provider_error", "cancelled", "native_cli"])
 async def test_authenticated_route_real_ipc_one_shot(canary, outcome):
     """Real synthetic password session and Unix IPC, no real provider."""
     import asyncio
 
-    from core.supervisor.canary import CanaryIPCService
+    from core.supervisor.canary import CanaryIPCService, ClaudeTextProbe
     from core.supervisor.ipc import IPCClient, IPCRequest
     from server.canary import _create_canary_app
 
@@ -65,6 +65,20 @@ async def test_authenticated_route_real_ipc_one_shot(canary, outcome):
         provider.side_effect = RuntimeError("synthetic-secret")
     if outcome == "cancelled":
         provider.side_effect = asyncio.CancelledError()
+    if outcome == "native_cli":
+        # Exercise the actual adapter and OS subprocess from authenticated HTTP.
+        # Only the executable/result/token are synthetic; no provider is called.
+        root = canary[0].parent
+        probe_home, probe_cwd = root / "cli-home", root / "cli-cwd"
+        probe_home.mkdir(mode=0o700)
+        probe_cwd.mkdir(mode=0o700)
+        executable = root / "synthetic-cli"
+        reply = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                            "num_turns": 1, "result": "CANARY_OK", "permission_denials": []})
+        executable.write_text("#!/bin/sh\ncat >/dev/null\nprintf '%s' '" + reply + "'\n")
+        executable.chmod(0o700)
+        probe = ClaudeTextProbe(executable, probe_home, probe_cwd, oauth_token="synthetic-only")
+        provider.side_effect = probe.__call__
     with tempfile.TemporaryDirectory(prefix="aw-c-", dir="/tmp") as directory:
         path = Path(directory).resolve() / "probe.sock"
         service = CanaryIPCService(path, provider)
@@ -111,14 +125,16 @@ async def test_authenticated_route_real_ipc_one_shot(canary, outcome):
                     response = next(r for r in responses if r.status_code == 200)
                 else:
                     response = await client.post(url, json=payload)
-                assert response.status_code == (200 if outcome in {"success", "parallel"} else 500)
+                assert response.status_code == (200 if outcome in {"success", "parallel", "native_cli"} else 500)
                 assert "synthetic-secret" not in response.text
-                if outcome in {"success", "parallel"}:
+                if outcome in {"success", "parallel", "native_cli"}:
                     assert response.json()["response"] == "CANARY_OK"
                 assert (await client.post(url, json=payload)).status_code == 503
                 assert (await client.post("/api/auth/logout")).status_code == 200
                 assert (await client.post(url, json=payload)).status_code == 503
                 provider.assert_awaited_once()
+                if outcome == "native_cli":
+                    assert probe._spent and probe._token == ""
         finally:
             await ipc.close()
             await service.stop()

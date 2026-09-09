@@ -142,6 +142,67 @@ async def test_cli_oversized_output_reports_cleanup_denial(cli_probe, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["overflow", "cancel", "timeout", "success_with_child"])
+async def test_native_probe_group_cleanup(cli_probe, monkeypatch, outcome):
+    """Real owned synthetic processes, no credentials, network or provider."""
+    import json
+
+    import psutil
+
+    record = cli_probe.executable.with_name("owned-pids.json")
+    result = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                         "num_turns": 1, "result": "CANARY_OK", "permission_denials": []})
+    cli_probe.executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys, time, json\n"
+        "sys.stdin.read()\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os.close(1)\n"
+        "    time.sleep(8)\n"
+        "    os._exit(0)\n"
+        f"with open({str(record)!r}, 'w') as f: json.dump([os.getpid(), child], f)\n"
+        + (f"print({result!r}, flush=True)\n" if outcome == "success_with_child" else
+           "os.write(1, b'x' * 70000)\ntime.sleep(8)\n" if outcome == "overflow" else
+           "time.sleep(8)\n")
+    )
+    if outcome == "timeout":
+        real_timeout = asyncio.timeout
+        monkeypatch.setattr(asyncio, "timeout", lambda delay: real_timeout(0.5 if delay == 50 else delay))
+    task = asyncio.create_task(cli_probe("Reply with CANARY_OK only."))
+    async with asyncio.timeout(3):
+        while not record.exists():
+            await asyncio.sleep(0.01)
+    pids = json.loads(record.read_text())
+    owned = [psutil.Process(pid) for pid in pids if psutil.pid_exists(pid)]
+    try:
+        if outcome == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif outcome == "success_with_child":
+            assert await task == "CANARY_OK"
+        else:
+            with pytest.raises(ValueError, match="Canary admission closed"):
+                await task
+        async with asyncio.timeout(2):
+            while any(p.is_running() and p.status() != psutil.STATUS_ZOMBIE for p in owned):
+                await asyncio.sleep(0.01)
+        assert cli_probe._token == ""
+        with pytest.raises(ValueError):
+            await cli_probe("Reply with CANARY_OK only.")
+    finally:
+        # Only this test's identity-bound synthetic children; never host processes.
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        for process in owned:
+            if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                process.kill()
+        psutil.wait_procs(owned, timeout=2)
+
+
+@pytest.mark.asyncio
 async def test_single_success_and_replay():
     provider = AsyncMock(return_value="CANARY_OK")
     session = CanaryChatSession(provider)
