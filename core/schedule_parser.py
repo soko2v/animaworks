@@ -15,6 +15,7 @@ dependency on LifecycleManager or APScheduler internals.
 
 import logging
 import re
+from pathlib import Path
 
 import yaml
 from apscheduler.triggers.cron import CronTrigger
@@ -117,6 +118,21 @@ def parse_heartbeat_config(content: str) -> tuple[int | None, int | None]:
 
 
 # ── Cron parsing ─────────────────────────────────────────
+
+
+def cron_task_is_current(path: Path, task: CronTask) -> bool:
+    """Permit a queued callback only for one unchanged definition on disk.
+
+    Check every callback, not just the first to notice an mtime change: another
+    callback or heartbeat may already have reloaded the schedule. This is a
+    definition check, not a process lock or an exactly-once execution guarantee.
+    """
+    try:
+        tasks = parse_cron_md(path.read_text(encoding="utf-8"), warn=False)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    matches = [candidate for candidate in tasks if candidate.name == task.name]
+    return len(matches) == 1 and matches[0] == task
 
 
 def parse_cron_md(content: str, *, warn: bool = True) -> list[CronTask]:

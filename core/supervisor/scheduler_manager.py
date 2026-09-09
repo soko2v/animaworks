@@ -25,7 +25,7 @@ from apscheduler.triggers.cron import CronTrigger
 from core.config.models import ActivityScheduleEntry, load_config, save_config
 from core.config.resolver import resolve_process_model_config
 from core.i18n import t
-from core.schedule_parser import parse_cron_md, parse_heartbeat_config, parse_schedule
+from core.schedule_parser import cron_task_is_current, parse_cron_md, parse_heartbeat_config, parse_schedule
 from core.schemas import CronTask
 from core.supervisor.task_runner_supervisor import TaskRunnerSupervisor
 from core.time_utils import get_app_timezone, now_local
@@ -960,8 +960,9 @@ class SchedulerManager:
             return
 
         # Detect schedule file changes and skip stale tasks
-        if self._check_schedule_freshness():
-            self._log_cron_event(task, "skipped", "schedule reloaded")
+        self._check_schedule_freshness()
+        if not cron_task_is_current(self._anima_dir / "cron.md", task):
+            self._log_cron_event(task, "skipped", "definition changed or unavailable")
             logger.info(
                 "Skipping stale cron '%s' for %s (schedule reloaded)",
                 task.name,

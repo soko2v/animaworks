@@ -16,8 +16,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 from core.anima import DigitalAnima
 from core.config.models import load_config
+from core.schedule_parser import cron_task_is_current, parse_heartbeat_config
 from core.schedule_parser import parse_cron_md as _parse_cron_md
-from core.schedule_parser import parse_heartbeat_config
 from core.schedule_parser import parse_schedule as _parse_schedule
 from core.schemas import CronTask
 
@@ -226,7 +226,8 @@ class SchedulerMixin:
             return
 
         # Detect schedule file changes and skip stale tasks
-        if self._check_schedule_freshness(name):
+        self._check_schedule_freshness(name)
+        if not cron_task_is_current(anima.memory.anima_dir / "cron.md", task):
             logger.info(
                 "Skipping stale cron '%s' for '%s' (schedule reloaded)",
                 task.name,
