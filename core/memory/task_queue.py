@@ -224,6 +224,21 @@ class TaskQueueManager:
 
     # ── Write operations ─────────────────────────────────────
 
+    def record_execution_holds(self, task_ids: set[str]) -> None:
+        """Persist conservative holds without changing display status or releasing any.
+
+        Lock/I/O failure must propagate: callers must retain processing evidence.
+        This is not an approval API or an atomic execution/dispatch fence.
+        """
+        if any(not isinstance(tid, str) or not tid.strip() for tid in task_ids):
+            raise ValueError("Execution hold requires nonempty task IDs")
+        with self._locked_queue(require_lock=True):
+            existing = _execution_holds(self._queue_path)
+            if existing is None:
+                raise TaskPersistenceError("Untrusted execution hold ledger")
+            for tid in sorted(task_ids - existing):
+                self._append_unlocked({"_event": "execution_hold", "task_id": tid})
+
     def _build_task_entry(
         self,
         *,

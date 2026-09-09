@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 from core.config.resolver import resolve_process_model_config
 from core.exceptions import TaskExecutionHeld, ToolExecutionError
 from core.i18n import t
-from core.memory.task_queue import legacy_execution_hold
+from core.memory.task_queue import TaskQueueManager, legacy_execution_hold
 from core.platform.processing_lease import (
     is_processing_lease_live,
     processing_lease_path,
@@ -1206,6 +1206,33 @@ class PendingTaskExecutor:
         held: set[str] = set()
         remaining = list(order)
 
+        def retain_hold(task_id: str) -> None:
+            # Persist the known transitive branch before returning to dispatch.
+            # Recovery must not depend on this coordinator's in-memory held set.
+            branch = {task_id}
+            while True:
+                expanded = branch | {
+                    td["task_id"] for td in tasks
+                    if any(dep in branch for dep in td.get("depends_on", []))
+                }
+                if expanded == branch:
+                    break
+                branch = expanded
+            TaskQueueManager(self._anima_dir).record_execution_holds(branch)
+            held.update(branch)
+
+        # Includes dependencies absent from this arrival group but durably held
+        # by an earlier batch. Absence alone is not proof of completion.
+        for td in tasks:
+            if legacy_execution_hold(self._anima_dir, td["task_id"]) or any(
+                legacy_execution_hold(self._anima_dir, dep) for dep in td.get("depends_on", [])
+            ):
+                retain_hold(td["task_id"])
+        for td in list(remaining):
+            if td["task_id"] in held:
+                unfinished.add(td["task_id"])
+                remaining.remove(td)
+
         while remaining:
             ready = [td for td in remaining if _deps_satisfied(td, completed, unfinished)]
             if not ready:
@@ -1241,7 +1268,7 @@ class PendingTaskExecutor:
                 for task, result in zip(parallel_ready, results, strict=False):
                     remaining.remove(task)
                     if isinstance(result, TaskExecutionHeld):
-                        held.add(task["task_id"])
+                        retain_hold(task["task_id"])
                         unfinished.add(task["task_id"])
                     elif isinstance(result, asyncio.CancelledError):
                         unfinished.add(task["task_id"])
@@ -1282,7 +1309,7 @@ class PendingTaskExecutor:
                     else:
                         completed[task["task_id"]] = result or ""
                 except TaskExecutionHeld:
-                    held.add(task["task_id"])
+                    retain_hold(task["task_id"])
                     unfinished.add(task["task_id"])
                 except Exception as exc:
                     logger.error(

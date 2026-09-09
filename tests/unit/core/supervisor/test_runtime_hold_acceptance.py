@@ -72,7 +72,13 @@ async def test_batch_watcher_retains_unfinished_evidence(tmp_path, parallel, out
     await asyncio.wait_for(executor.watcher_loop(), timeout=3)
     assert called == (["root", "independent", "child", "grandchild"] if outcome == "success"
                       else ["root", "independent"])
-    assert ledger.read_bytes() == before_ledger
+    if outcome == "held":
+        assert ledger.read_bytes().startswith(before_ledger)
+        for tid in ("root", "child", "grandchild"):
+            assert legacy_execution_hold(tmp_path, tid)
+        assert not legacy_execution_hold(tmp_path, "independent")
+    else:
+        assert ledger.read_bytes() == before_ledger
     assert not executor._active_task_ids
     completed = {"independent"} | ({"root", "child", "grandchild"} if outcome == "success" else set())
     assert {c.args[0] for c in executor._save_task_result.call_args_list} == completed
@@ -85,6 +91,106 @@ async def test_batch_watcher_retains_unfinished_evidence(tmp_path, parallel, out
             assert processing_lease_path(path).read_bytes() == leases[tid]
     if outcome == "held":
         executor._return_task_to_pending.assert_not_called()
+        # A new recovery instance must retain the branch even when the old
+        # process is conclusively dead. No in-memory batch state is reused.
+        before = {p: p.read_bytes() for p in pending.rglob("*") if p.is_file()}
+        callback = MagicMock()
+        with patch("core.supervisor.pending_executor.is_processing_lease_live", return_value=False):
+            PendingTaskExecutor._recover_processing(pending / "processing", tmp_path, callback)
+        callback.assert_not_called()
+        assert {p: p.read_bytes() for p in pending.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_split_batch_inherits_durable_external_dependency_hold(tmp_path, parallel):
+    manager = TaskQueueManager(tmp_path)
+    manager.record_execution_holds({"previous-root"})
+    executor = PendingTaskExecutor(anima=MagicMock(), anima_name="synthetic", anima_dir=tmp_path,
+                                   shutdown_event=asyncio.Event())
+    executor._execute_parallel_task = AsyncMock(return_value="ok")
+    executor._execute_serial_batch_task = AsyncMock(return_value="ok")
+    executor._return_task_to_pending = MagicMock()
+    tasks = [{"task_id": "child", "depends_on": ["previous-root"], "parallel": parallel},
+             {"task_id": "grandchild", "depends_on": ["child"], "parallel": parallel},
+             {"task_id": "independent", "parallel": parallel}]
+    assert await executor._dispatch_batch("later-arrival", tasks) == {"independent"}
+    calls = (executor._execute_parallel_task.await_args_list +
+             executor._execute_serial_batch_task.await_args_list)
+    assert [call.args[0]["task_id"] for call in calls] == ["independent"]
+    executor._return_task_to_pending.assert_not_called()
+    assert all(legacy_execution_hold(tmp_path, tid) for tid in ("child", "grandchild"))
+
+
+def test_recorded_hold_survives_display_updates_compaction_and_reuse(tmp_path):
+    manager = TaskQueueManager(tmp_path)
+    manager.add_task(source="human", original_instruction="synthetic", assignee="synthetic",
+                     summary="synthetic", task_id="task")
+    manager.record_execution_holds({"task", "unregistered-dependent"})
+    manager.update_status("task", status="done")
+    manager.compact()
+    manager.add_task(source="human", original_instruction="synthetic", assignee="synthetic",
+                     summary="synthetic", task_id="task")
+    for tid in ("task", "unregistered-dependent"):
+        assert legacy_execution_hold(tmp_path, tid)
+    before = manager.queue_path.read_bytes()
+    manager.record_execution_holds({"task", "unregistered-dependent"})
+    assert manager.queue_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("fault", ["lock", "corrupt", "symlink", "fsync"])
+def test_hold_persistence_failure_is_not_silently_accepted(tmp_path, fault):
+    from core.exceptions import TaskPersistenceError
+
+    manager = TaskQueueManager(tmp_path)
+    manager.queue_path.parent.mkdir()
+    if fault == "corrupt":
+        manager.queue_path.write_text("{")
+    elif fault == "symlink":
+        target = tmp_path / "untouched"
+        target.write_text("")
+        manager.queue_path.symlink_to(target)
+    if fault in ("lock", "fsync"):
+        symbol = ("core.platform.locks.acquire_file_lock" if fault == "lock"
+                  else "core.memory.task_queue.os.fsync")
+        with (patch(symbol, side_effect=OSError("synthetic unavailable")),
+              pytest.raises((OSError, TaskPersistenceError))):
+            manager.record_execution_holds({"task"})
+    else:
+        with pytest.raises(TaskPersistenceError):
+            manager.record_execution_holds({"task"})
+        if fault == "symlink":
+            assert target.read_text() == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_batch_hold_write_failure_retains_claims_and_stops_dispatch(tmp_path, parallel):
+    from core.exceptions import TaskPersistenceError
+
+    processing = tmp_path / "state/pending/processing"
+    processing.mkdir(parents=True)
+    executor = PendingTaskExecutor(anima=MagicMock(), anima_name="synthetic", anima_dir=tmp_path,
+                                   shutdown_event=asyncio.Event())
+    tasks = [{"task_id": "root", "parallel": parallel},
+             {"task_id": "child", "parallel": parallel, "depends_on": ["root"]}]
+    for task in tasks:
+        path = processing / f'{task["task_id"]}.json'
+        path.write_text(json.dumps(task))
+        processing_lease_path(path).write_text('{"synthetic":"retained"}')
+        executor._batch_processing_paths[task["task_id"]] = path
+    before = {p: p.read_bytes() for p in processing.iterdir()}
+    executor._execute_serial_batch_task = AsyncMock(side_effect=TaskExecutionHeld("synthetic"))
+    executor._execute_parallel_task = AsyncMock(side_effect=TaskExecutionHeld("synthetic"))
+    executor._return_task_to_pending = MagicMock()
+    with (patch.object(TaskQueueManager, "record_execution_holds",
+                       side_effect=TaskPersistenceError("synthetic disk failure")),
+          pytest.raises(TaskPersistenceError)):
+        await executor._execute_claimed_batch("synthetic", tasks)
+    assert {p: p.read_bytes() for p in processing.iterdir()} == before
+    calls = executor._execute_serial_batch_task.await_args_list + executor._execute_parallel_task.await_args_list
+    assert [call.args[0]["task_id"] for call in calls] == ["root"]
+    executor._return_task_to_pending.assert_not_called()
 
 
 @pytest.mark.asyncio
