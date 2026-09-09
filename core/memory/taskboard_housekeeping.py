@@ -13,8 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from core.memory.task_queue import legacy_execution_hold
-from core.platform.processing_lease import is_processing_lease_live, processing_lease_path
+from core.platform.processing_lease import is_processing_lease_live
 from core.time_utils import ensure_aware, now_local, today_local
 
 logger = logging.getLogger("animaworks.housekeeping.taskboard")
@@ -72,12 +71,12 @@ def _cleanup_pending_processing(
     unreadable = 0
     errors = 0
     live_leases_skipped = 0
+    interrupted_retained = 0
 
     for anima_dir in _iter_anima_dirs(animas_dir):
         processing_dir = anima_dir / "state" / "pending" / "processing"
         if not processing_dir.is_dir():
             continue
-        failed_dir = anima_dir / "state" / "pending" / "failed"
         for path in sorted(processing_dir.glob("*.json")):
             try:
                 if path.stat().st_mtime >= cutoff_ts:
@@ -86,41 +85,11 @@ def _cleanup_pending_processing(
                     live_leases_skipped += 1
                     logger.info("Skipping stale processing task with live or inconclusive lease: %s", path)
                     continue
-                payload, valid_json = _read_json_object(path)
-                if not valid_json:
-                    unreadable += 1
-                task_id = _task_id_from_payload(payload, path) if valid_json else ""
-                if legacy_execution_hold(anima_dir, task_id or path.stem):
-                    continue
-                target = _move_with_collision(path, failed_dir, collision_label="recovered")
-                lease_path = processing_lease_path(path)
-                if lease_path.exists():
-                    try:
-                        lease_path.rename(processing_lease_path(target))
-                    except OSError:
-                        logger.warning("Failed to move stale processing lease: %s", lease_path, exc_info=True)
-                recovered += 1
-                synced = False
-                missing = False
-                if task_id:
-                    synced = _requeue_stale_processing_task(anima_dir, task_id)
-                    missing = not synced
-                    if synced:
-                        queue_synced += 1
-                    else:
-                        queue_missing += 1
-                    _append_stale_processing_event(
-                        store,
-                        anima_name=anima_dir.name,
-                        task_id=task_id,
-                        payload={
-                            "path": str(path),
-                            "recovered_path": str(target),
-                            "queue_missing": missing,
-                            "queue_synced": synced,
-                            "valid_json": valid_json,
-                        },
-                    )
+                # A dead worker can have returned a hold without persisting it.
+                # Moving its claim and requeueing would erase that uncertainty.
+                # No checkpoint-backed resume authorization is implemented yet.
+                interrupted_retained += 1
+                logger.warning("Retaining interrupted processing attempt for safe resume review: %s", path)
             except OSError:
                 errors += 1
                 logger.warning("Failed to recover stale processing task: %s", path, exc_info=True)
@@ -134,6 +103,7 @@ def _cleanup_pending_processing(
         "unreadable": unreadable,
         "errors": errors,
         "live_leases_skipped": live_leases_skipped,
+        "interrupted_retained": interrupted_retained,
     }
 
 

@@ -34,7 +34,7 @@ def _write_json(path: Path, payload: dict[str, object], *, age_hours: int = 0) -
     return path
 
 
-def test_stale_processing_moves_to_failed_dir_and_requeues_to_pending(tmp_path: Path) -> None:
+def test_stale_processing_retains_claim_without_requeue(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     anima_dir = _anima_dir(data_dir)
     queue = TaskQueueManager(anima_dir)
@@ -56,24 +56,22 @@ def test_stale_processing_moves_to_failed_dir_and_requeues_to_pending(tmp_path: 
     with patch("core.platform.processing_lease._pid_exists", return_value=False):
         result = cleanup_taskboard_stale_artifacts(data_dir, 24, 48, 24, 30)
 
-    assert result["processing_recovered"] == 1
-    assert result["processing_queue_synced"] == 1
-    assert not processing.exists()
-    assert (anima_dir / "state" / "pending" / "failed" / "task-processing.json").exists()
+    assert result["processing_recovered"] == 0
+    assert result["processing_queue_synced"] == 0
+    assert result["processing_interrupted_retained"] == 1
+    assert processing.exists()
+    assert not (anima_dir / "state" / "pending" / "failed" / "task-processing.json").exists()
 
     task = queue.get_task_by_id("task-processing")
     assert task is not None
-    # "failed" was retired (A1 task-model teardown): a stale processing task
-    # is requeued to pending, not parked as failed.
-    assert task.status == "pending"
-    assert task.summary == "auto-recovered: stale processing task requeued by housekeeping"
+    assert task.status == "in_progress"
+    assert task.summary == "recover this task"
 
     events = TaskBoardStore(data_dir / "shared" / "taskboard.sqlite3").list_events(
         anima_name="sakura",
         task_id="task-processing",
     )
-    assert events[-1]["event_type"] == "stale_processing_recovered"
-    assert events[-1]["payload"]["queue_synced"] is True
+    assert not any(event["event_type"] == "stale_processing_recovered" for event in events)
 
 
 def test_stale_processing_with_live_lease_is_skipped(tmp_path: Path) -> None:
@@ -105,7 +103,7 @@ def test_stale_processing_with_live_lease_is_skipped(tmp_path: Path) -> None:
     assert queue.get_task_by_id("live-processing").status == "in_progress"
 
 
-def test_stale_processing_with_dead_lease_is_recovered(tmp_path: Path) -> None:
+def test_stale_processing_with_dead_lease_is_retained(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     anima_dir = _anima_dir(data_dir)
     queue = TaskQueueManager(anima_dir)
@@ -128,13 +126,13 @@ def test_stale_processing_with_dead_lease_is_recovered(tmp_path: Path) -> None:
         result = cleanup_taskboard_stale_artifacts(data_dir, 24, 48, 24, 30)
 
     failed = anima_dir / "state" / "pending" / "failed" / "dead-processing.json"
-    assert result["processing_recovered"] == 1
-    assert not processing.exists()
-    assert failed.exists()
-    assert not processing_lease_path(processing).exists()
-    assert processing_lease_path(failed).exists()
-    # "failed" was retired (A1 task-model teardown): requeued to pending.
-    assert queue.get_task_by_id("dead-processing").status == "pending"
+    assert result["processing_recovered"] == 0
+    assert result["processing_interrupted_retained"] == 1
+    assert processing.exists()
+    assert not failed.exists()
+    assert processing_lease_path(processing).exists()
+    assert not processing_lease_path(failed).exists()
+    assert queue.get_task_by_id("dead-processing").status == "in_progress"
 
 
 def test_unreadable_processing_file_without_lease_is_preserved(tmp_path: Path) -> None:

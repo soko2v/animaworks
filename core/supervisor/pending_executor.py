@@ -715,11 +715,12 @@ class PendingTaskExecutor:
         anima_dir: Path | None = None,
         return_to_pending: Callable[[dict[str, Any], str], None] | None = None,
     ) -> None:
-        """Return orphaned processing descriptors to their owners on startup.
+        """Preserve interrupted attempts until safe resume is authorized.
 
-        Only conclusively dead leases permit dropping a descriptor and returning
-        the ledger entry to pending with a crash stamp. Missing or inconclusive
-        evidence is preserved; nothing is re-enqueued or retried automatically.
+        Death is not evidence that no work ran or that no hold was returned.
+        A writer may die before persisting its hold. Until checkpoint-backed
+        resume authorization exists, even conclusively dead attempts stay put.
+        The callback parameter is retained for caller compatibility only.
         """
         if not processing_dir.exists():
             return
@@ -731,54 +732,10 @@ class PendingTaskExecutor:
                     orphan.name,
                 )
                 continue
-            task_id = ""
-            task_desc: dict[str, Any] = {}
-            if anima_dir is not None:
-                try:
-                    loaded = json.loads(orphan.read_text(encoding="utf-8"))
-                    task_desc = loaded if isinstance(loaded, dict) else {}
-                    task_id = str(task_desc.get("task_id") or "").strip()
-                except (json.JSONDecodeError, OSError):
-                    task_id = ""
-                if not task_id:
-                    task_id = orphan.stem
-
-                if legacy_execution_hold(anima_dir, task_id):
-                    continue
-
-            try:
-                _unlink_processing_descriptor(orphan)
-                logger.warning("Dropped orphaned processing descriptor: %s", orphan.name)
-            except OSError:
-                logger.exception("Failed to drop orphaned task: %s", orphan.name)
-                continue
-
-            if anima_dir is None or not task_id:
-                continue
-            reason = (
-                "INTERRUPTED: the run was interrupted and may have PARTIALLY "
-                "EXECUTED (commits/messages may already exist). Verify the "
-                "actual state before running this task again."
+            logger.warning(
+                "Interrupted attempt retained; safe resume authorization required: %s",
+                orphan.name,
             )
-            if return_to_pending is not None:
-                return_to_pending({**task_desc, "task_id": task_id}, reason)
-                continue
-            try:
-                from core.memory.task_queue import TaskQueueManager
-
-                manager = TaskQueueManager(anima_dir)
-                entry = manager.get_task_by_id(task_id)
-                if entry is not None and entry.status in _QUEUE_ACTIVE_STATUSES:
-                    manager.update_meta(
-                        task_id,
-                        {"last_run_ended_at": now_iso(), "last_run_stop_kind": "crash"},
-                    )
-                    manager.update_status(task_id, "pending", summary=reason)
-            except Exception:
-                logger.exception(
-                    "Failed to return recovered task to pending: %s",
-                    task_id,
-                )
 
     async def _execute_claimed_llm_task(
         self,

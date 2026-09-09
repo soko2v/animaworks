@@ -55,6 +55,57 @@ def test_archived_group_holds_are_sticky_without_display_tasks(tmp_path):
     assert manager.load_active_tasks() == {}
 
 
+@pytest.mark.parametrize("caller", ["startup_callback", "startup_queue", "housekeeping"])
+@pytest.mark.parametrize("boundary", ["before_write", "write_error"])
+def test_zero_write_hold_failure_must_not_authorize_recovery(tmp_path, caller, boundary):
+    """Acceptance gap: no durable hold exists after our synthetic writer dies."""
+    anima_dir = tmp_path / "animas" / "synthetic"
+    manager = TaskQueueManager(anima_dir)
+    manager.add_task(source="human", original_instruction="synthetic", assignee="synthetic",
+                     summary="synthetic", task_id="root")
+    manager.update_status("root", status="in_progress")
+    processing = anima_dir / "state/pending/processing"
+    processing.mkdir(parents=True)
+    path = processing / "root.json"
+    path.write_text(json.dumps({"task_id": "root", "task_type": "llm"}))
+    processing_lease_path(path).write_text('{"synthetic":"retained claim"}')
+    os.utime(path, (1, 1))
+    before = {p: p.read_bytes() for p in processing.iterdir()}
+    ledger_before = manager.queue_path.read_bytes()
+    code = r'''
+import os, signal, sys
+from pathlib import Path
+from core.memory.task_queue import TaskQueueManager
+manager = TaskQueueManager(Path(sys.argv[1]))
+def interrupted(data):
+    if sys.argv[2] == "write_error":
+        raise OSError("synthetic zero-byte write failure")
+    os.kill(os.getpid(), signal.SIGKILL)
+manager._append_unlocked = interrupted
+try:
+    manager.record_execution_holds({"root", "child"})
+except OSError:
+    os.kill(os.getpid(), signal.SIGKILL)
+raise AssertionError("writer should not survive")
+'''
+    child = subprocess.run([sys.executable, "-c", code, str(anima_dir), boundary],
+                           env=dict(os.environ), capture_output=True, timeout=20)
+    assert child.returncode == -signal.SIGKILL, child.stderr.decode()
+    assert manager.queue_path.read_bytes() == ledger_before
+    assert not legacy_execution_hold(anima_dir, "root")
+    callback = MagicMock()
+    if caller == "housekeeping":
+        with patch("core.memory.taskboard_housekeeping.is_processing_lease_live", return_value=False):
+            _cleanup_pending_processing(tmp_path / "animas", 1, None)
+    else:
+        with patch("core.supervisor.pending_executor.is_processing_lease_live", return_value=False):
+            PendingTaskExecutor._recover_processing(
+                processing, anima_dir, callback if caller == "startup_callback" else None)
+    callback.assert_not_called()
+    assert {p: p.read_bytes() for p in processing.iterdir()} == before
+    assert manager.queue_path.read_bytes() == ledger_before
+
+
 @pytest.mark.parametrize("boundary", ["first_append", "torn_record"])
 def test_hold_group_survives_real_writer_sigkill(tmp_path, boundary):
     """Kill only our isolated synthetic writer, never a service/worker PID."""

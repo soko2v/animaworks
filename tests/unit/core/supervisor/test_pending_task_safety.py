@@ -279,8 +279,8 @@ class TestRecoverProcessing:
 
         assert is_processing_lease_live(descriptor, expected_anima="test-anima")
 
-    def test_crash_returns_layer2_task_to_pending(self, tmp_path: Path) -> None:
-        # A conclusively dead lease permits the upstream crash-return behavior.
+    def test_crash_preserves_layer2_task_without_resume_authorization(self, tmp_path: Path) -> None:
+        # Death alone cannot authorize replay of potentially partial work.
         from core.memory.task_queue import TaskQueueManager
 
         anima_dir = tmp_path / "anima"
@@ -300,17 +300,17 @@ class TestRecoverProcessing:
 
         write_processing_lease(processing_dir / f"{entry.task_id}.json",
                                anima="anima", task_id=entry.task_id, pid=12345)
+        before = {p: p.read_bytes() for p in processing_dir.iterdir()}
+        ledger_before = tqm.queue_path.read_bytes()
         with patch("core.platform.processing_lease._pid_exists", return_value=False):
             PendingTaskExecutor._recover_processing(processing_dir, anima_dir)
 
-        assert not list(processing_dir.glob("*.json"))
-        # No descriptor is regenerated: the owner picks it up from its pending list.
+        assert {p: p.read_bytes() for p in processing_dir.iterdir()} == before
+        assert tqm.queue_path.read_bytes() == ledger_before
         assert not list(tmp_path.glob("*.json"))
         recovered = tqm.get_task_by_id(entry.task_id)
-        assert recovered.status == "pending"
-        assert recovered.summary.startswith("INTERRUPTED:")
-        assert recovered.meta["last_run_stop_kind"] == "crash"
-        assert recovered.meta["last_run_ended_at"]
+        assert recovered.status == "in_progress"
+        assert recovered.summary == "orphaned work"
 
     def test_layer2_sync_leaves_terminal_tasks_untouched(self, tmp_path: Path) -> None:
         # A task that already reached a terminal state must not be flipped.
@@ -559,12 +559,12 @@ class TestExecuteLLMTaskFailureHandling:
         with patch("core.supervisor.pending_executor.is_processing_lease_live", return_value=False):
             PendingTaskExecutor._recover_processing(processing, executor._anima_dir)
 
-        assert not processing_path.exists()
-        # No descriptor is regenerated; the entry simply becomes pending again.
+        assert processing_path.exists()
+        assert processing_lease_path(processing_path).exists()
+        # No replay is authorized by process death.
         assert not (pending / "shutdown.json").exists()
         recovered = queue.get_task_by_id("shutdown")
-        assert recovered.status == "pending"
-        assert recovered.meta["last_run_stop_kind"] == "crash"
+        assert recovered.status == "in_progress"
 
     @pytest.mark.asyncio
     async def test_notification_failure_does_not_propagate(self, tmp_path: Path) -> None:
