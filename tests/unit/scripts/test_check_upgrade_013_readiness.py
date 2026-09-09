@@ -1,11 +1,75 @@
 """Synthetic files only; no runtime server, transport, credentials or models."""
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
 
 from scripts.check_upgrade_013_readiness import inspect_queue, main
+
+
+def test_synthetic_snapshot_restores_config_memory_and_execution_evidence(tmp_path):
+    """Empty destination only; no service, real credentials or live data."""
+    from core.memory.migration.backup import BackupManager
+    from core.memory.task_queue import legacy_execution_hold
+
+    source, restored = tmp_path / "source", tmp_path / "restored"
+    files = {
+        "config.json": '{"version":1}',
+        "animas/synthetic/identity.md": "Synthetic identity",
+        "animas/synthetic/knowledge/example.md": "Synthetic memory",
+        "animas/synthetic/cron.md": "Synthetic schedule, never executed",
+        "animas/synthetic/state/task_queue.jsonl": json.dumps({
+            "task_id": "held", "status": "blocked"}) + "\n" + json.dumps({
+            "task_id": "running", "status": "in_progress"}) + "\n" + json.dumps({
+            "_event": "execution_hold_group", "task_ids": ["held", "child"]}) + "\n",
+        "animas/synthetic/state/pending/processing/running.json": '{"task_id":"running"}',
+        "animas/synthetic/state/pending/processing/running.lease.json": '{"synthetic":true}',
+        "shared/example.md": "Synthetic shared memory",
+    }
+    for name, content in files.items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    snapshot = BackupManager(source).create(label="synthetic-only")
+    shutil.copytree(snapshot, restored / "backup" / snapshot.name)
+    BackupManager(restored).restore(snapshot.name)
+    for name in files:
+        assert (restored / name).read_bytes() == (source / name).read_bytes()
+    anima = restored / "animas/synthetic"
+    assert legacy_execution_hold(anima, "held")
+    assert legacy_execution_hold(anima, "child")
+    assert not inspect_queue(anima / "state/task_queue.jsonl")["ready"]
+
+
+def test_corrupt_snapshot_rejected_before_empty_destination_restore(tmp_path):
+    from core.memory.migration.backup import BackupManager
+
+    source, restored = tmp_path / "source", tmp_path / "restored"
+    source.mkdir()
+    (source / "config.json").write_text('{"synthetic":true}')
+    snapshot = BackupManager(source).create(label="synthetic-corrupt")
+    copied = restored / "backup" / snapshot.name
+    shutil.copytree(snapshot, copied)
+    (copied / "config.json").write_text("corrupt synthetic data")
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        BackupManager(restored).restore(snapshot.name)
+    assert not (restored / "config.json").exists()
+
+
+def test_builtin_memory_backup_is_not_a_complete_auth_snapshot(tmp_path):
+    """Document a cutover blocker, not an accepted full-runtime backup."""
+    from core.memory.migration.backup import BackupManager
+
+    source, restored = tmp_path / "source", tmp_path / "restored"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode":"password"}')
+    snapshot = BackupManager(source).create(label="synthetic-scope")
+    shutil.copytree(snapshot, restored / "backup" / snapshot.name)
+    BackupManager(restored).restore(snapshot.name)
+    assert not (restored / "auth.json").exists()
+    # Never start a server against this incomplete restore.
 
 
 def queue_at(tmp_path: Path, rows: list[object]) -> Path:
