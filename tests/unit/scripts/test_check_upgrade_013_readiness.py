@@ -2,11 +2,83 @@
 
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from scripts.check_upgrade_013_readiness import inspect_queue, main
+
+
+def test_real_runner_process_lock_rejects_duplicate_then_allows_handoff(tmp_path):
+    """Real child process, synthetic state; never starts a runner or model."""
+    from types import SimpleNamespace
+
+    from core.platform.locks import release_file_lock
+    from core.supervisor.runner import AnimaRunner
+
+    owner = SimpleNamespace(shared_dir=tmp_path / "shared", anima_name="synthetic", _lock_file=None)
+    AnimaRunner._acquire_process_lock(owner)
+    pid_path = tmp_path / "run/animas/synthetic.pid"
+    lock_path = pid_path.with_suffix(".lock")
+    original_pid = pid_path.read_bytes()
+    original_inode = lock_path.stat().st_ino
+    child = """
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from core.supervisor.runner import AnimaRunner
+from core.platform.locks import release_file_lock
+owner = SimpleNamespace(shared_dir=Path(sys.argv[1]) / 'shared', anima_name='synthetic', _lock_file=None)
+AnimaRunner._acquire_process_lock(owner)
+release_file_lock(owner._lock_file)
+owner._lock_file.close()
+"""
+    env = {
+        "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home"),
+        "ANIMAWORKS_DATA_DIR": str(tmp_path), "ANIMAWORKS_DISABLE_EXTERNAL_SYNC": "1",
+        "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(Path(__file__).resolve().parents[3]),
+    }
+    def attempt():
+        return subprocess.run([sys.executable, "-c", child, str(tmp_path)],
+                              env=env, capture_output=True, timeout=30)
+    try:
+        rejected = attempt()
+        assert rejected.returncode == 1
+        assert b"DUPLICATE PROCESS" in rejected.stderr
+        assert pid_path.read_bytes() == original_pid
+        assert lock_path.stat().st_ino == original_inode
+    finally:
+        release_file_lock(owner._lock_file)
+        owner._lock_file.close()
+    assert attempt().returncode == 0
+    assert lock_path.stat().st_ino == original_inode
+    assert pid_path.read_bytes() != original_pid
+
+
+def test_explicit_synthetic_auth_vault_restore_uses_real_resolver(tmp_path, monkeypatch):
+    """Manual quiescent fixture copy, NOT a production backup implementation."""
+    from core.auth import manager as auth
+    from core.auth.models import AuthConfig
+    from core.config.vault import VaultManager, resolve_vault_references
+
+    source, restored = tmp_path / "source", tmp_path / "restored"
+    source.mkdir(mode=0o700)
+    monkeypatch.setattr(auth, "get_data_dir", lambda: source)
+    auth.save_auth(AuthConfig())
+    vault = VaultManager(source)
+    assert vault.is_encryption_available, "Encrypted restoration must not silently use plaintext fallback"
+    assert vault.generate_key()
+    vault.store("shared", "SYNTHETIC", "synthetic-not-a-real-credential")
+    shutil.copytree(source, restored)
+    assert (restored.stat().st_mode & 0o777) == 0o700
+    for name in ("auth.json", "vault.json", "vault.key"):
+        assert (restored / name).read_bytes() == (source / name).read_bytes()
+        assert (restored / name).stat().st_mode & 0o777 == 0o600
+    monkeypatch.setattr(auth, "get_data_dir", lambda: restored)
+    assert auth.load_auth() == AuthConfig()
+    assert resolve_vault_references({"$vault": "SYNTHETIC"}, restored) == "synthetic-not-a-real-credential"
 
 
 def test_synthetic_snapshot_restores_config_memory_and_execution_evidence(tmp_path):
