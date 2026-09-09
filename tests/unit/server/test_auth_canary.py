@@ -4,9 +4,10 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -47,6 +48,80 @@ def client_for(app, host="127.0.0.1", headers=None):
         transport=ASGITransport(app=app, client=(host, 12345)),
         base_url="http://127.0.0.1:18502", headers=headers,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "parallel", "provider_error", "cancelled"])
+async def test_authenticated_route_real_ipc_one_shot(canary, outcome):
+    """Real synthetic password session and Unix IPC, no real provider."""
+    import asyncio
+
+    from core.supervisor.canary import CanaryIPCService
+    from core.supervisor.ipc import IPCClient, IPCRequest
+    from server.canary import _create_canary_app
+
+    provider = AsyncMock(return_value="CANARY_OK")
+    if outcome == "provider_error":
+        provider.side_effect = RuntimeError("synthetic-secret")
+    if outcome == "cancelled":
+        provider.side_effect = asyncio.CancelledError()
+    with tempfile.TemporaryDirectory(prefix="aw-c-", dir="/tmp") as directory:
+        path = Path(directory).resolve() / "probe.sock"
+        service = CanaryIPCService(path, provider)
+        ipc = IPCClient(path)
+
+        class ProbeSupervisor:
+            def is_bootstrapping(self, name):
+                assert name == "h2-canary"
+                return False
+
+            async def send_request(self, *, anima_name, method, params, timeout):
+                assert anima_name == "h2-canary"
+                try:
+                    result = await ipc.send_request(IPCRequest("probe", method, params), timeout=1)
+                    if result.error:
+                        raise RuntimeError("Canary admission closed")
+                    return result.result
+                except Exception:
+                    raise RuntimeError("Canary admission closed") from None
+
+        await service.start()
+        try:
+            app = _create_canary_app(probe_supervisor=ProbeSupervisor())
+            async with client_for(app) as client:
+                url = "/api/animas/h2-canary/chat"
+                payload = {"message": "Reply with CANARY_OK only."}
+                assert (await client.post(url, json=payload)).status_code == 503
+                provider.assert_not_called()
+                assert (await client.post("/api/auth/login", json={
+                    "username": "operator", "password": "synthetic-password",
+                })).status_code == 200
+                for bad in [
+                    {**payload, "model": "other"}, {**payload, "images": [{}]},
+                    {**payload, "from_person": "other"}, {**payload, "extra": True},
+                    {"message": "x" * 300}, {"message": "run a tool"},
+                ]:
+                    assert (await client.post(url, json=bad)).status_code == 503
+                for suffix in ["/stream", "/../greet"]:
+                    assert (await client.post(url + suffix, json=payload)).status_code == 503
+                provider.assert_not_called()
+                if outcome == "parallel":
+                    responses = await asyncio.gather(client.post(url, json=payload), client.post(url, json=payload))
+                    assert sorted(r.status_code for r in responses) == [200, 503]
+                    response = next(r for r in responses if r.status_code == 200)
+                else:
+                    response = await client.post(url, json=payload)
+                assert response.status_code == (200 if outcome in {"success", "parallel"} else 500)
+                assert "synthetic-secret" not in response.text
+                if outcome in {"success", "parallel"}:
+                    assert response.json()["response"] == "CANARY_OK"
+                assert (await client.post(url, json=payload)).status_code == 503
+                assert (await client.post("/api/auth/logout")).status_code == 200
+                assert (await client.post(url, json=payload)).status_code == 503
+                provider.assert_awaited_once()
+        finally:
+            await ipc.close()
+            await service.stop()
 
 
 @pytest.mark.asyncio

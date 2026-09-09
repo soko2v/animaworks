@@ -10,6 +10,7 @@ This is not an OS sandbox against a malicious same-UID operator or root.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pwd
@@ -61,9 +62,11 @@ def _validate_roots() -> tuple[Path, Path]:
 
 
 class _AuthCanaryGate:
-    def __init__(self, app: ASGIApp, roots: tuple[Path, Path]) -> None:
+    def __init__(self, app: ASGIApp, roots: tuple[Path, Path], *, chat_probe: bool = False) -> None:
         self.app = app
         self.roots = roots
+        self.chat_probe = chat_probe
+        self.chat_spent = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":
@@ -102,7 +105,47 @@ class _AuthCanaryGate:
                 scope.setdefault("state", {})["user"] = find_user(auth, session.username) if session else None
                 await self.app(scope, receive, send)
                 return
-        except (ValueError, OSError):
+            elif self.chat_probe and (method, path) == ("POST", "/api/animas/h2-canary/chat"):
+                session = validate_session(request.cookies.get("session_token"))
+                user = find_user(auth, session.username) if session else None
+                if user is None or user.username != "operator" or self.chat_spent:
+                    raise ValueError("Authenticated operator required")
+                # Bound the raw body before the normal route can save attachments
+                # or normalize away unexpected fields. Only this fixed probe is admitted.
+                body = bytearray()
+                async with asyncio.timeout(5):
+                    while True:
+                        message = await receive()
+                        if message["type"] != "http.request":
+                            raise ValueError("Incomplete request")
+                        body.extend(message.get("body", b""))
+                        if len(body) > 256:
+                            raise ValueError("Oversized probe")
+                        if not message.get("more_body", False):
+                            break
+                if json.loads(body) != {"message": "Reply with CANARY_OK only."}:
+                    raise ValueError("Fixed probe required")
+                # Re-check after body receipt: concurrent requests must not both
+                # pass, and logout/environment changes while receiving must close.
+                current = validate_session(request.cookies.get("session_token"))
+                if self.chat_spent or current is None or current.username != "operator":
+                    raise ValueError("Probe consumed or session revoked")
+                if _validate_roots() != self.roots:
+                    raise ValueError("Canary roots changed")
+                self.chat_spent = True
+                scope.setdefault("state", {})["user"] = user
+                delivered = False
+
+                async def replay() -> dict:
+                    nonlocal delivered
+                    if not delivered:
+                        delivered = True
+                        return {"type": "http.request", "body": bytes(body), "more_body": False}
+                    return await receive()
+
+                await self.app(scope, replay, send)
+                return
+        except (ValueError, OSError, TimeoutError):
             # Do not include settings, request contents or secrets in diagnostics.
             pass
         response.headers["Cache-Control"] = "no-store"
@@ -111,6 +154,16 @@ class _AuthCanaryGate:
 
 def create_auth_canary_app() -> FastAPI:
     """Authentication-only preparation; no model/runner or release endpoint."""
+    return _create_canary_app()
+
+
+def _create_canary_app(*, probe_supervisor=None) -> FastAPI:
+    """Internal integration seam, NOT a production launch factory.
+
+    A caller-supplied adapter is trusted code, not a verified provider sandbox.
+    The public zero-argument auth factory remains chat-closed. Do not expose a
+    CLI/env toggle until the real provider and child ownership pass review.
+    """
     roots = _validate_roots()
     from core.auth.manager import load_auth
 
@@ -121,5 +174,10 @@ def create_auth_canary_app() -> FastAPI:
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.include_router(create_auth_router(), prefix="/api")
-    app.add_middleware(_AuthCanaryGate, roots=roots)
+    if probe_supervisor is not None:
+        from server.routes.chat import create_chat_router
+
+        app.state.supervisor = probe_supervisor
+        app.include_router(create_chat_router(), prefix="/api")
+    app.add_middleware(_AuthCanaryGate, roots=roots, chat_probe=probe_supervisor is not None)
     return app
