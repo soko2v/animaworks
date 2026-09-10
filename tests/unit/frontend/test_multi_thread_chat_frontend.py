@@ -60,6 +60,8 @@ class TestThreadRename:
         assert '"dblclick"' in js
         assert "renameDblclickBound" in js, "dblclick must be delegated to the container (tabs re-render on select)"
         assert "chat-thread-dd-rename" in js, "mobile dropdown needs a rename affordance"
+        assert 'renameThread(tid, "dropdown")' in js, "dropdown rename must restore focus in the dropdown (tabs are hidden on mobile)"
+        assert '.chat-thread-dd-rename[data-thread=' in js
         assert "scheduleSaveChatUiState(ctx)" in js.split("function renameThread(")[1].split("\n  }\n")[0], \
             "rename must persist via chat ui-state"
 

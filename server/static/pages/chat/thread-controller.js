@@ -192,7 +192,11 @@ export function createThreadController(ctx) {
     scheduleSaveChatUiState(ctx);
   }
 
-  function renameThread(threadId) {
+  /**
+   * @param {string} threadId
+   * @param {"tabs"|"dropdown"} source - Which control initiated the rename (focus is restored there).
+   */
+  function renameThread(threadId, source = "tabs") {
     if (!state.selectedAnima) return;
     const list = state.threads[state.selectedAnima] || [{ id: "default", label: t("thread.default_label"), unread: false }];
     const target = list.find(th => th.id === threadId);
@@ -207,14 +211,28 @@ export function createThreadController(ctx) {
     renderThreadTabs();
     renderThreadDropdownMenu();
     scheduleSaveChatUiState(ctx);
-    _focusRenameControl($("chatThreadTabs"), threadId);
+    _focusRenameControl(threadId, source);
   }
 
-  /** Re-render drops focus; move it back to the renamed tab's rename control (keyboard users). */
-  function _focusRenameControl(container, threadId) {
-    if (!container || typeof CSS === "undefined" || !CSS.escape) return;
-    const el = container.querySelector(`.thread-tab-rename[data-thread="${CSS.escape(threadId)}"]`)
-      || container.querySelector(`.thread-tab[data-thread="${CSS.escape(threadId)}"]`);
+  /**
+   * Re-rendering drops keyboard focus; move it back to the rename control that
+   * initiated the rename. On mobile the tab strip is display:none, so
+   * dropdown-initiated renames restore focus inside the rebuilt dropdown
+   * (falling back to the dropdown toggle).
+   */
+  function _focusRenameControl(threadId, source) {
+    if (typeof CSS === "undefined" || !CSS.escape) return;
+    const tid = CSS.escape(threadId);
+    let el = null;
+    if (source === "dropdown") {
+      const menu = $("chatThreadDropdownMenu");
+      el = menu?.querySelector(`.chat-thread-dd-rename[data-thread="${tid}"]`)
+        || $("chatThreadDropdown")?.querySelector("button, [role=\"button\"]");
+    } else {
+      const tabs = $("chatThreadTabs");
+      el = tabs?.querySelector(`.thread-tab-rename[data-thread="${tid}"]`)
+        || tabs?.querySelector(`.thread-tab[data-thread="${tid}"]`);
+    }
     if (el) el.focus();
   }
 
@@ -288,7 +306,7 @@ export function createThreadController(ctx) {
       btn.addEventListener("click", e => {
         e.stopPropagation();
         const tid = btn.dataset.thread;
-        if (tid) renameThread(tid);
+        if (tid) renameThread(tid, "dropdown");
       });
     });
     menu.querySelectorAll(".chat-thread-dd-item.archived").forEach(el => {
