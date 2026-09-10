@@ -116,7 +116,9 @@ export const THREAD_LABEL_MAX_LENGTH = 60;
  */
 export function normalizeThreadLabel(label) {
   if (typeof label !== "string") return "";
-  return label.replace(/\s+/g, " ").trim().slice(0, THREAD_LABEL_MAX_LENGTH);
+  const collapsed = label.replace(/\s+/g, " ").trim();
+  // Truncate by code points so surrogate pairs (emoji etc.) are never split.
+  return Array.from(collapsed).slice(0, THREAD_LABEL_MAX_LENGTH).join("").trim();
 }
 
 /**

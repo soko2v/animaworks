@@ -130,6 +130,16 @@ assert.equal(THREAD_AUTO_ARCHIVE_MS, 7 * DAY);
   assert.equal(THREAD_LABEL_MAX_LENGTH, 60);
 }
 
+// ── normalizeThreadLabel: truncation never splits surrogate pairs (emoji) ──
+{
+  const input = "a".repeat(THREAD_LABEL_MAX_LENGTH - 1) + "\\u{1F600}\\u{1F600}";
+  const out = normalizeThreadLabel(input);
+  assert.equal(Array.from(out).length, THREAD_LABEL_MAX_LENGTH, "counted by code points");
+  assert.ok(out.endsWith("\\u{1F600}"), "last emoji kept whole");
+  assert.ok(!/[\\uD800-\\uDBFF]$/.test(out), "no lone high surrogate");
+  assert.equal(normalizeThreadLabel("a".repeat(THREAD_LABEL_MAX_LENGTH) + "  x"), "a".repeat(THREAD_LABEL_MAX_LENGTH));
+}
+
 console.log("thread-logic lifecycle tests passed");
 """
 

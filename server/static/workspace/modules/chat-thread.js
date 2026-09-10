@@ -68,13 +68,17 @@ export function renderWsThreadTabs() {
       if (tid) renameWsThread(tid);
     });
   });
-  container.querySelectorAll(".thread-tab").forEach(btn => {
-    btn.addEventListener("dblclick", e => {
+  // Delegated: selecting an inactive tab re-renders the tabs between the two clicks.
+  if (!container.dataset.renameDblclickBound) {
+    container.dataset.renameDblclickBound = "1";
+    container.addEventListener("dblclick", e => {
+      const tab = e.target.closest(".thread-tab");
+      if (!tab || !container.contains(tab)) return;
       e.preventDefault();
-      const tid = e.currentTarget.dataset.thread;
+      const tid = tab.dataset.thread;
       if (tid) renameWsThread(tid);
     });
-  });
+  }
   const newBtn = document.getElementById("wsNewThreadBtn");
   if (newBtn) newBtn.addEventListener("click", () => createWsNewThread());
 }
@@ -147,6 +151,11 @@ export function renameWsThread(threadId) {
   if (updated === list) return;
   setState({ threads: { ...threads, [animaName]: updated } });
   renderWsThreadTabs();
+  const container = _getDom().threadTabs;
+  if (container && typeof CSS !== "undefined" && CSS.escape) {
+    const el = container.querySelector(`.thread-tab-rename[data-thread="${CSS.escape(threadId)}"]`);
+    if (el) el.focus();
+  }
 }
 
 export function closeWsThread(threadId) {

@@ -58,6 +58,7 @@ class TestThreadRename:
         assert "renameThread as sharedRenameThread" in js
         assert '".thread-tab-rename"' in js
         assert '"dblclick"' in js
+        assert "renameDblclickBound" in js, "dblclick must be delegated to the container (tabs re-render on select)"
         assert "chat-thread-dd-rename" in js, "mobile dropdown needs a rename affordance"
         assert "scheduleSaveChatUiState(ctx)" in js.split("function renameThread(")[1].split("\n  }\n")[0], \
             "rename must persist via chat ui-state"
@@ -68,6 +69,7 @@ class TestThreadRename:
         assert "export function renameWsThread(" in js
         assert '".thread-tab-rename"' in js
         assert '"dblclick"' in js
+        assert "renameDblclickBound" in js, "dblclick must be delegated to the container (tabs re-render on select)"
 
     def test_i18n_keys_present_in_all_locales(self) -> None:
         import json

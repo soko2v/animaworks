@@ -52,13 +52,19 @@ export function createThreadController(ctx) {
         if (tid) renameThread(tid);
       });
     });
-    container.querySelectorAll(".thread-tab").forEach(btn => {
-      btn.addEventListener("dblclick", e => {
+    // Double-click rename is delegated to the persistent container: the first click
+    // on an inactive tab selects it and re-renders the tabs, so a per-node listener
+    // would be discarded before the second click arrives.
+    if (!container.dataset.renameDblclickBound) {
+      container.dataset.renameDblclickBound = "1";
+      container.addEventListener("dblclick", e => {
+        const tab = e.target.closest(".thread-tab");
+        if (!tab || !container.contains(tab)) return;
         e.preventDefault();
-        const tid = e.currentTarget.dataset.thread;
+        const tid = tab.dataset.thread;
         if (tid) renameThread(tid);
       });
-    });
+    }
     const newBtn = $("chatNewThreadBtn");
     if (newBtn) newBtn.addEventListener("click", () => createNewThread());
 
@@ -201,6 +207,15 @@ export function createThreadController(ctx) {
     renderThreadTabs();
     renderThreadDropdownMenu();
     scheduleSaveChatUiState(ctx);
+    _focusRenameControl($("chatThreadTabs"), threadId);
+  }
+
+  /** Re-render drops focus; move it back to the renamed tab's rename control (keyboard users). */
+  function _focusRenameControl(container, threadId) {
+    if (!container || typeof CSS === "undefined" || !CSS.escape) return;
+    const el = container.querySelector(`.thread-tab-rename[data-thread="${CSS.escape(threadId)}"]`)
+      || container.querySelector(`.thread-tab[data-thread="${CSS.escape(threadId)}"]`);
+    if (el) el.focus();
   }
 
   function renderThreadDropdownMenu() {
