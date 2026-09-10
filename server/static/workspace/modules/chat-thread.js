@@ -8,6 +8,7 @@ import { t } from "../../shared/i18n.js";
 import {
   renderThreadTabsHtml, createThread as sharedCreateThread,
   closeThread as sharedCloseThread,
+  renameThread as sharedRenameThread,
 } from "../../shared/chat/thread-logic.js";
 import { ChatSessionManager } from "../../shared/chat/session-manager.js";
 import { HISTORY_PAGE_SIZE } from "./chat-history.js";
@@ -58,6 +59,20 @@ export function renderWsThreadTabs() {
       e.stopPropagation();
       const tid = e.target.dataset.thread;
       if (tid) closeWsThread(tid);
+    });
+  });
+  container.querySelectorAll(".thread-tab-rename").forEach(btn => {
+    btn.addEventListener("click", e => {
+      e.stopPropagation();
+      const tid = e.currentTarget.dataset.thread;
+      if (tid) renameWsThread(tid);
+    });
+  });
+  container.querySelectorAll(".thread-tab").forEach(btn => {
+    btn.addEventListener("dblclick", e => {
+      e.preventDefault();
+      const tid = e.currentTarget.dataset.thread;
+      if (tid) renameWsThread(tid);
     });
   });
   const newBtn = document.getElementById("wsNewThreadBtn");
@@ -114,6 +129,24 @@ export function createWsNewThread() {
   renderWsThreadTabs();
   _renderConvMessages();
   _refreshSentinel();
+}
+
+export function renameWsThread(threadId) {
+  const animaName = getState().conversationAnima;
+  if (!animaName) return;
+
+  const { threads } = getState();
+  const list = threads[animaName] || [{ id: "default", label: t("thread.default_label"), unread: false }];
+  const target = list.find(th => th.id === threadId);
+  if (!target) return;
+
+  const entered = window.prompt(t("thread.rename_prompt"), target.label || "");
+  if (entered === null) return;
+
+  const updated = sharedRenameThread(list, threadId, entered);
+  if (updated === list) return;
+  setState({ threads: { ...threads, [animaName]: updated } });
+  renderWsThreadTabs();
 }
 
 export function closeWsThread(threadId) {

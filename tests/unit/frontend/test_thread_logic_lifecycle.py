@@ -24,6 +24,7 @@ NODE_SCRIPT = """
 import assert from "node:assert/strict";
 import {
   createThread, autoArchiveStaleThreads, restoreThread, THREAD_AUTO_ARCHIVE_MS,
+  renameThread, normalizeThreadLabel, THREAD_LABEL_MAX_LENGTH,
 } from "./thread-logic.js";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -89,6 +90,45 @@ const iso = (agoMs) => new Date(Date.now() - agoMs).toISOString();
 
 // ── sanity: threshold is 7 days ──
 assert.equal(THREAD_AUTO_ARCHIVE_MS, 7 * DAY);
+
+// ── renameThread: applies normalized label, keeps other fields ──
+{
+  const list = [
+    { id: "default", label: "main" },
+    { id: "abc", label: "Thread 03:34", unread: true, lastTs: iso(1 * DAY) },
+  ];
+  const out = renameThread(list, "abc", "  LEAP   設計  ");
+  assert.notEqual(out, list);
+  const renamed = out.find(t => t.id === "abc");
+  assert.equal(renamed.label, "LEAP 設計");
+  assert.equal(renamed.unread, true, "other fields preserved");
+  assert.equal(renamed.lastTs, list[1].lastTs);
+  assert.equal(out.find(t => t.id === "default").label, "main");
+  assert.equal(list[1].label, "Thread 03:34", "input not mutated");
+}
+
+// ── renameThread: default thread is renamable too ──
+{
+  const list = [{ id: "default", label: "main" }];
+  assert.equal(renameThread(list, "default", "Home")[0].label, "Home");
+}
+
+// ── renameThread: no-op cases return the same reference (no spurious saves) ──
+{
+  const list = [{ id: "default", label: "main" }, { id: "abc", label: "x" }];
+  assert.equal(renameThread(list, "abc", ""), list, "empty");
+  assert.equal(renameThread(list, "abc", "   \\n\\t "), list, "whitespace only");
+  assert.equal(renameThread(list, "abc", "x"), list, "identical");
+  assert.equal(renameThread(list, "missing", "y"), list, "unknown id");
+  assert.equal(renameThread(list, "abc", null), list, "non-string");
+}
+
+// ── normalizeThreadLabel: truncation ──
+{
+  const long = "a".repeat(THREAD_LABEL_MAX_LENGTH + 20);
+  assert.equal(normalizeThreadLabel(long).length, THREAD_LABEL_MAX_LENGTH);
+  assert.equal(THREAD_LABEL_MAX_LENGTH, 60);
+}
 
 console.log("thread-logic lifecycle tests passed");
 """

@@ -37,6 +37,51 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+# ── TestThreadRename ────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestThreadRename:
+    """Thread labels are user-editable in both chat surfaces."""
+
+    THREAD_LOGIC_JS = PROJECT_ROOT / "server" / "static" / "shared" / "chat" / "thread-logic.js"
+    I18N_DIR = PROJECT_ROOT / "server" / "static" / "i18n"
+    RESPONSIVE_CSS = PROJECT_ROOT / "server" / "static" / "styles" / "responsive.css"
+
+    def test_shared_logic_renders_rename_button_and_exports_rename(self) -> None:
+        js = _read(self.THREAD_LOGIC_JS)
+        assert "export function renameThread(" in js
+        assert 'class="thread-tab-rename"' in js
+
+    def test_chat_page_binds_rename_button_and_dblclick(self) -> None:
+        js = _read(CHAT_THREAD_JS)
+        assert "renameThread as sharedRenameThread" in js
+        assert '".thread-tab-rename"' in js
+        assert '"dblclick"' in js
+        assert "chat-thread-dd-rename" in js, "mobile dropdown needs a rename affordance"
+        assert "scheduleSaveChatUiState(ctx)" in js.split("function renameThread(")[1].split("\n  }\n")[0], \
+            "rename must persist via chat ui-state"
+
+    def test_workspace_binds_rename_button_and_dblclick(self) -> None:
+        js = _read(WORKSPACE_CHAT_THREAD_JS)
+        assert "renameThread as sharedRenameThread" in js
+        assert "export function renameWsThread(" in js
+        assert '".thread-tab-rename"' in js
+        assert '"dblclick"' in js
+
+    def test_i18n_keys_present_in_all_locales(self) -> None:
+        import json
+        for lang in ("ja", "en", "ko"):
+            data = json.loads((self.I18N_DIR / f"{lang}.json").read_text(encoding="utf-8"))
+            for key in ("thread.rename", "thread.rename_short", "thread.rename_prompt", "thread.rename_hint"):
+                assert data.get(key), f"{lang}: missing {key}"
+
+    def test_css_has_rename_styles(self) -> None:
+        assert ".thread-tab-rename" in _read(CHAT_CSS)
+        assert ".chat-thread-dd-rename" in _read(self.RESPONSIVE_CSS)
+        assert ".ws-thread-tabs .thread-tab-rename" in _read(WORKSPACE_STYLE)
+
+
 # ── TestChatJsThreadTabs ────────────────────────────────────
 
 

@@ -105,6 +105,36 @@ export function closeThread(threadList, threadId) {
   return archiveThread(threadList, threadId);
 }
 
+/** Maximum accepted length for a user-provided thread label. */
+export const THREAD_LABEL_MAX_LENGTH = 60;
+
+/**
+ * Normalize a user-provided thread label.
+ * Collapses internal whitespace, trims, and truncates to THREAD_LABEL_MAX_LENGTH.
+ * @param {string} label
+ * @returns {string} Normalized label ("" when nothing usable remains)
+ */
+export function normalizeThreadLabel(label) {
+  if (typeof label !== "string") return "";
+  return label.replace(/\s+/g, " ").trim().slice(0, THREAD_LABEL_MAX_LENGTH);
+}
+
+/**
+ * Rename a thread. Returns the same list reference when nothing changes
+ * (unknown id, empty label, or identical label) so callers can skip saves.
+ * @param {Array} threadList
+ * @param {string} threadId
+ * @param {string} label - Raw user input
+ * @returns {Array} Updated list
+ */
+export function renameThread(threadList, threadId, label) {
+  const next = normalizeThreadLabel(label);
+  if (!next) return threadList;
+  const idx = threadList.findIndex(th => th.id === threadId);
+  if (idx < 0 || threadList[idx].label === next) return threadList;
+  return threadList.map(th => th.id === threadId ? { ...th, label: next } : th);
+}
+
 /**
  * Generate thread tabs HTML string.
  * @param {Array} threadList
@@ -158,7 +188,11 @@ export function renderThreadTabsHtml(threadList, activeThreadId, opts) {
     const closeBtn = th.id !== "default"
       ? ` <button type="button" class="thread-tab-close" data-thread="${escapeHtml(th.id)}" title="${escapeHtml(t("thread.close"))}" aria-label="${escapeHtml(t("thread.close_short"))}">&times;</button>`
       : "";
-    html += `<span class="thread-tab-wrap"><button type="button" class="thread-tab${activeClass}${streamClass}${completeClass}" data-thread="${escapeHtml(th.id)}">${escapeHtml(th.label)}${star}</button>${closeBtn}</span>`;
+    // Rename affordance only on the active tab (double-click works on any tab).
+    const renameBtn = th.id === activeThreadId
+      ? `<button type="button" class="thread-tab-rename" data-thread="${escapeHtml(th.id)}" title="${escapeHtml(t("thread.rename"))}" aria-label="${escapeHtml(t("thread.rename_short"))}">✎</button>`
+      : "";
+    html += `<span class="thread-tab-wrap"><button type="button" class="thread-tab${activeClass}${streamClass}${completeClass}" data-thread="${escapeHtml(th.id)}" title="${escapeHtml(t("thread.rename_hint"))}">${escapeHtml(th.label)}${star}</button>${renameBtn}${closeBtn}</span>`;
   }
 
   if (hiddenThreads.length > 0) {
