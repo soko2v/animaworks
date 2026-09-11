@@ -1228,11 +1228,11 @@ class SchedulerManager:
             )
             return True
 
-        for t in new_tasks:
+        for candidate in new_tasks:
             if (
-                t.name == fired_job.name
-                and t.schedule == fired_job.schedule
-                and t.type == fired_job.type
+                candidate.name == fired_job.name
+                and candidate.schedule == fired_job.schedule
+                and candidate.type == fired_job.type
             ):
                 logger.debug(
                     "Freshness: fired job '%s' still present after cron.md reload for %s — running",
