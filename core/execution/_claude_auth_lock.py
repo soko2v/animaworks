@@ -43,6 +43,36 @@ def trip_claude_oauth_circuit(env: dict[str, str] | None, error_text: str) -> bo
     return True
 
 
+def trip_claude_oauth_circuit_from_result(
+    env: dict[str, str] | None,
+    result: object,
+    text: str,
+    assistant_error: str | None = None,
+) -> bool:
+    """Inspect SDK failure results, never ordinary generated assistant text."""
+    subtype = getattr(result, "subtype", "")
+    is_error = (
+        getattr(result, "is_error", False) is True
+        or (isinstance(subtype, str) and subtype.startswith("error_"))
+        or bool(assistant_error)
+    )
+    result_text = getattr(result, "result", None)
+    if not is_error:
+        # Some SDK versions return only an auth error result without marking
+        # it as an error. Any assistant content rules out this fallback.
+        from core.execution.error_classifier import detect_cli_error_envelope
+
+        if text.strip() or not isinstance(result_text, str) or not detect_cli_error_envelope(result_text):
+            return False
+    errors = getattr(result, "errors", None)
+    details = [item for item in errors if isinstance(item, str)] if isinstance(errors, list) else []
+    if isinstance(result_text, str):
+        details.append(result_text)
+    if is_error:
+        details.extend([text, assistant_error or ""])
+    return trip_claude_oauth_circuit(env, "\n".join(details))
+
+
 def clear_claude_oauth_circuit(profile: Path) -> None:
     """Reset the circuit after a successful centralized re-login."""
     claude_circuit_path(profile).unlink(missing_ok=True)

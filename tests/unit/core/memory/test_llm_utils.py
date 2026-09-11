@@ -452,3 +452,33 @@ class TestStripProviderPrefix:
         assert llm_utils._strip_provider_prefix("anthropic/claude-sonnet-4-6") == "claude-sonnet-4-6"
         assert llm_utils._strip_provider_prefix("bedrock/jp.anthropic.claude-sonnet-4-6") == "claude-sonnet-4-6"
         assert llm_utils._strip_provider_prefix("vertex_ai/claude-sonnet-4-6") == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["quoted_success", "result_error", "assistant_error", "result_only"])
+async def test_one_shot_oauth_circuit_ignores_generated_quotes(tmp_path, shape):
+    from core.execution._claude_auth_lock import claude_circuit_path
+    from tests.helpers.mocks import MockAssistantMessage, MockClaudeSDKClient, MockResultMessage, MockTextBlock, patch_agent_sdk
+
+    auth_text = "API Error: 401 OAuth access token has been revoked"
+    assistant = MockAssistantMessage([MockTextBlock(f'The document says "{auth_text}".')])
+    result = MockResultMessage()
+    result.subtype = "success"
+    if shape == "result_error":
+        result.is_error = True
+        result.result = auth_text
+    elif shape == "assistant_error":
+        assistant.error = "authentication_failed"
+        assistant.content = [MockTextBlock(auth_text)]
+    elif shape == "result_only":
+        assistant.content = []
+        result.result = auth_text
+    profile = tmp_path / "profile"
+    with (
+        patch_agent_sdk(),
+        patch("claude_agent_sdk.ClaudeSDKClient", side_effect=lambda **kwargs: MockClaudeSDKClient(messages=[assistant, result], **kwargs)),
+        patch.object(llm_utils, "_build_sdk_env", return_value={"CLAUDE_HOME": str(profile)}),
+        patch("core.execution._sdk_options._resolve_sdk_cli_path", return_value=None),
+    ):
+        await llm_utils._try_agent_sdk("test", system_prompt="", model="claude-sonnet-4-6", max_tokens=10)
+    assert claude_circuit_path(profile).exists() is (shape != "quoted_success")

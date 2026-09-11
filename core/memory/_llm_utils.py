@@ -456,17 +456,28 @@ async def _try_agent_sdk(
         options = ClaudeAgentOptions(**options_kwargs)
 
     chunks: list[str] = []
-    from core.execution._claude_auth_lock import claude_execution_lock, trip_claude_oauth_circuit
+    from core.execution._claude_auth_lock import (
+        claude_execution_lock,
+        trip_claude_oauth_circuit,
+        trip_claude_oauth_circuit_from_result,
+    )
 
+    result_message = None
+    assistant_error = None
     try:
         async with claude_execution_lock(env), ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for message in client.receive_response():
+                if hasattr(message, "subtype"):
+                    result_message = message
+                error = getattr(message, "error", None)
+                if isinstance(error, str) and error:
+                    assistant_error = error
                 if hasattr(message, "content"):
                     for block in message.content:
                         if hasattr(block, "text"):
                             chunks.append(block.text)
-            trip_claude_oauth_circuit(env, "\n".join(chunks))
+            trip_claude_oauth_circuit_from_result(env, result_message, "\n".join(chunks), assistant_error)
     except Exception as e:
         trip_claude_oauth_circuit(env, str(e))
         logger.warning("Agent SDK one-shot failed: %s", e)

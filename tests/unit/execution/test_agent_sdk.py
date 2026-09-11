@@ -932,3 +932,41 @@ class TestExecutionResultUnconfirmedSends:
         result = ExecutionResult(text="hello", unconfirmed_sends=sends)
         assert result.unconfirmed_sends == sends
         assert len(result.unconfirmed_sends) == 1
+
+
+@pytest.mark.parametrize("mode", ["blocking", "streaming", "fresh_streaming"])
+@pytest.mark.parametrize("shape", ["quoted_success", "result_error", "assistant_error", "result_only"])
+async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir, mode, shape):
+    from types import SimpleNamespace
+
+    from core.execution._claude_auth_lock import claude_circuit_path
+    from core.execution.agent_sdk import AgentSDKExecutor
+    from core.prompt.context import ContextTracker
+
+    auth_text = "API Error: 401 OAuth access token has been revoked"
+    quoted = f'The document quotes "{auth_text}". This is an example.'
+    assistant = MockAssistantMessage([MockTextBlock(quoted)])
+    result = MockResultMessage()
+    if shape == "result_error":
+        result.is_error = True
+        result.result = auth_text
+    elif shape == "assistant_error":
+        assistant.error = "authentication_failed"
+        assistant.content = [MockTextBlock(auth_text)]
+    elif shape == "result_only":
+        assistant.content = []
+        result.result = auth_text
+    sequence = [assistant, result]
+    sequences = [[], sequence] if mode == "fresh_streaming" else [sequence]
+    profile = anima_dir / "oauth-profile"
+    with _patch_agent_sdk_sequences(sequences):
+        executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
+        with (
+            patch.object(executor, "_build_sdk_options", return_value=(SimpleNamespace(env={"CLAUDE_HOME": str(profile)}), [])),
+            patch("core.execution.agent_sdk._load_session_id", return_value="old" if mode == "fresh_streaming" else None),
+        ):
+            if mode == "blocking":
+                await executor.execute("test")
+            else:
+                _ = [event async for event in executor.execute_streaming("sys", "test", ContextTracker(model=model_config.model))]
+    assert claude_circuit_path(profile).exists() is (shape != "quoted_success")

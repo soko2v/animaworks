@@ -47,6 +47,7 @@ from core.execution._claude_auth_lock import (
     ClaudeOAuthCircuitOpen,
     claude_execution_lock,
     trip_claude_oauth_circuit,
+    trip_claude_oauth_circuit_from_result,
 )
 from core.execution._sdk_patch import apply_sdk_transport_patch
 
@@ -540,7 +541,9 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                             exc_info=True,
                         )
                 result = await self._process_blocking_messages(client, **_msg_args)
-                trip_claude_oauth_circuit(getattr(run_options, "env", None), "\n".join(response_text))
+                trip_claude_oauth_circuit_from_result(
+                    getattr(run_options, "env", None), result, "\n".join(response_text), session_stats.get("sdk_error")
+                )
                 return result
 
         try:
@@ -593,7 +596,9 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             _sdk_failure_text(result_message, "\n".join(response_text), session_stats.get("sdk_error")) or ""
         )
         auth_failure = _detect_sdk_auth_failure(auth_failure_text)
-        if trip_claude_oauth_circuit(getattr(options, "env", None), auth_failure_text):
+        if trip_claude_oauth_circuit_from_result(
+            getattr(options, "env", None), result_message, "\n".join(response_text), session_stats.get("sdk_error")
+        ):
             logger.error("Claude OAuth revoked; fleet-wide circuit opened")
         if auth_failure and self._should_retry_sdk_auth_failure():
             logger.warning("Claude SDK returned auth failure text; retrying fresh session once")
@@ -724,9 +729,11 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                     try:
                         async for ev in process_stream_messages(fc, ctx, state):
                             yield ev
-                        trip_claude_oauth_circuit(
+                        trip_claude_oauth_circuit_from_result(
                             getattr(fresh_opts, "env", None),
+                            state.result_message,
                             "\n".join(state.response_text),
+                            state.sdk_error,
                         )
                     finally:
                         if self._active_client is fc:
@@ -781,9 +788,11 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                         if ev.get("type") == "text_delta":
                             emitted_text_delta = True
                         yield ev
-                    trip_claude_oauth_circuit(
+                    trip_claude_oauth_circuit_from_result(
                         getattr(run_options, "env", None),
+                        state.result_message,
                         "\n".join(state.response_text),
+                        state.sdk_error,
                     )
                 finally:
                     if self._active_client is client:
@@ -840,7 +849,9 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             _sdk_failure_text(state.result_message, "\n".join(state.response_text), state.sdk_error) or ""
         )
         auth_failure = _detect_sdk_auth_failure(auth_failure_text)
-        if trip_claude_oauth_circuit(getattr(options, "env", None), auth_failure_text):
+        if trip_claude_oauth_circuit_from_result(
+            getattr(options, "env", None), state.result_message, "\n".join(state.response_text), state.sdk_error
+        ):
             logger.error("Claude OAuth revoked; fleet-wide circuit opened")
         if auth_failure and self._should_retry_sdk_auth_failure() and not emitted_text_delta:
             logger.warning("Claude SDK returned auth failure text during streaming; retrying fresh session once")
