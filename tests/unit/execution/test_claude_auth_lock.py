@@ -104,3 +104,24 @@ def test_login_lock_is_nonblocking_while_profile_is_in_use(tmp_path) -> None:
         claude_auth_lock(profile, nonblocking=True),
     ):
         pass
+
+
+@pytest.mark.asyncio
+async def test_waiter_timeout_finishes_while_lock_still_held(tmp_path):
+    profile = tmp_path / "profile"
+    env = {"CLAUDE_HOME": str(profile)}
+
+    async def wait_with_timeout():
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.02):
+                async with claude_execution_lock(env):
+                    pytest.fail("holder still owns the lock")
+
+    with claude_auth_lock(profile):
+        waiter = asyncio.create_task(wait_with_timeout())
+        done, _ = await asyncio.wait({waiter}, timeout=0.3)
+    # Release even on regression, so a broken implementation cannot hang cleanup.
+    await waiter
+    assert waiter in done, "cancellation waited for the lock holder"
+    async with claude_execution_lock(env):
+        pass

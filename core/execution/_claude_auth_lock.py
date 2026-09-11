@@ -129,15 +129,12 @@ async def claude_execution_lock(env: dict[str, str] | None) -> AsyncIterator[Non
     if not profile.is_absolute():
         raise ValueError("CLAUDE_HOME must be absolute before acquiring the Claude execution lock")
 
-    acquire_task = asyncio.create_task(asyncio.to_thread(_acquire, profile, nonblocking=False))
-    try:
-        lock_file = await asyncio.shield(acquire_task)
-    except asyncio.CancelledError:
-        # ``flock`` is blocking in a worker thread and cannot be cancelled.
-        # Wait for it to acquire, then release it rather than leaking the lock.
-        lock_file = await acquire_task
-        await asyncio.to_thread(_release, lock_file)
-        raise
+    while True:
+        try:
+            lock_file = _acquire(profile, nonblocking=True)
+            break
+        except BlockingIOError:
+            await asyncio.sleep(0.05)
     try:
         if claude_circuit_path(profile).exists():
             raise ClaudeOAuthCircuitOpen(
@@ -151,4 +148,4 @@ async def claude_execution_lock(env: dict[str, str] | None) -> AsyncIterator[Non
             trip_claude_oauth_circuit(env, str(exc))
             raise
     finally:
-        await asyncio.to_thread(_release, lock_file)
+        _release(lock_file)
