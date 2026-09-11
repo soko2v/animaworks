@@ -284,8 +284,7 @@ class ProcessSupervisor(HealthMixin, RAGRepairMixin, ReconcileMixin, SchedulerMi
                     continue
                 if not _same_user or "animaworks" not in _cmdline.lower():
                     logger.warning(
-                        "Stale pidfile for %s: pid=%d is an unrelated process "
-                        "(%s); refusing to kill",
+                        "Stale pidfile for %s: pid=%d is an unrelated process (%s); refusing to kill",
                         anima_name,
                         pid,
                         _cmdline[:120],

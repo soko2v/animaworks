@@ -41,9 +41,7 @@ class SchedulerMixin:
             hb_mt = 0.0
         self._schedule_mtimes[name] = (cron_mt, hb_mt)
 
-    def _check_schedule_freshness(
-        self, name: str, fired_job: CronTask | None = None
-    ) -> bool:
+    def _check_schedule_freshness(self, name: str, fired_job: CronTask | None = None) -> bool:
         """Check if cron.md or heartbeat.md changed since last setup.
 
         Symmetric with
@@ -131,11 +129,7 @@ class SchedulerMixin:
             return True
 
         for t in new_tasks:
-            if (
-                t.name == fired_job.name
-                and t.schedule == fired_job.schedule
-                and t.type == fired_job.type
-            ):
+            if t.name == fired_job.name and t.schedule == fired_job.schedule and t.type == fired_job.type:
                 logger.debug(
                     "Freshness: fired job '%s' still present after cron.md reload for '%s' — running",
                     fired_job.name,

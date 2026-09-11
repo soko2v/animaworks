@@ -589,9 +589,9 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             _cleanup_tool_outputs(self._anima_dir)
             _cleanup_prompt_files(_prompt_files)
 
-        auth_failure_text = _sdk_failure_text(
-            result_message, "\n".join(response_text), session_stats.get("sdk_error")
-        ) or ""
+        auth_failure_text = (
+            _sdk_failure_text(result_message, "\n".join(response_text), session_stats.get("sdk_error")) or ""
+        )
         auth_failure = _detect_sdk_auth_failure(auth_failure_text)
         if trip_claude_oauth_circuit(getattr(options, "env", None), auth_failure_text):
             logger.error("Claude OAuth revoked; fleet-wide circuit opened")
@@ -836,9 +836,9 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             _cleanup_tool_outputs(self._anima_dir)
             _cleanup_prompt_files(_prompt_files)
 
-        auth_failure_text = _sdk_failure_text(
-            state.result_message, "\n".join(state.response_text), state.sdk_error
-        ) or ""
+        auth_failure_text = (
+            _sdk_failure_text(state.result_message, "\n".join(state.response_text), state.sdk_error) or ""
+        )
         auth_failure = _detect_sdk_auth_failure(auth_failure_text)
         if trip_claude_oauth_circuit(getattr(options, "env", None), auth_failure_text):
             logger.error("Claude OAuth revoked; fleet-wide circuit opened")

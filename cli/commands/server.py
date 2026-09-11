@@ -397,8 +397,7 @@ def _spawn_daemon(args: argparse.Namespace) -> None:
     existing_pid = _read_pid()
     if existing_pid is not None and not _is_server_process(existing_pid):
         logger.warning(
-            "Discarding stale PID file: pid=%d is not an AnimaWorks server "
-            "(PID reuse after reboot)",
+            "Discarding stale PID file: pid=%d is not an AnimaWorks server (PID reuse after reboot)",
             existing_pid,
         )
         _remove_pid_file()
@@ -747,8 +746,7 @@ def _start_foreground(args: argparse.Namespace) -> None:
     existing_pid = _read_pid()
     if existing_pid is not None and not _is_server_process(existing_pid):
         logger.warning(
-            "Discarding stale PID file: pid=%d is not an AnimaWorks server "
-            "(PID reuse after reboot)",
+            "Discarding stale PID file: pid=%d is not an AnimaWorks server (PID reuse after reboot)",
             existing_pid,
         )
         _remove_pid_file()
@@ -1043,9 +1041,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
     reports success or failure with log path.
     """
     old_pid = _read_pid()
-    if old_pid is not None and (
-        not _is_process_alive(old_pid) or not _is_server_process(old_pid)
-    ):
+    if old_pid is not None and (not _is_process_alive(old_pid) or not _is_server_process(old_pid)):
         _remove_pid_file()
         old_pid = None
     if old_pid is None:
