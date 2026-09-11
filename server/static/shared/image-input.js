@@ -335,8 +335,8 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
         return false;
       }
       if (rejectedSinceLastSubmit && pendingImages.length === 0 && pendingFiles.length === 0) {
-        rejectedSinceLastSubmit = false;
         setStatus("error", t("chat.image_send_without_attachment"));
+        rejectedSinceLastSubmit = false;
         return false;
       }
       // Never allow a visible thumbnail to degrade silently into a text-only
