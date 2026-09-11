@@ -14,10 +14,45 @@ import logging
 import os
 import re
 import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_CLI_ERROR_RE = re.compile(
+    r"^(?:error[:：]?\s*)?(?:invalid api key\b|fix external api key\b|"
+    r"failed to authenticate\b|api error:\s*401\b|not logged in\b|invalid x-api-key\b)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_cli_error(text: str, *, reject_short: bool = True) -> bool:
+    """Recognize error envelopes, not prose quoting authentication errors.
+
+    File writers also reject single-line fragments shorter than four characters.
+    Generic one-shot calls disable that heuristic: short JSON and control tokens
+    can be legitimate responses. Never log the rejected text (it may hold keys).
+    """
+    stripped = text.strip()
+    if _CLI_ERROR_RE.match(stripped):
+        return True
+    return reject_short and "\n" not in stripped and len(stripped) < 4
+
+
+def _guard_one_shot_output(func: Any) -> Any:
+    """Reject CLI error envelopes from every backend before returning to callers."""
+
+    @wraps(func)
+    async def guarded(*args: Any, **kwargs: Any) -> str | None:
+        text = await func(*args, **kwargs)
+        if text and looks_like_cli_error(text, reject_short=False):
+            logger.warning("Rejected CLI/authentication error from one-shot completion")
+            return None
+        return text
+
+    return guarded
+
 
 _ANTHROPIC_MODEL_RE = re.compile(
     r"^(anthropic/|bedrock/|vertex_ai/)?"
@@ -62,6 +97,8 @@ def ensure_credentials_in_env() -> None:
             return
 
         for provider, cred in cfg.credentials.items():
+            if provider == "anthropic" and cfg.anima_defaults.mode_s_auth != "api":
+                continue
             if not cred.api_key:
                 continue
             env_key = _PROVIDER_ENV_MAP.get(provider)
@@ -449,11 +486,8 @@ async def _try_agent_sdk(
     }
     if _cli:
         options_kwargs["cli_path"] = _cli
-    try:
-        options = ClaudeAgentOptions(**options_kwargs)
-    except TypeError:
-        options_kwargs.pop("env", None)
-        options = ClaudeAgentOptions(**options_kwargs)
+    # Fail closed if an obsolete SDK cannot accept the authentication env.
+    options = ClaudeAgentOptions(**options_kwargs)
 
     chunks: list[str] = []
     from core.execution._claude_auth_lock import (
@@ -464,8 +498,10 @@ async def _try_agent_sdk(
 
     result_message = None
     assistant_error_text: list[str] = []
+    from core.execution._sdk_env import sdk_client_context
+
     try:
-        async with claude_execution_lock(env), ClaudeSDKClient(options=options) as client:
+        async with claude_execution_lock(env), sdk_client_context(ClaudeSDKClient, options) as client:
             await client.query(prompt)
             async for message in client.receive_response():
                 if hasattr(message, "subtype"):
@@ -697,6 +733,7 @@ def _sdk_stage_guarded(guard: Any, stage_key: str, log_prefix: str, backend: str
     return False
 
 
+@_guard_one_shot_output
 async def one_shot_completion(
     prompt: str,
     *,
@@ -804,6 +841,7 @@ async def one_shot_completion(
     return None
 
 
+@_guard_one_shot_output
 async def one_shot_completion_with_model_config(
     prompt: str,
     *,

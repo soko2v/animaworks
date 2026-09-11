@@ -49,6 +49,7 @@ from core.execution._claude_auth_lock import (
     trip_claude_oauth_circuit,
     trip_claude_oauth_circuit_from_result,
 )
+from core.execution._sdk_env import sdk_client_context
 from core.execution._sdk_patch import apply_sdk_transport_patch
 
 apply_sdk_transport_patch()
@@ -531,7 +532,7 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             logger.info("ClaudeSDKClient connecting (%s, resume=%s)", log_label, getattr(run_options, "resume", None))
             async with (
                 claude_execution_lock(getattr(run_options, "env", None)),
-                ClaudeSDKClient(options=run_options) as client,
+                sdk_client_context(ClaudeSDKClient, run_options) as client,
             ):
                 logger.info("ClaudeSDKClient connected")
                 sdk_pid = _extract_sdk_pid(client)
@@ -723,7 +724,7 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             try:
                 async with (
                     claude_execution_lock(getattr(fresh_opts, "env", None)),
-                    ClaudeSDKClient(options=fresh_opts) as fc,
+                    sdk_client_context(ClaudeSDKClient, fresh_opts) as fc,
                 ):
                     logger.info("ClaudeSDKClient connected (fresh session retry)")
                     self._active_client = fc
@@ -763,7 +764,7 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             nonlocal emitted_text_delta, sdk_pid, sdk_pid_create_time
             async with (
                 claude_execution_lock(getattr(run_options, "env", None)),
-                ClaudeSDKClient(options=run_options) as client,
+                sdk_client_context(ClaudeSDKClient, run_options) as client,
             ):
                 logger.info("ClaudeSDKClient connected")
                 self._active_client = client
