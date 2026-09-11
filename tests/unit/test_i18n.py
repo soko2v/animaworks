@@ -1,6 +1,8 @@
 """Unit tests for core/i18n.py."""
 from __future__ import annotations
 
+import pytest
+
 
 
 class TestTranslationFunction:
@@ -85,3 +87,20 @@ class TestSafeFormatDict:
         d = _SafeFormatDict({"a": "1"})
         result = "hello {a} {b}".format_map(d)
         assert result == "hello 1 {b}"
+
+
+@pytest.mark.parametrize("key,kwargs", [
+    ("chat.image_file_too_large", {"size_mb": 6}),
+    ("chat.invalid_image_data", {}),
+])
+def test_image_validation_messages_have_korean_translations(key, kwargs):
+    from string import Formatter
+
+    from core.i18n import _STRINGS, t
+
+    translations = _STRINGS[key]
+    assert "ko" in translations
+    def fields(text):
+        return {name for _, name, _, _ in Formatter().parse(text) if name}
+    assert fields(translations["ko"]) == fields(translations["en"]) == fields(translations["ja"])
+    assert t(key, locale="ko", **kwargs) == translations["ko"].format(**kwargs)

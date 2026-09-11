@@ -155,10 +155,12 @@ STRINGS: dict[str, dict[str, str]] = {
     "chat.image_file_too_large": {
         "ja": "画像が大きすぎます（{size_mb}MB / 1枚あたり上限5MB）",
         "en": "Image too large ({size_mb}MB / max 5MB per image)",
+        "ko": "이미지가 너무 큽니다({size_mb}MB / 이미지당 최대 5MB).",
     },
     "chat.invalid_image_data": {
         "ja": "画像データが破損しているか、申告された形式と一致しません。",
         "en": "The image data is invalid or does not match its declared format.",
+        "ko": "이미지 데이터가 손상되었거나 지정된 형식과 일치하지 않습니다.",
     },
     "chat.file_payload_too_large": {
         "ja": "添付ファイルの合計サイズが大きすぎます。",
