@@ -207,3 +207,30 @@ class TestStreamHandleToolEndSerialization:
 
         # Final response must be done
         assert responses[-1].done is True
+
+
+@pytest.mark.asyncio
+async def test_close_immediately_after_isolated_keepalive():
+    import asyncio
+
+    handler = _make_handler()
+    handler._chat_isolated = True
+    closed = asyncio.Event()
+
+    async def child_stream(params):
+        try:
+            await asyncio.Event().wait()
+            yield {"done": True}
+        finally:
+            closed.set()
+
+    handler._task_runner_supervisor = MagicMock()
+    handler._task_runner_supervisor.run_chat_stream = child_stream
+    request = IPCRequest(id="keepalive-close", method="process_message", params={})
+    with patch("core.config.load_config") as config:
+        config.return_value.server.keepalive_interval = 0.01
+        wrapper = handler.handle_stream(request)
+        response = await anext(wrapper)
+        assert json.loads(response.chunk)["type"] == "keepalive"
+        await wrapper.aclose()
+    assert closed.is_set()
