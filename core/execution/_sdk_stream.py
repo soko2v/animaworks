@@ -296,6 +296,7 @@ class StreamingState:
     usage_acc: Any = None
     interrupted: bool = False
     sdk_error: str | None = None
+    assistant_error_text: list[str] = field(default_factory=list)
 
 
 def _append_assistant_blocks_to_state(
@@ -469,6 +470,11 @@ async def process_stream_messages(
             sdk_error = getattr(message, "error", None)
             if isinstance(sdk_error, str) and sdk_error:
                 state.sdk_error = sdk_error
+                assistant_error_text = "\n".join(
+                    block.text for block in message.content if isinstance(getattr(block, "text", None), str)
+                )
+                if assistant_error_text:
+                    state.assistant_error_text.append(assistant_error_text)
             if not got_stream_event:
                 buffered_assistant_messages.append(message)
                 continue

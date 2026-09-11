@@ -87,6 +87,18 @@ export async function streamChat(animaName, body, signal, callbacks) {
   let lastEventId = null;
 
   const headers = body instanceof FormData ? {} : { "Content-Type": "application/json" };
+  if (typeof body === "string") {
+    try {
+      const parsed = JSON.parse(body);
+      logger.info("[IMAGE-SEND] http boundary", {
+        anima: animaName,
+        image_count: Array.isArray(parsed.images) ? parsed.images.length : 0,
+        body_chars: body.length,
+      });
+    } catch {
+      logger.warn("[IMAGE-SEND] invalid JSON body", { anima: animaName, body_chars: body.length });
+    }
+  }
 
   const res = await fetch(url, {
     method: "POST",

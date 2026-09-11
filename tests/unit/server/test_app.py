@@ -204,6 +204,11 @@ class TestLifespan:
              patch("server.app._prepare_startup_vector_worker", new_callable=AsyncMock), \
              patch("server.app._start_usage_governor_if_enabled", new_callable=AsyncMock), \
              patch("server.app._startup_animas_background", new=fake_startup_animas), \
+             patch("server.app._run_model_warmup", new_callable=AsyncMock), \
+             patch("server.app._warm_model_catalog", new_callable=AsyncMock), \
+             patch("server.app._warm_voice_greets", new_callable=AsyncMock), \
+             patch("core.external_tasks.collector.collect_all"), \
+             patch("core.external_tasks.store.ExternalTaskStore"), \
              patch("core.config.global_permissions.GlobalPermissionsCache.get") as mock_gp:
             mock_gp.return_value = MagicMock(loaded=True, check_integrity=MagicMock(return_value=True))
             async with lifespan(mock_app):

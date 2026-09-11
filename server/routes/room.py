@@ -58,6 +58,22 @@ class AddParticipantRequest(BaseModel):
     name: str
 
 
+class UpdateRoomRequest(BaseModel):
+    """Request body for updating room metadata."""
+
+    title: str
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        title = value.strip()
+        if not title:
+            raise ValueError("Room title cannot be empty")
+        if len(title) > 100:
+            raise ValueError("Room title must be 100 characters or fewer")
+        return title
+
+
 # ── Helpers ─────────────────────────────────────────────────
 
 
@@ -368,6 +384,17 @@ def create_room_router() -> APIRouter:
             "closed_at": room.closed_at.isoformat() if room.closed_at else None,
             "conversation": room.conversation,
         }
+
+    @router.patch("/{room_id}")
+    async def update_room(room_id: str, body: UpdateRoomRequest, request: Request):
+        """Update editable room metadata."""
+        room_manager = _get_room_manager(request)
+        try:
+            room_manager.update_title(room_id, body.title)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
+        room = room_manager.get_room(room_id)
+        return {"room_id": room_id, "title": room.title if room else body.title}
 
     @router.post("/{room_id}/participants")
     async def add_participant(room_id: str, body: AddParticipantRequest, request: Request):

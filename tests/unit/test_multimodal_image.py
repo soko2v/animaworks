@@ -24,13 +24,12 @@ import pytest
 
 from server.routes.chat import (
     SUPPORTED_IMAGE_TYPES,
+    ChatRequest,
     ImageAttachment,
     _validate_images,
     build_content_blocks,
     save_images,
-    ChatRequest,
 )
-
 
 # ── 1. ImageAttachment model validation ────────────────────────
 
@@ -55,7 +54,8 @@ class TestImageValidation:
         assert _validate_images([]) is None
 
     def test_valid_images_pass(self) -> None:
-        imgs = [ImageAttachment(data="dGVzdA==", media_type="image/png")]
+        data = base64.b64encode(b"\x89PNG\r\n\x1a\ncontent").decode()
+        imgs = [ImageAttachment(data=data, media_type="image/png")]
         assert _validate_images(imgs) is None
 
     def test_unsupported_type_rejected(self) -> None:
@@ -71,6 +71,35 @@ class TestImageValidation:
         error = _validate_images(imgs)
         assert error is not None
         assert "大きすぎ" in error
+
+    def test_oversized_decoded_image_rejected(self) -> None:
+        raw = b"\x89PNG\r\n\x1a\n" + b"0" * (5 * 1024 * 1024)
+        imgs = [ImageAttachment(data=base64.b64encode(raw).decode(), media_type="image/png")]
+        error = _validate_images(imgs)
+        assert error is not None
+        assert "1枚あたり上限5MB" in error
+
+    def test_invalid_base64_rejected(self) -> None:
+        imgs = [ImageAttachment(data="%%%", media_type="image/png")]
+        assert _validate_images(imgs) is not None
+
+    def test_mime_signature_mismatch_rejected(self) -> None:
+        data = base64.b64encode(b"\xff\xd8\xffjpeg").decode()
+        imgs = [ImageAttachment(data=data, media_type="image/png")]
+        assert _validate_images(imgs) is not None
+
+    @pytest.mark.parametrize(
+        ("media_type", "raw"),
+        [
+            ("image/jpeg", b"\xff\xd8\xffjpeg"),
+            ("image/png", b"\x89PNG\r\n\x1a\npng"),
+            ("image/gif", b"GIF89agif"),
+            ("image/webp", b"RIFF\x04\x00\x00\x00WEBPwebp"),
+        ],
+    )
+    def test_supported_signatures_pass(self, media_type: str, raw: bytes) -> None:
+        imgs = [ImageAttachment(data=base64.b64encode(raw).decode(), media_type=media_type)]
+        assert _validate_images(imgs) is None
 
 
 # ── 3. save_images function ────────────────────────────────────

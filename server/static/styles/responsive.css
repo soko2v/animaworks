@@ -561,6 +561,20 @@ body.sidebar-collapsed .sidebar-collapse-btn {
   }
   .chat-thread-dd-close:hover { color: var(--aw-color-text-primary); }
 
+  .chat-thread-dd-rename {
+    padding: 0 6px;
+    font-size: 0.9rem;
+    line-height: 1;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--aw-color-text-muted);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .chat-thread-dd-rename:hover,
+  .chat-thread-dd-rename:active { color: var(--aw-color-accent); }
+
   .chat-thread-dd-restore {
     font-size: 0.85rem;
     color: var(--aw-color-text-muted);

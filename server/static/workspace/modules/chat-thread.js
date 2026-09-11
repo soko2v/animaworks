@@ -8,6 +8,7 @@ import { t } from "../../shared/i18n.js";
 import {
   renderThreadTabsHtml, createThread as sharedCreateThread,
   closeThread as sharedCloseThread,
+  renameThread as sharedRenameThread,
 } from "../../shared/chat/thread-logic.js";
 import { ChatSessionManager } from "../../shared/chat/session-manager.js";
 import { HISTORY_PAGE_SIZE } from "./chat-history.js";
@@ -60,6 +61,24 @@ export function renderWsThreadTabs() {
       if (tid) closeWsThread(tid);
     });
   });
+  container.querySelectorAll(".thread-tab-rename").forEach(btn => {
+    btn.addEventListener("click", e => {
+      e.stopPropagation();
+      const tid = e.currentTarget.dataset.thread;
+      if (tid) renameWsThread(tid);
+    });
+  });
+  // Delegated: selecting an inactive tab re-renders the tabs between the two clicks.
+  if (!container.dataset.renameDblclickBound) {
+    container.dataset.renameDblclickBound = "1";
+    container.addEventListener("dblclick", e => {
+      const tab = e.target.closest(".thread-tab");
+      if (!tab || !container.contains(tab)) return;
+      e.preventDefault();
+      const tid = tab.dataset.thread;
+      if (tid) renameWsThread(tid);
+    });
+  }
   const newBtn = document.getElementById("wsNewThreadBtn");
   if (newBtn) newBtn.addEventListener("click", () => createWsNewThread());
 }
@@ -114,6 +133,29 @@ export function createWsNewThread() {
   renderWsThreadTabs();
   _renderConvMessages();
   _refreshSentinel();
+}
+
+export function renameWsThread(threadId) {
+  const animaName = getState().conversationAnima;
+  if (!animaName) return;
+
+  const { threads } = getState();
+  const list = threads[animaName] || [{ id: "default", label: t("thread.default_label"), unread: false }];
+  const target = list.find(th => th.id === threadId);
+  if (!target) return;
+
+  const entered = window.prompt(t("thread.rename_prompt"), target.label || "");
+  if (entered === null) return;
+
+  const updated = sharedRenameThread(list, threadId, entered);
+  if (updated === list) return;
+  setState({ threads: { ...threads, [animaName]: updated } });
+  renderWsThreadTabs();
+  const container = _getDom().threadTabs;
+  if (container && typeof CSS !== "undefined" && CSS.escape) {
+    const el = container.querySelector(`.thread-tab-rename[data-thread="${CSS.escape(threadId)}"]`);
+    if (el) el.focus();
+  }
 }
 
 export function closeWsThread(threadId) {

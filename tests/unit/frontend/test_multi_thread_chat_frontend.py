@@ -26,12 +26,64 @@ WORKSPACE_CHAT_STREAMING_JS = PROJECT_ROOT / "server" / "static" / "workspace" /
 SESSION_MANAGER_JS = PROJECT_ROOT / "server" / "static" / "shared" / "chat" / "session-manager.js"
 WORKSPACE_STATE_JS = PROJECT_ROOT / "server" / "static" / "workspace" / "modules" / "state.js"
 CHAT_CSS = PROJECT_ROOT / "server" / "static" / "styles" / "chat.css"
+CHAT_EVENTS_JS = PROJECT_ROOT / "server" / "static" / "pages" / "chat" / "events-controller.js"
+CHAT_THREAD_JS = PROJECT_ROOT / "server" / "static" / "pages" / "chat" / "thread-controller.js"
+MEETING_CONTROLLER_JS = PROJECT_ROOT / "server" / "static" / "pages" / "chat" / "meeting-controller.js"
 WORKSPACE_STYLE = PROJECT_ROOT / "server" / "static" / "workspace" / "style.css"
 
 
 def _read(path: Path) -> str:
     """Read a file's text content."""
     return path.read_text(encoding="utf-8")
+
+
+# ── TestThreadRename ────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestThreadRename:
+    """Thread labels are user-editable in both chat surfaces."""
+
+    THREAD_LOGIC_JS = PROJECT_ROOT / "server" / "static" / "shared" / "chat" / "thread-logic.js"
+    I18N_DIR = PROJECT_ROOT / "server" / "static" / "i18n"
+    RESPONSIVE_CSS = PROJECT_ROOT / "server" / "static" / "styles" / "responsive.css"
+
+    def test_shared_logic_renders_rename_button_and_exports_rename(self) -> None:
+        js = _read(self.THREAD_LOGIC_JS)
+        assert "export function renameThread(" in js
+        assert 'class="thread-tab-rename"' in js
+
+    def test_chat_page_binds_rename_button_and_dblclick(self) -> None:
+        js = _read(CHAT_THREAD_JS)
+        assert "renameThread as sharedRenameThread" in js
+        assert '".thread-tab-rename"' in js
+        assert '"dblclick"' in js
+        assert "renameDblclickBound" in js, "dblclick must be delegated to the container (tabs re-render on select)"
+        assert "chat-thread-dd-rename" in js, "mobile dropdown needs a rename affordance"
+        assert 'renameThread(tid, "dropdown")' in js, "dropdown rename must restore focus in the dropdown (tabs are hidden on mobile)"
+        assert '.chat-thread-dd-rename[data-thread=' in js
+        assert "scheduleSaveChatUiState(ctx)" in js.split("function renameThread(")[1].split("\n  }\n")[0], \
+            "rename must persist via chat ui-state"
+
+    def test_workspace_binds_rename_button_and_dblclick(self) -> None:
+        js = _read(WORKSPACE_CHAT_THREAD_JS)
+        assert "renameThread as sharedRenameThread" in js
+        assert "export function renameWsThread(" in js
+        assert '".thread-tab-rename"' in js
+        assert '"dblclick"' in js
+        assert "renameDblclickBound" in js, "dblclick must be delegated to the container (tabs re-render on select)"
+
+    def test_i18n_keys_present_in_all_locales(self) -> None:
+        import json
+        for lang in ("ja", "en", "ko"):
+            data = json.loads((self.I18N_DIR / f"{lang}.json").read_text(encoding="utf-8"))
+            for key in ("thread.rename", "thread.rename_short", "thread.rename_prompt", "thread.rename_hint"):
+                assert data.get(key), f"{lang}: missing {key}"
+
+    def test_css_has_rename_styles(self) -> None:
+        assert ".thread-tab-rename" in _read(CHAT_CSS)
+        assert ".chat-thread-dd-rename" in _read(self.RESPONSIVE_CSS)
+        assert ".ws-thread-tabs .thread-tab-rename" in _read(WORKSPACE_STYLE)
 
 
 # ── TestChatJsThreadTabs ────────────────────────────────────
@@ -63,6 +115,29 @@ class TestChatJsThreadTabs:
         """threads is initialized as empty object {} in chat context."""
         js = _read(CHAT_CTX_JS)
         assert "threads: {}" in js
+
+    def test_new_thread_button_has_one_binding_owner(self) -> None:
+        """Dynamic thread rendering owns the + button listener exactly once."""
+        events_js = _read(CHAT_EVENTS_JS)
+        thread_js = _read(CHAT_THREAD_JS)
+        assert 'addListener("chatNewThreadBtn"' not in events_js
+        assert thread_js.count('const newBtn = $("chatNewThreadBtn")') == 1
+
+
+@pytest.mark.unit
+class TestMeetingRoomReentry:
+    """Verify active meeting rooms can be listed and reopened."""
+
+    def test_meeting_controller_lists_and_reopens_rooms(self) -> None:
+        js = _read(MEETING_CONTROLLER_JS)
+        assert 'api("/api/rooms")' in js
+        assert "meeting-room-reopen" in js
+        assert "openRoom(btn.dataset.roomId)" in js
+
+    def test_meeting_creation_has_duplicate_submit_guard(self) -> None:
+        js = _read(MEETING_CONTROLLER_JS)
+        assert "state.meetingRoomCreating" in js
+        assert "finally" in js
 
 
 # ── TestChatJsThreadIdInSendChat ─────────────────────────────

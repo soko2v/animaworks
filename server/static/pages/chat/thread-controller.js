@@ -10,6 +10,7 @@ import {
   createThread as sharedCreateThread,
   closeThread as sharedCloseThread,
   restoreThread as sharedRestoreThread,
+  renameThread as sharedRenameThread,
 } from "../../shared/chat/thread-logic.js";
 
 export function createThreadController(ctx) {
@@ -44,6 +45,26 @@ export function createThreadController(ctx) {
         if (tid) closeThread(tid);
       });
     });
+    container.querySelectorAll(".thread-tab-rename").forEach(btn => {
+      btn.addEventListener("click", e => {
+        e.stopPropagation();
+        const tid = e.currentTarget.dataset.thread;
+        if (tid) renameThread(tid);
+      });
+    });
+    // Double-click rename is delegated to the persistent container: the first click
+    // on an inactive tab selects it and re-renders the tabs, so a per-node listener
+    // would be discarded before the second click arrives.
+    if (!container.dataset.renameDblclickBound) {
+      container.dataset.renameDblclickBound = "1";
+      container.addEventListener("dblclick", e => {
+        const tab = e.target.closest(".thread-tab");
+        if (!tab || !container.contains(tab)) return;
+        e.preventDefault();
+        const tid = tab.dataset.thread;
+        if (tid) renameThread(tid);
+      });
+    }
     const newBtn = $("chatNewThreadBtn");
     if (newBtn) newBtn.addEventListener("click", () => createNewThread());
 
@@ -171,6 +192,50 @@ export function createThreadController(ctx) {
     scheduleSaveChatUiState(ctx);
   }
 
+  /**
+   * @param {string} threadId
+   * @param {"tabs"|"dropdown"} source - Which control initiated the rename (focus is restored there).
+   */
+  function renameThread(threadId, source = "tabs") {
+    if (!state.selectedAnima) return;
+    const list = state.threads[state.selectedAnima] || [{ id: "default", label: t("thread.default_label"), unread: false }];
+    const target = list.find(th => th.id === threadId);
+    if (!target) return;
+
+    const entered = window.prompt(t("thread.rename_prompt"), target.label || "");
+    if (entered === null) return;
+
+    const updated = sharedRenameThread(list, threadId, entered);
+    if (updated === list) return;
+    state.threads[state.selectedAnima] = updated;
+    renderThreadTabs();
+    renderThreadDropdownMenu();
+    scheduleSaveChatUiState(ctx);
+    _focusRenameControl(threadId, source);
+  }
+
+  /**
+   * Re-rendering drops keyboard focus; move it back to the rename control that
+   * initiated the rename. On mobile the tab strip is display:none, so
+   * dropdown-initiated renames restore focus inside the rebuilt dropdown
+   * (falling back to the dropdown toggle).
+   */
+  function _focusRenameControl(threadId, source) {
+    if (typeof CSS === "undefined" || !CSS.escape) return;
+    const tid = CSS.escape(threadId);
+    let el = null;
+    if (source === "dropdown") {
+      const menu = $("chatThreadDropdownMenu");
+      el = menu?.querySelector(`.chat-thread-dd-rename[data-thread="${tid}"]`)
+        || $("chatThreadDropdown")?.querySelector("button, [role=\"button\"]");
+    } else {
+      const tabs = $("chatThreadTabs");
+      el = tabs?.querySelector(`.thread-tab-rename[data-thread="${tid}"]`)
+        || tabs?.querySelector(`.thread-tab[data-thread="${tid}"]`);
+    }
+    if (el) el.focus();
+  }
+
   function renderThreadDropdownMenu() {
     const menu = $("chatThreadDropdownMenu");
     const label = $("chatThreadDropdownLabel");
@@ -203,9 +268,10 @@ export function createThreadController(ctx) {
         const closeBtn = th.id !== "default"
         ? ` <button class="chat-thread-dd-close" data-thread="${escapeHtml(th.id)}" aria-label="${escapeHtml(t("thread.close_short"))}">&times;</button>`
         : "";
+      const renameBtn = ` <button class="chat-thread-dd-rename" data-thread="${escapeHtml(th.id)}" aria-label="${escapeHtml(t("thread.rename_short"))}" title="${escapeHtml(t("thread.rename"))}">✎</button>`;
       return `<div class="${cls}" data-thread="${escapeHtml(th.id)}">`
         + `<span class="chat-thread-dd-label">${escapeHtml(th.label || th.id)}</span>`
-        + closeBtn + `</div>`;
+        + renameBtn + closeBtn + `</div>`;
     }).join("");
 
     if (archived.length > 0) {
@@ -222,6 +288,7 @@ export function createThreadController(ctx) {
     menu.querySelectorAll(".chat-thread-dd-item:not(.archived)").forEach(el => {
       el.addEventListener("click", e => {
         if (e.target.classList.contains("chat-thread-dd-close")) return;
+        if (e.target.classList.contains("chat-thread-dd-rename")) return;
         const tid = el.dataset.thread;
         if (tid) selectThread(tid);
         $("chatThreadDropdown")?.classList.remove("open");
@@ -233,6 +300,13 @@ export function createThreadController(ctx) {
         const tid = btn.dataset.thread;
         if (tid) closeThread(tid);
         renderThreadDropdownMenu();
+      });
+    });
+    menu.querySelectorAll(".chat-thread-dd-rename").forEach(btn => {
+      btn.addEventListener("click", e => {
+        e.stopPropagation();
+        const tid = btn.dataset.thread;
+        if (tid) renameThread(tid, "dropdown");
       });
     });
     menu.querySelectorAll(".chat-thread-dd-item.archived").forEach(el => {
@@ -259,5 +333,5 @@ export function createThreadController(ctx) {
     label.textContent = active?.label || t("thread.default_label");
   }
 
-  return { renderThreadTabs, selectThread, createNewThread, closeThread, restoreThread, renderThreadDropdownMenu };
+  return { renderThreadTabs, selectThread, createNewThread, closeThread, restoreThread, renameThread, renderThreadDropdownMenu };
 }

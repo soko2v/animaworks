@@ -163,6 +163,30 @@ class TestAgentSDKExecutor:
             env = executor._build_env()
             assert env["ANTHROPIC_API_KEY"] == ""
 
+    def test_build_env_max_plan_uses_configured_shared_claude_home(self, anima_dir):
+        config = ModelConfig(
+            model="claude-sonnet-4-6",
+            mode_s_auth="max",
+            extra_keys={"claude_home": "/tmp/animaworks-shared-claude"},
+        )
+        with patch_agent_sdk():
+            from core.execution.agent_sdk import AgentSDKExecutor
+
+            env = AgentSDKExecutor(model_config=config, anima_dir=anima_dir)._build_env()
+        assert env["CLAUDE_HOME"] == "/tmp/animaworks-shared-claude"
+
+    def test_build_env_ignores_relative_shared_claude_home(self, anima_dir):
+        config = ModelConfig(
+            model="claude-sonnet-4-6",
+            mode_s_auth="max",
+            extra_keys={"claude_home": "relative-profile"},
+        )
+        with patch_agent_sdk():
+            from core.execution.agent_sdk import AgentSDKExecutor
+
+            env = AgentSDKExecutor(model_config=config, anima_dir=anima_dir)._build_env()
+        assert "CLAUDE_HOME" not in env
+
     def test_build_env_bedrock(self, anima_dir):
         """mode_s_auth=bedrock → Bedrock mode."""
         config = ModelConfig(
@@ -256,24 +280,19 @@ class TestAgentSDKExecutor:
             # Actually empty string joined would be "", then or "(no response)"
             assert result.text == "(no response)" or result.text == ""
 
-    async def test_execute_retries_max_auth_failure_once(self, model_config, anima_dir):
+    async def test_execute_does_not_retry_max_auth_failure(self, model_config, anima_dir):
         auth_text = 'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}'
         first_messages = [
             MockAssistantMessage([MockTextBlock(auth_text)]),
             MockResultMessage(usage={"input_tokens": 10, "output_tokens": 5}),
         ]
-        second_messages = [
-            MockAssistantMessage([MockTextBlock("Recovered response")]),
-            MockResultMessage(usage={"input_tokens": 12, "output_tokens": 6}),
-        ]
-
-        with _patch_agent_sdk_sequences([first_messages, second_messages]):
+        with _patch_agent_sdk_sequences([first_messages]):
             from core.execution.agent_sdk import AgentSDKExecutor
 
             executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
             result = await executor.execute("test", system_prompt="sys")
 
-        assert result.text == "Recovered response"
+        assert auth_text in result.text
 
     async def test_execute_does_not_retry_api_auth_failure(self, anima_dir):
         auth_text = 'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}'
@@ -573,7 +592,69 @@ class TestAgentSDKExecutorStreaming:
         assert len(done_events) == 1
         assert done_events[0]["full_text"] == "reply from completed message"
 
-    async def test_streaming_retries_max_auth_failure_without_text_deltas(
+    async def test_streaming_oauth_circuit_open_is_not_wrapped_as_disconnect(
+        self,
+        model_config,
+        anima_dir,
+    ):
+        """An open auth circuit must bypass outer transient stream retries."""
+        from core.execution._claude_auth_lock import ClaudeOAuthCircuitOpen
+        from core.execution.agent_sdk import AgentSDKExecutor
+        from core.prompt.context import ContextTracker
+
+        executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
+        tracker = ContextTracker(model="claude-sonnet-4-6")
+
+        with (
+            patch(
+                "core.execution.agent_sdk.claude_execution_lock",
+                side_effect=ClaudeOAuthCircuitOpen("centralized re-login is required"),
+            ),
+            pytest.raises(ClaudeOAuthCircuitOpen),
+        ):
+            async for _ in executor.execute_streaming(
+                system_prompt="sys",
+                prompt="test",
+                tracker=tracker,
+            ):
+                pass
+
+    async def test_streaming_resume_oauth_circuit_does_not_fallback_to_fresh_session(
+        self,
+        model_config,
+        anima_dir,
+    ):
+        """A resume blocked by the auth circuit must not spawn a fresh client."""
+        from core.execution._claude_auth_lock import ClaudeOAuthCircuitOpen
+        from core.execution._sdk_session import _save_session_id
+        from core.execution.agent_sdk import AgentSDKExecutor
+        from core.prompt.context import ContextTracker
+
+        _save_session_id(anima_dir, "stale-session", "chat")
+        executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
+        tracker = ContextTracker(model="claude-sonnet-4-6")
+
+        with (
+            patch(
+                "core.execution.agent_sdk.claude_execution_lock",
+                side_effect=ClaudeOAuthCircuitOpen("centralized re-login is required"),
+            ),
+            patch("core.execution.agent_sdk._sdk_session._clear_session_id") as clear_session,
+            patch.object(executor, "_build_sdk_options", wraps=executor._build_sdk_options) as build_options,
+            pytest.raises(ClaudeOAuthCircuitOpen),
+        ):
+            async for _ in executor.execute_streaming(
+                system_prompt="sys",
+                prompt="test",
+                tracker=tracker,
+                trigger="chat",
+            ):
+                pass
+
+        assert build_options.call_count == 1
+        clear_session.assert_not_called()
+
+    async def test_streaming_does_not_retry_max_auth_failure_without_text_deltas(
         self,
         model_config,
         anima_dir,
@@ -585,21 +666,9 @@ class TestAgentSDKExecutorStreaming:
             MockAssistantMessage([MockTextBlock(auth_text)]),
             MockResultMessage(usage={"input_tokens": 10, "output_tokens": 5}),
         ]
-        second_messages = [
-            MockStreamEvent(
-                {
-                    "type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": "Recovered"},
-                    "index": 0,
-                }
-            ),
-            MockAssistantMessage([MockTextBlock("Recovered")]),
-            MockResultMessage(usage={"input_tokens": 12, "output_tokens": 6}),
-        ]
-
         tracker = ContextTracker(model="claude-sonnet-4-6")
 
-        with _patch_agent_sdk_sequences([first_messages, second_messages]):
+        with _patch_agent_sdk_sequences([first_messages]):
             from core.execution.agent_sdk import AgentSDKExecutor
 
             executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
@@ -611,9 +680,15 @@ class TestAgentSDKExecutorStreaming:
             ):
                 events.append(event)
 
-        done_events = [e for e in events if e["type"] == "done"]
-        assert len(done_events) == 1
-        assert done_events[0]["full_text"] == "Recovered"
+        # v0.13 correctly classifies a structured SDK authentication envelope
+        # as a terminal provider error.  The integration invariant here is
+        # that it is reported once and never causes a second SDK spawn.
+        assert not [event for event in events if event.get("type") == "retry_start"]
+        assert not [event for event in events if event.get("type") == "done"]
+        error_events = [event for event in events if event.get("type") == "error"]
+        assert len(error_events) == 1
+        assert error_events[0]["terminal"] is True
+        assert auth_text in error_events[0]["message"]
 
 
 # ── Image input (multimodal) ──────────────────────────────────
@@ -857,3 +932,64 @@ class TestExecutionResultUnconfirmedSends:
         result = ExecutionResult(text="hello", unconfirmed_sends=sends)
         assert result.unconfirmed_sends == sends
         assert len(result.unconfirmed_sends) == 1
+
+
+@pytest.mark.parametrize("mode", ["blocking", "streaming", "fresh_streaming"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "quoted_success",
+        "result_error",
+        "assistant_error",
+        "mixed_quoted_then_flagged_unrelated",
+        "result_only",
+        "result_only_mirrored",
+        "quoted_max_turns",
+    ],
+)
+async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir, mode, shape):
+    from types import SimpleNamespace
+
+    from core.execution._claude_auth_lock import claude_circuit_path
+    from core.execution.agent_sdk import AgentSDKExecutor
+    from core.prompt.context import ContextTracker
+
+    auth_text = "API Error: 401 OAuth access token has been revoked"
+    quoted = f'The document quotes "{auth_text}". This is an example.'
+    assistant = MockAssistantMessage([MockTextBlock(quoted)])
+    result = MockResultMessage()
+    if shape == "result_error":
+        result.is_error = True
+        result.result = auth_text
+    elif shape == "assistant_error":
+        assistant.error = "authentication_failed"
+        assistant.content = [MockTextBlock(auth_text)]
+    elif shape == "mixed_quoted_then_flagged_unrelated":
+        flagged = MockAssistantMessage([MockTextBlock("Provider request failed")])
+        flagged.error = "server_error"
+    elif shape == "result_only":
+        assistant.content = []
+        result.result = auth_text
+    elif shape == "result_only_mirrored":
+        assistant.content = [MockTextBlock(auth_text)]
+        result.result = auth_text
+    elif shape == "quoted_max_turns":
+        result.subtype = "error_max_turns"
+        result.is_error = True
+        result.result = None
+    sequence = [assistant, flagged, result] if shape == "mixed_quoted_then_flagged_unrelated" else [assistant, result]
+    sequences = [[], sequence] if mode == "fresh_streaming" else [sequence]
+    profile = anima_dir / "oauth-profile"
+    with _patch_agent_sdk_sequences(sequences):
+        executor = AgentSDKExecutor(model_config=model_config, anima_dir=anima_dir)
+        with (
+            patch.object(executor, "_build_sdk_options", return_value=(SimpleNamespace(env={"CLAUDE_HOME": str(profile)}), [])),
+            patch("core.execution.agent_sdk._load_session_id", return_value="old" if mode == "fresh_streaming" else None),
+        ):
+            if mode == "blocking":
+                await executor.execute("test")
+            else:
+                _ = [event async for event in executor.execute_streaming("sys", "test", ContextTracker(model=model_config.model))]
+    assert claude_circuit_path(profile).exists() is (
+        shape not in {"quoted_success", "mixed_quoted_then_flagged_unrelated", "quoted_max_turns", "result_only_mirrored"}
+    )

@@ -21,12 +21,15 @@ mechanism with thread IDs persisted to the shortterm directory.
 """
 
 import asyncio
+import base64
+import binascii
 import inspect
 import json
 import logging
 import os
 import shutil
 import sys
+import tempfile
 import threading
 from collections.abc import AsyncGenerator
 from dataclasses import asdict, dataclass
@@ -97,6 +100,46 @@ _CODEX_REASONING_SUMMARY_DEFAULT = "concise"
 _CODEX_REASONING_SUMMARY_VALUES = {"auto", "concise", "detailed", "none"}
 _CODEX_CLIENT_PROCESS_WAIT_TIMEOUT_SEC = 2.0
 _CODEX_CLIENT_READER_JOIN_TIMEOUT_SEC = 2.0
+_CODEX_IMAGE_SUFFIXES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+_CODEX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def _prepare_codex_run_input(
+    prompt: str,
+    images: list[ImageData] | None,
+) -> tuple[Any, tempfile.TemporaryDirectory[str] | None]:
+    """Return SDK turn input and keepalive storage for local image files."""
+    if not images:
+        return prompt, None
+
+    from openai_codex import LocalImageInput, TextInput
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="animaworks-codex-images-")
+    try:
+        inputs: list[Any] = [TextInput(prompt)]
+        for index, image in enumerate(images):
+            media_type = image.get("media_type", "")
+            suffix = _CODEX_IMAGE_SUFFIXES.get(media_type)
+            if suffix is None:
+                raise ValueError(f"Unsupported Codex image media type: {media_type}")
+            try:
+                decoded = base64.b64decode(image.get("data", ""), validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("Invalid base64 image data for Codex input") from exc
+            if len(decoded) > _CODEX_MAX_IMAGE_BYTES:
+                raise ValueError("Codex image exceeds the 5 MiB limit")
+            image_path = Path(temp_dir.name) / f"image-{index}{suffix}"
+            image_path.write_bytes(decoded)
+            inputs.append(LocalImageInput(str(image_path)))
+        return inputs, temp_dir
+    except Exception:
+        temp_dir.cleanup()
+        raise
 
 
 # ── Model name helpers ───────────────────────────────────────
@@ -2122,6 +2165,8 @@ class CodexSDKExecutor(BaseExecutor):
 
         self._write_codex_config(system_prompt)
         codex = self._create_codex_client()
+        run_input: Any = prompt
+        image_temp_dir: tempfile.TemporaryDirectory[str] | None = None
 
         response_item_order: list[str] = []
         response_text_by_item: dict[str, str] = {}
@@ -2184,7 +2229,7 @@ class CodexSDKExecutor(BaseExecutor):
             )
             active_thread = thread
             usage_meter = _CodexUsageAccumulator(fresh_thread=not tid or _get_thread_id(thread) != tid)
-            turn = await _maybe_await(thread.turn(prompt, **self._codex_turn_kwargs()))
+            turn = await _maybe_await(thread.turn(run_input, **self._codex_turn_kwargs()))
             stream = turn.stream()
             event_iter = stream.__aiter__()
             idle_timeout = _event_idle_timeout_seconds(trigger)
@@ -2549,6 +2594,7 @@ class CodexSDKExecutor(BaseExecutor):
                     await aclose()
 
         try:
+            run_input, image_temp_dir = _prepare_codex_run_input(prompt, images)
             # Try resume first, fallback to fresh thread.
             fell_back = False
             if codex_thread_id:
@@ -2682,4 +2728,6 @@ class CodexSDKExecutor(BaseExecutor):
                 exc.tool_call_records = tool_evidence.to_dicts()
             raise
         finally:
+            if image_temp_dir is not None:
+                image_temp_dir.cleanup()
             await _close_codex_client(codex)

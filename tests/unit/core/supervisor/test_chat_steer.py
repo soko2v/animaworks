@@ -79,6 +79,7 @@ async def test_injected_user_turn_is_persisted_once(tmp_path: Path) -> None:
     conversation.save()
     agent = SimpleNamespace(supports_message_injection=True, inject_message=AsyncMock(return_value=True))
     owner = SimpleNamespace(
+        anima_dir=anima_dir,
         agent=agent,
         _active_chat_conversations={"default": conversation},
         _log_human_conversation=MagicMock(),
@@ -99,6 +100,7 @@ async def test_declined_injection_rolls_back_user_turn(tmp_path: Path) -> None:
     conversation.append_turn("human", "first")
     conversation.save()
     owner = SimpleNamespace(
+        anima_dir=anima_dir,
         agent=SimpleNamespace(supports_message_injection=True, inject_message=AsyncMock(return_value=False)),
         _active_chat_conversations={"default": conversation},
         _log_human_conversation=MagicMock(),

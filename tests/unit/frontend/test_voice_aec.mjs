@@ -17,6 +17,8 @@ class VoicePlayback {
   }
   destroy() {}
   stop() { this.isPlaying = false; this.queueLength = 0; }
+  pause() {}
+  resume() {}
   enqueue() {}
   setVolume() {}
 }`;
@@ -315,7 +317,7 @@ describe('VoiceManager native AEC', () => {
     assert.equal(manager._mediaStream, null);
   });
 
-  it('holds TTS-time PCM until real speech, then interrupts before flushing it', async () => {
+  it('holds TTS-time PCM until sustained speech starts a server-confirmed probe', async () => {
     const allStream = new FakeStream({ echoCancellation: 'all' });
     navigator.mediaDevices.getUserMedia = async () => allStream;
     const allManager = newManager();
@@ -329,7 +331,14 @@ describe('VoiceManager native AEC', () => {
     assert.deepEqual(allManager._ws.sent, []);
     assert.equal(allManager.isRecording, true);
     allManager._vad.options.onSpeechRealStart();
-    assert.deepEqual(allManager._ws.sent, [JSON.stringify({ type: 'interrupt' }), pcm]);
+    assert.deepEqual(allManager._ws.sent, []);
+    for (let frame = 0; frame < 19; frame++) {
+      allManager._vad.options.onFrameProcessed({ isSpeech: 0.9 });
+    }
+    assert.deepEqual(allManager._ws.sent, [JSON.stringify({ type: 'barge_probe' }), pcm]);
+    assert.equal(allManager._ttsPlaying, true);
+    allManager._resolveBargeProbe(true);
+    assert.equal(allManager._ttsPlaying, false);
     assert.equal(allManager._holdPcm, false);
   });
 

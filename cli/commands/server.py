@@ -31,7 +31,13 @@ logger = logging.getLogger("animaworks")
 
 # Command patterns used to identify the animaworks server process.
 # Matches both direct invocation (main.py start) and entry point (animaworks start).
-_SERVER_CMD_MARKERS = ("main.py start", "animaworks start", "-m cli start")
+_SERVER_CMD_MARKERS = (
+    "main.py start",
+    "animaworks start",
+    "-m cli start",
+    "animaworks serve",
+    "-m cli serve",
+)
 
 _DAEMON_STARTUP_TIMEOUT = 10
 _DAEMON_POLL_INTERVAL = 0.3
@@ -88,6 +94,24 @@ def _read_pid() -> int | None:
 def _is_process_alive(pid: int) -> bool:
     """Check whether a process with the given PID is currently running."""
     return is_pid_alive(pid)
+
+
+def _is_server_process(pid: int) -> bool:
+    """Return whether *pid* is the current user's AnimaWorks server.
+
+    A PID file can outlive its process and the operating system may reuse the
+    number for an unrelated process.  Never signal such a process merely
+    because it is alive.
+    """
+    try:
+        proc = psutil.Process(pid)
+        if proc.username() != psutil.Process().username():
+            return False
+        cmdline = " ".join(proc.cmdline())
+    except psutil.Error:
+        return False
+
+    return any(marker in cmdline for marker in _SERVER_CMD_MARKERS)
 
 
 def _find_server_pid_by_process(
@@ -254,6 +278,14 @@ def _stop_server(
             _remove_pid_file()
             _cleanup_orphans()
             return True
+        if not _is_server_process(pid):
+            print(f"Stale PID file (pid={pid}) points to a non-server process. Cleaning up.")
+            _remove_pid_file()
+            pid = _find_server_pid_by_process(extra_exclude_pids=extra_exclude_pids)
+            if pid is None:
+                _cleanup_orphans()
+                print("No AnimaWorks server process detected. Server is not running.")
+                return True
 
     print(f"Stopping server (pid={pid})...")
     try:
@@ -363,6 +395,13 @@ def _spawn_daemon(args: argparse.Namespace) -> None:
     from core.paths import get_data_dir
 
     existing_pid = _read_pid()
+    if existing_pid is not None and not _is_server_process(existing_pid):
+        logger.warning(
+            "Discarding stale PID file: pid=%d is not an AnimaWorks server (PID reuse after reboot)",
+            existing_pid,
+        )
+        _remove_pid_file()
+        existing_pid = None
     if existing_pid is not None and _is_process_alive(existing_pid):
         print(f"Error: Server is already running (pid={existing_pid}).")
         print("Use 'animaworks stop' first, or 'animaworks restart'.")
@@ -705,6 +744,13 @@ def _start_foreground(args: argparse.Namespace) -> None:
     raise_fd_soft_limit(logger=logger, process_label="server")
 
     existing_pid = _read_pid()
+    if existing_pid is not None and not _is_server_process(existing_pid):
+        logger.warning(
+            "Discarding stale PID file: pid=%d is not an AnimaWorks server (PID reuse after reboot)",
+            existing_pid,
+        )
+        _remove_pid_file()
+        existing_pid = None
     if existing_pid is not None and _is_process_alive(existing_pid):
         print(f"Error: Server is already running (pid={existing_pid}).")
         print("Use 'animaworks stop' first, or 'animaworks restart'.")
@@ -995,7 +1041,8 @@ def cmd_restart(args: argparse.Namespace) -> None:
     reports success or failure with log path.
     """
     old_pid = _read_pid()
-    if old_pid is not None and not _is_process_alive(old_pid):
+    if old_pid is not None and (not _is_process_alive(old_pid) or not _is_server_process(old_pid)):
+        _remove_pid_file()
         old_pid = None
     if old_pid is None:
         old_pid = _find_server_pid_by_process()

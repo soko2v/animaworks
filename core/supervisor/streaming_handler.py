@@ -92,6 +92,14 @@ class StreamingIPCHandler:
             yield IPCResponse(id=request.id, error={"code": "NOT_INITIALIZED", "message": "Anima not initialized"})
             return
 
+        # ── Resolve keep-alive interval from config ──────────────
+        try:
+            from core.config import load_config
+
+            keepalive_interval: int = load_config().server.keepalive_interval
+        except Exception:
+            keepalive_interval = _DEFAULT_KEEPALIVE_INTERVAL
+
         if self._chat_isolated:
             if self._task_runner_supervisor is None:
                 yield IPCResponse(
@@ -99,22 +107,52 @@ class StreamingIPCHandler:
                     error={"code": "CHAT_RUNNER_UNAVAILABLE", "message": "Chat task runner is unavailable"},
                 )
                 return
+            stream = self._task_runner_supervisor.run_chat_stream(request.params)
+            next_item: asyncio.Task[dict[str, Any]] | None = None
+            stream_start_time = time.monotonic()
             try:
-                async with aclosing(self._task_runner_supervisor.run_chat_stream(request.params)) as stream:
-                    async for item in stream:
-                        if item.get("done"):
-                            yield IPCResponse(
-                                id=request.id,
-                                stream=True,
-                                done=True,
-                                result=item.get("result") or {},
-                            )
-                        elif isinstance(item.get("chunk"), str):
-                            yield IPCResponse(
-                                id=request.id,
-                                stream=True,
-                                chunk=item["chunk"],
-                            )
+                async with aclosing(stream):
+                    try:
+                        while True:
+                            if next_item is None:
+                                next_item = asyncio.create_task(anext(stream))
+                            done, _ = await asyncio.wait({next_item}, timeout=keepalive_interval)
+                            if not done:
+                                yield IPCResponse(
+                                    id=request.id,
+                                    stream=True,
+                                    chunk=json.dumps(
+                                        {
+                                            "type": "keepalive",
+                                            "elapsed_s": round(time.monotonic() - stream_start_time, 1),
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                )
+                                continue
+                            try:
+                                item = next_item.result()
+                            except StopAsyncIteration:
+                                return
+                            finally:
+                                next_item = None
+                            if item.get("done"):
+                                yield IPCResponse(
+                                    id=request.id,
+                                    stream=True,
+                                    done=True,
+                                    result=item.get("result") or {},
+                                )
+                            elif isinstance(item.get("chunk"), str):
+                                yield IPCResponse(
+                                    id=request.id,
+                                    stream=True,
+                                    chunk=item["chunk"],
+                                )
+                    finally:
+                        if next_item is not None:
+                            next_item.cancel()
+                            await asyncio.gather(next_item, return_exceptions=True)
                 return
             except Exception as exc:
                 logger.exception("Isolated chat task runner failed: %s", exc)
@@ -123,15 +161,7 @@ class StreamingIPCHandler:
                     id=request.id,
                     error={"code": "CHAT_RUNNER_ERROR", "message": str(exc)},
                 )
-                return
-
-        # ── Resolve keep-alive interval from config ──────────────
-        try:
-            from core.config import load_config
-
-            keepalive_interval: int = load_config().server.keepalive_interval
-        except Exception:
-            keepalive_interval = _DEFAULT_KEEPALIVE_INTERVAL
+            return
 
         message = request.params.get("message", "")
         from_person = request.params.get("from_person", "human")

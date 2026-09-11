@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.execution._claude_auth_lock import ClaudeOAuthCircuitOpen
 from core.execution.base import StreamDisconnectedError
 from core.prompt.builder import BuildResult
 from core.schemas import ModelConfig
@@ -256,6 +257,56 @@ class TestRetryFreshSession:
             "Expected _clear_session_id('chat') to be called exactly once "
             f"(retry_count==1 only), but got {len(chat_clears)} calls"
         )
+
+
+# ── non-retryable errors ──────────────────────────────────────
+
+
+class TestNonRetryableError:
+    """Non-stream failures must fail immediately without a retry event."""
+
+    @pytest.mark.asyncio
+    async def test_oauth_circuit_open_is_not_retried(self, tmp_path: Path) -> None:
+        agent = _make_agent(tmp_path)
+        call_count = 0
+
+        async def _circuit_open(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise ClaudeOAuthCircuitOpen("centralized re-login is required")
+            yield  # pragma: no cover
+
+        agent._executor.execute_streaming = _circuit_open
+        agent._executor.supports_streaming = True
+
+        with (
+            patch("core._agent_cycle.build_system_prompt", return_value=_build_result_mock()),
+            patch("core._agent_cycle.inject_shortterm", side_effect=lambda sp, _stm: sp),
+            patch("core.agent.AgentCore._resolve_execution_mode", return_value="s"),
+            patch("core.agent.AgentCore._preflight_size_check") as mock_preflight,
+            patch("core.agent.AgentCore._load_stream_retry_config") as mock_retry_cfg,
+            patch("core._agent_cycle._save_prompt_log"),
+            patch("core.execution._sdk_session._clear_session_id") as clear_session,
+            patch("core.agent.AgentCore._run_priming", new_callable=AsyncMock) as mock_priming,
+        ):
+            mock_preflight.return_value = ("mocked system prompt", "test prompt", False)
+            mock_retry_cfg.return_value = {
+                "checkpoint_enabled": False,
+                "retry_max": 3,
+                "retry_delay_s": 0.0,
+            }
+            mock_priming.return_value = ("", "")
+
+            events = []
+            async for event in agent.run_cycle_streaming("test prompt", trigger="chat"):
+                events.append(event)
+
+        assert call_count == 1
+        assert not [event for event in events if event.get("type") == "retry_start"]
+        clear_session.assert_not_called()
+        error_events = [event for event in events if event.get("type") == "error"]
+        assert len(error_events) == 1
+        assert "centralized re-login is required" in error_events[0]["message"]
 
 
 # ── retry exhausted path ──────────────────────────────────────

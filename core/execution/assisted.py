@@ -411,15 +411,19 @@ class AssistedExecutor(BaseExecutor):
                         kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
                     kwargs["temperature"] = 1
             elif model.startswith("openai/"):
-                kwargs.setdefault("extra_body", {})
-                kwargs["extra_body"]["enable_thinking"] = self._model_config.thinking
+                # Only for OpenAI-compatible custom endpoints (vLLM etc.);
+                # the real OpenAI API rejects unknown parameters with 400.
+                if self._model_config.api_base_url:
+                    kwargs.setdefault("extra_body", {})
+                    kwargs["extra_body"]["enable_thinking"] = self._model_config.thinking
             else:
                 kwargs["think"] = self._model_config.thinking
         elif self._model_config.model.startswith("openai/"):
-            kwargs.setdefault("extra_body", {})
-            kwargs["extra_body"]["enable_thinking"] = True
-            kwargs["extra_body"].setdefault("chat_template_kwargs", {})
-            kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] = True
+            if self._model_config.api_base_url:
+                kwargs.setdefault("extra_body", {})
+                kwargs["extra_body"]["enable_thinking"] = True
+                kwargs["extra_body"].setdefault("chat_template_kwargs", {})
+                kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] = True
         elif self._model_config.model.startswith("ollama/"):
             kwargs["think"] = False
 

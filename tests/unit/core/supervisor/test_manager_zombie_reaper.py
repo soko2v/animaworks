@@ -170,3 +170,35 @@ async def test_reaper_preserves_real_exit_status_and_foreign_child(supervisor, r
         assert owned.wait(timeout=2) == returncode
         assert foreign.returncode is None
         assert foreign.wait(timeout=2) == 17
+
+
+@pytest.mark.parametrize("cmdline,same_user,should_kill", [
+    (["/opt/custom/python", "-m", "core.supervisor.runner", "alice", "--data-dir", "/srv/custom"], True, True),
+    (["python", "-m", "core.supervisor.runner", "alice"], False, False),
+    (["python", "/srv/animaworks/unrelated.py"], True, False),
+    (["python", "-m", "core.supervisor.runner_extra", "alice"], True, False),
+    (["rg", "core.supervisor.runner", "/srv/logs"], True, False),
+    (["python", "core.supervisor.runner", "alice"], True, False),
+    (["python", "unrelated.py", "-m", "core.supervisor.runner"], True, False),
+    (["python", "-c", "print(1)", "-m", "core.supervisor.runner"], True, False),
+    (["python", "-cprint(1)", "-m", "core.supervisor.runner"], True, False),
+    (["python", "-u", "-X", "utf8", "-W", "ignore", "-m", "core.supervisor.runner", "alice"], True, True),
+    (["python", "-Xutf8", "-m", "core.supervisor.runner"], True, True),
+    (["python", "-m"], True, False),
+    (["python"], True, False),
+])
+def test_zombie_runner_identified_by_exact_module(supervisor, cmdline, same_user, should_kill):
+    pid_dir = supervisor.run_dir / "animas"
+    pid_dir.mkdir(parents=True)
+    pid_file = pid_dir / "alice.pid"
+    pid_file.write_text("12345")
+    runner = MagicMock()
+    runner.cmdline.return_value = cmdline
+    runner.username.return_value = "owner" if same_user else "other"
+    runner.children.return_value = []
+    current = MagicMock()
+    current.username.return_value = "owner"
+    with patch("psutil.Process", side_effect=lambda pid=None: runner if pid else current):
+        supervisor._kill_zombie_runners(["alice"])
+    assert runner.kill.called is should_kill
+    assert not pid_file.exists()

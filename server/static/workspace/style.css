@@ -1530,6 +1530,24 @@ html, body {
   color: #1a1a1a;
 }
 
+.ws-thread-tabs .thread-tab-rename {
+  padding: 0 4px;
+  font-size: 0.85rem;
+  line-height: 1;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #999;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.ws-thread-tabs .thread-tab-rename:hover,
+.ws-thread-tabs .thread-tab-rename:active {
+  background: #f0f0f0;
+  color: #1d4ed8;
+}
+
 .ws-thread-tabs .thread-tab-new {
   padding: 0.35rem 0.6rem;
   font-size: 1rem;
@@ -2990,11 +3008,24 @@ html, body {
 
 .image-preview-bar {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 8px 0;
   overflow-x: auto;
   flex-shrink: 0;
 }
+
+.image-input-status {
+  flex: 1 1 220px;
+  min-width: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.image-input-status-error { color: #b42318; }
+.image-input-status-info { color: #666; }
+.image-input-status-success { color: #16794b; }
 
 .image-preview-item {
   position: relative;
@@ -3034,6 +3065,24 @@ html, body {
 .image-preview-remove:hover {
   background: rgba(0, 0, 0, 0.75);
 }
+
+.file-preview-item,
+.chat-attached-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 280px;
+  padding: 7px 9px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.08);
+  font-size: 0.78rem;
+}
+
+.file-preview-icon { font-weight: 700; color: #335cff; }
+.file-preview-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-preview-remove { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 16px; }
+.chat-attached-files { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 
 .chat-attach-btn {
   width: 34px;

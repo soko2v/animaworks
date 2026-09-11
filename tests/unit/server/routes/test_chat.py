@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from httpx import ASGITransport, AsyncClient
 
@@ -491,3 +493,28 @@ class TestChatCompact:
                 "/api/animas/alice/chat/compact", json={"thread_id": "default"}
             )
         assert resp.status_code == 504
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "chat/stream"])
+@pytest.mark.parametrize("media_type,name", [("text/csv", "empty.csv"), ("application/pdf", "empty.pdf")])
+async def test_empty_documents_rejected_before_save(endpoint, media_type, name):
+    app = _make_test_app({"alice": MagicMock()})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        with patch("server.routes.chat.save_files") as save:
+            response = await client.post(f"/api/animas/alice/{endpoint}", json={
+                "message": "read this", "files": [{"data": "", "media_type": media_type, "name": name}],
+            })
+    assert response.status_code == 400
+    save.assert_not_called()
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "chat/stream"])
+async def test_attachment_count_limited_before_save(endpoint):
+    app = _make_test_app({"alice": MagicMock()})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        with patch("server.routes.chat.save_files") as save:
+            response = await client.post(f"/api/animas/alice/{endpoint}", json={
+                "message": "read this", "files": [{"data": "", "media_type": "text/csv", "name": "empty.csv"}] * 11,
+            })
+    assert response.status_code == 422
+    save.assert_not_called()

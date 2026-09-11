@@ -37,6 +37,32 @@ from core.time_utils import ensure_aware, now_local
 
 logger = logging.getLogger(__name__)
 
+_RUNNER_MODULE = "core.supervisor.runner"
+# Interpreter options that consume the following argv element.
+_PY_OPTIONS_WITH_VALUE = frozenset({"-W", "-X", "--check-hash-based-pycs"})
+
+
+def _is_runner_cmdline(cmdline: list[str]) -> bool:
+    """Return whether *cmdline* executes the anima runner module.
+
+    Mirrors how the interpreter resolves its execution target: after argv[0]
+    (the interpreter), interpreter options are skipped until the first
+    execution target, which must be ``-m core.supervisor.runner`` (the launch
+    form used by :mod:`core.supervisor.process_handle`).  A script path, ``-c``
+    (including an attached command) or stdin target ends the scan, so ``python unrelated.py -m
+    core.supervisor.runner`` and ``rg core.supervisor.runner`` never classify
+    an unrelated process as a runner after PID reuse.
+    """
+    index = 1
+    while index < len(cmdline):
+        arg = cmdline[index]
+        if arg == "-m":
+            return index + 1 < len(cmdline) and cmdline[index + 1] == _RUNNER_MODULE
+        if arg == "-" or arg == "--" or arg.startswith("-c") or not arg.startswith("-"):
+            return False
+        index += 2 if arg in _PY_OPTIONS_WITH_VALUE else 1
+    return False
+
 
 # ── Configuration ──────────────────────────────────────────────────
 
@@ -273,6 +299,22 @@ class ProcessSupervisor(HealthMixin, RAGRepairMixin, ReconcileMixin, SchedulerMi
                         raise _psutil.NoSuchProcess(pid)
                 except _psutil.NoSuchProcess:
                     logger.debug("Stale pidfile for %s (pid=%d, already dead)", anima_name, pid)
+                    pid_file.unlink(missing_ok=True)
+                    continue
+
+                try:
+                    _cmdline = proc.cmdline()
+                    _same_user = proc.username() == _psutil.Process().username()
+                except _psutil.Error:
+                    pid_file.unlink(missing_ok=True)
+                    continue
+                if not _same_user or not _is_runner_cmdline(_cmdline):
+                    logger.warning(
+                        "Stale pidfile for %s: pid=%d is an unrelated process (%s); refusing to kill",
+                        anima_name,
+                        pid,
+                        " ".join(_cmdline)[:120],
+                    )
                     pid_file.unlink(missing_ok=True)
                     continue
 

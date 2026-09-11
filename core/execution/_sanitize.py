@@ -202,6 +202,13 @@ TOOL_TRUST_LEVELS: dict[str, str] = {
     "google_tasks_insert_tasklist": "untrusted",
     "google_tasks_update_task": "untrusted",
     "google_tasks_update_tasklist": "untrusted",
+    "google_drive_search": "untrusted",
+    "google_drive_info": "untrusted",
+    "google_drive_read": "untrusted",
+    "google_sheets_info": "untrusted",
+    "google_sheets_read": "untrusted",
+    "google_sheets_write": "untrusted",
+    "google_sheets_append": "untrusted",
     "local_llm": "untrusted",
 }
 

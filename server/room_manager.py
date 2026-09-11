@@ -152,6 +152,22 @@ class RoomManager:
             return list(self._rooms.values())
         return [r for r in self._rooms.values() if not r.closed]
 
+    def update_title(self, room_id: str, title: str) -> None:
+        """Update and persist a room title."""
+        room = self.get_room(room_id)
+        if room is None:
+            raise ValueError(t("room_manager.room_not_found", room_id=room_id))
+        if room.closed:
+            raise ValueError(t("room_manager.room_closed"))
+        normalized = title.strip()
+        if not normalized:
+            raise ValueError("Room title cannot be empty")
+        if len(normalized) > 100:
+            raise ValueError("Room title must be 100 characters or fewer")
+        room.title = normalized
+        self.save_room(room_id)
+        logger.info("Updated title for room %s", room_id)
+
     def add_participant(self, room_id: str, name: str) -> None:
         """Add a participant to the room.
 
