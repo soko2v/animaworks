@@ -10,6 +10,7 @@ from core.execution._claude_auth_lock import (
     claude_circuit_path,
     claude_execution_lock,
     trip_claude_oauth_circuit,
+    trip_claude_oauth_circuit_from_result,
 )
 
 
@@ -125,3 +126,39 @@ async def test_waiter_timeout_finishes_while_lock_still_held(tmp_path):
     assert waiter in done, "cancellation waited for the lock holder"
     async with claude_execution_lock(env):
         pass
+
+
+_AUTH_TEXT = "API Error: 401 OAuth access token has been revoked"
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ("unflagged_mirrored", True),
+        ("unflagged_after_progress", True),
+        ("unflagged_result_only", True),
+        ("quoted_then_max_turns", False),
+        ("quoted_success", False),
+        ("quoted_result_prose", False),
+    ],
+)
+def test_result_circuit_judges_sdk_envelopes_not_generated_text(tmp_path, shape, expected) -> None:
+    from types import SimpleNamespace
+
+    profile = tmp_path / "claude-profile"
+    env = {"CLAUDE_HOME": str(profile)}
+    quoted = f'The log quotes "{_AUTH_TEXT}" as an example.'
+    if shape == "unflagged_mirrored":
+        result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT), _AUTH_TEXT
+    elif shape == "unflagged_after_progress":
+        result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT), "Reading files...\nStill working."
+    elif shape == "unflagged_result_only":
+        result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT), ""
+    elif shape == "quoted_then_max_turns":
+        result, text = SimpleNamespace(subtype="error_max_turns", is_error=True, result=None), quoted
+    elif shape == "quoted_success":
+        result, text = SimpleNamespace(subtype="success", result=quoted), quoted
+    else:
+        result, text = SimpleNamespace(subtype="success", result=quoted), ""
+    assert trip_claude_oauth_circuit_from_result(env, result, text) is expected
+    assert claude_circuit_path(profile).exists() is expected

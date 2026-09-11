@@ -49,27 +49,38 @@ def trip_claude_oauth_circuit_from_result(
     text: str,
     assistant_error: str | None = None,
 ) -> bool:
-    """Inspect SDK failure results, never ordinary generated assistant text."""
+    """Inspect SDK failure results, never ordinary generated assistant text.
+
+    Generated assistant *text* only counts when the SDK flagged that assistant
+    message itself as an error.  Result-level failures are judged from the
+    result envelope and error list alone, so quoted prose followed by an
+    unrelated SDK error (for example ``error_max_turns``) cannot open the
+    fleet-wide circuit.  An unflagged result is judged solely by whether its
+    ``result`` field is a synthetic CLI error envelope; mirrored error text or
+    earlier assistant progress does not rule that fallback out.
+    """
     subtype = getattr(result, "subtype", "")
-    is_error = (
-        getattr(result, "is_error", False) is True
-        or (isinstance(subtype, str) and subtype.startswith("error_"))
-        or bool(assistant_error)
+    result_error = getattr(result, "is_error", False) is True or (
+        isinstance(subtype, str) and subtype.startswith("error_")
     )
     result_text = getattr(result, "result", None)
-    if not is_error:
-        # Some SDK versions return only an auth error result without marking
-        # it as an error. Any assistant content rules out this fallback.
-        from core.execution.error_classifier import detect_cli_error_envelope
-
-        if text.strip() or not isinstance(result_text, str) or not detect_cli_error_envelope(result_text):
-            return False
     errors = getattr(result, "errors", None)
     details = [item for item in errors if isinstance(item, str)] if isinstance(errors, list) else []
     if isinstance(result_text, str):
-        details.append(result_text)
-    if is_error:
-        details.extend([text, assistant_error or ""])
+        if result_error or assistant_error:
+            details.append(result_text)
+        else:
+            # Some SDK versions return only an auth error result without marking
+            # it as an error; recognize the CLI error envelope, never prose.
+            from core.execution.error_classifier import detect_cli_error_envelope
+
+            envelope = detect_cli_error_envelope(result_text)
+            if envelope:
+                details.append(envelope)
+    if assistant_error:
+        details.extend([text, assistant_error])
+    if not details:
+        return False
     return trip_claude_oauth_circuit(env, "\n".join(details))
 
 

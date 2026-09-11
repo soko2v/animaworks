@@ -935,7 +935,9 @@ class TestExecutionResultUnconfirmedSends:
 
 
 @pytest.mark.parametrize("mode", ["blocking", "streaming", "fresh_streaming"])
-@pytest.mark.parametrize("shape", ["quoted_success", "result_error", "assistant_error", "result_only"])
+@pytest.mark.parametrize(
+    "shape", ["quoted_success", "result_error", "assistant_error", "result_only", "result_only_mirrored", "quoted_max_turns"]
+)
 async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir, mode, shape):
     from types import SimpleNamespace
 
@@ -956,6 +958,13 @@ async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir,
     elif shape == "result_only":
         assistant.content = []
         result.result = auth_text
+    elif shape == "result_only_mirrored":
+        assistant.content = [MockTextBlock(auth_text)]
+        result.result = auth_text
+    elif shape == "quoted_max_turns":
+        result.subtype = "error_max_turns"
+        result.is_error = True
+        result.result = None
     sequence = [assistant, result]
     sequences = [[], sequence] if mode == "fresh_streaming" else [sequence]
     profile = anima_dir / "oauth-profile"
@@ -969,4 +978,4 @@ async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir,
                 await executor.execute("test")
             else:
                 _ = [event async for event in executor.execute_streaming("sys", "test", ContextTracker(model=model_config.model))]
-    assert claude_circuit_path(profile).exists() is (shape != "quoted_success")
+    assert claude_circuit_path(profile).exists() is (shape not in {"quoted_success", "quoted_max_turns"})

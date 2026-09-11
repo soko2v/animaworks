@@ -455,7 +455,9 @@ class TestStripProviderPrefix:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("shape", ["quoted_success", "result_error", "assistant_error", "result_only"])
+@pytest.mark.parametrize(
+    "shape", ["quoted_success", "result_error", "assistant_error", "result_only", "result_only_mirrored", "quoted_max_turns"]
+)
 async def test_one_shot_oauth_circuit_ignores_generated_quotes(tmp_path, shape):
     from core.execution._claude_auth_lock import claude_circuit_path
     from tests.helpers.mocks import MockAssistantMessage, MockClaudeSDKClient, MockResultMessage, MockTextBlock, patch_agent_sdk
@@ -473,6 +475,13 @@ async def test_one_shot_oauth_circuit_ignores_generated_quotes(tmp_path, shape):
     elif shape == "result_only":
         assistant.content = []
         result.result = auth_text
+    elif shape == "result_only_mirrored":
+        assistant.content = [MockTextBlock(auth_text)]
+        result.result = auth_text
+    elif shape == "quoted_max_turns":
+        result.subtype = "error_max_turns"
+        result.is_error = True
+        result.result = None
     profile = tmp_path / "profile"
     with (
         patch_agent_sdk(),
@@ -481,4 +490,4 @@ async def test_one_shot_oauth_circuit_ignores_generated_quotes(tmp_path, shape):
         patch("core.execution._sdk_options._resolve_sdk_cli_path", return_value=None),
     ):
         await llm_utils._try_agent_sdk("test", system_prompt="", model="claude-sonnet-4-6", max_tokens=10)
-    assert claude_circuit_path(profile).exists() is (shape != "quoted_success")
+    assert claude_circuit_path(profile).exists() is (shape not in {"quoted_success", "quoted_max_turns"})

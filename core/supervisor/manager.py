@@ -37,6 +37,19 @@ from core.time_utils import ensure_aware, now_local
 
 logger = logging.getLogger(__name__)
 
+_RUNNER_MODULE = "core.supervisor.runner"
+
+
+def _is_runner_cmdline(cmdline: list[str]) -> bool:
+    """Return whether *cmdline* executes the anima runner module.
+
+    Only the ``-m core.supervisor.runner`` launch form used by
+    :mod:`core.supervisor.process_handle` counts; the module name appearing as
+    an ordinary argument of an unrelated process (``rg core.supervisor.runner``)
+    must not classify that process as a runner after PID reuse.
+    """
+    return any(arg == "-m" and cmdline[index + 1] == _RUNNER_MODULE for index, arg in enumerate(cmdline[:-1]))
+
 
 # ── Configuration ──────────────────────────────────────────────────
 
@@ -282,7 +295,7 @@ class ProcessSupervisor(HealthMixin, RAGRepairMixin, ReconcileMixin, SchedulerMi
                 except _psutil.Error:
                     pid_file.unlink(missing_ok=True)
                     continue
-                if not _same_user or "core.supervisor.runner" not in _cmdline:
+                if not _same_user or not _is_runner_cmdline(_cmdline):
                     logger.warning(
                         "Stale pidfile for %s: pid=%d is an unrelated process (%s); refusing to kill",
                         anima_name,
