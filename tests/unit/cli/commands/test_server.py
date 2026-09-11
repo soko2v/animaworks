@@ -14,6 +14,13 @@ import pytest
 
 from core.platform.process import subprocess_session_kwargs
 
+@pytest.fixture(autouse=True)
+def prevent_real_server_spawn(data_dir):
+    """Every spawn must be explicitly mocked by the test that expects it."""
+    with patch("subprocess.Popen", side_effect=AssertionError("Unmocked server spawn")):
+        yield
+
+
 # ── PID helpers ──────────────────────────────────────────
 
 
@@ -486,9 +493,10 @@ class TestStopServer:
 
 
 class TestCmdStart:
+    @patch("cli.commands.server._is_server_process", return_value=True)
     @patch("cli.commands.server._is_process_alive", return_value=True)
     @patch("cli.commands.server._read_pid", return_value=999)
-    def test_already_running(self, mock_pid, mock_alive):
+    def test_already_running(self, mock_pid, mock_alive, mock_server_process):
         from cli.commands.server import EXIT_ALREADY_RUNNING, cmd_start
 
         args = argparse.Namespace(host="0.0.0.0", port=18500)
@@ -512,7 +520,8 @@ class TestCmdStart:
     @patch("cli.commands.server._pin_native_threads")
     @patch("cli.commands.server._is_process_alive", return_value=True)
     @patch("cli.commands.server._read_pid", return_value=999)
-    def test_foreground_already_running(self, mock_pid, mock_alive, mock_pin):
+    @patch("cli.commands.server._is_server_process", return_value=True)
+    def test_foreground_already_running(self, mock_server_process, mock_pid, mock_alive, mock_pin):
         from cli.commands.server import EXIT_ALREADY_RUNNING, cmd_start
 
         args = argparse.Namespace(host="0.0.0.0", port=18500, foreground=True)
