@@ -181,6 +181,7 @@ async def test_reaper_preserves_real_exit_status_and_foreign_child(supervisor, r
     (["python", "core.supervisor.runner", "alice"], True, False),
     (["python", "unrelated.py", "-m", "core.supervisor.runner"], True, False),
     (["python", "-c", "print(1)", "-m", "core.supervisor.runner"], True, False),
+    (["python", "-cprint(1)", "-m", "core.supervisor.runner"], True, False),
     (["python", "-u", "-X", "utf8", "-W", "ignore", "-m", "core.supervisor.runner", "alice"], True, True),
     (["python", "-Xutf8", "-m", "core.supervisor.runner"], True, True),
     (["python", "-m"], True, False),

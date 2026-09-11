@@ -936,7 +936,16 @@ class TestExecutionResultUnconfirmedSends:
 
 @pytest.mark.parametrize("mode", ["blocking", "streaming", "fresh_streaming"])
 @pytest.mark.parametrize(
-    "shape", ["quoted_success", "result_error", "assistant_error", "result_only", "result_only_mirrored", "quoted_max_turns"]
+    "shape",
+    [
+        "quoted_success",
+        "result_error",
+        "assistant_error",
+        "mixed_quoted_then_flagged_unrelated",
+        "result_only",
+        "result_only_mirrored",
+        "quoted_max_turns",
+    ],
 )
 async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir, mode, shape):
     from types import SimpleNamespace
@@ -955,6 +964,9 @@ async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir,
     elif shape == "assistant_error":
         assistant.error = "authentication_failed"
         assistant.content = [MockTextBlock(auth_text)]
+    elif shape == "mixed_quoted_then_flagged_unrelated":
+        flagged = MockAssistantMessage([MockTextBlock("Provider request failed")])
+        flagged.error = "server_error"
     elif shape == "result_only":
         assistant.content = []
         result.result = auth_text
@@ -965,7 +977,7 @@ async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir,
         result.subtype = "error_max_turns"
         result.is_error = True
         result.result = None
-    sequence = [assistant, result]
+    sequence = [assistant, flagged, result] if shape == "mixed_quoted_then_flagged_unrelated" else [assistant, result]
     sequences = [[], sequence] if mode == "fresh_streaming" else [sequence]
     profile = anima_dir / "oauth-profile"
     with _patch_agent_sdk_sequences(sequences):
@@ -978,4 +990,6 @@ async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir,
                 await executor.execute("test")
             else:
                 _ = [event async for event in executor.execute_streaming("sys", "test", ContextTracker(model=model_config.model))]
-    assert claude_circuit_path(profile).exists() is (shape not in {"quoted_success", "quoted_max_turns", "result_only_mirrored"})
+    assert claude_circuit_path(profile).exists() is (
+        shape not in {"quoted_success", "mixed_quoted_then_flagged_unrelated", "quoted_max_turns", "result_only_mirrored"}
+    )

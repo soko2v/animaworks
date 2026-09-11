@@ -463,7 +463,7 @@ async def _try_agent_sdk(
     )
 
     result_message = None
-    assistant_error = None
+    assistant_error_text: list[str] = []
     try:
         async with claude_execution_lock(env), ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
@@ -471,13 +471,17 @@ async def _try_agent_sdk(
                 if hasattr(message, "subtype"):
                     result_message = message
                 error = getattr(message, "error", None)
-                if isinstance(error, str) and error:
-                    assistant_error = error
                 if hasattr(message, "content"):
+                    message_text: list[str] = []
                     for block in message.content:
                         if hasattr(block, "text"):
-                            chunks.append(block.text)
-            trip_claude_oauth_circuit_from_result(env, result_message, "\n".join(chunks), assistant_error)
+                            message_text.append(block.text)
+                    chunks.extend(message_text)
+                    if isinstance(error, str) and error and message_text:
+                        assistant_error_text.append("\n".join(message_text))
+            trip_claude_oauth_circuit_from_result(
+                env, result_message, "\n".join(chunks), "\n".join(assistant_error_text)
+            )
     except Exception as e:
         trip_claude_oauth_circuit(env, str(e))
         logger.warning("Agent SDK one-shot failed: %s", e)

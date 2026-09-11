@@ -435,6 +435,11 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                 sdk_error = getattr(message, "error", None)
                 if isinstance(sdk_error, str) and sdk_error:
                     session_stats["sdk_error"] = sdk_error
+                    assistant_error_text = "\n".join(
+                        block.text for block in message.content if isinstance(block, TextBlock)
+                    )
+                    if assistant_error_text:
+                        session_stats.setdefault("assistant_error_text", []).append(assistant_error_text)
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         response_text.append(block.text)
@@ -542,7 +547,10 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                         )
                 result = await self._process_blocking_messages(client, **_msg_args)
                 trip_claude_oauth_circuit_from_result(
-                    getattr(run_options, "env", None), result, "\n".join(response_text), session_stats.get("sdk_error")
+                    getattr(run_options, "env", None),
+                    result,
+                    "\n".join(response_text),
+                    "\n".join(session_stats.get("assistant_error_text", ())),
                 )
                 return result
 
@@ -597,7 +605,10 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
         )
         auth_failure = _detect_sdk_auth_failure(auth_failure_text)
         if trip_claude_oauth_circuit_from_result(
-            getattr(options, "env", None), result_message, "\n".join(response_text), session_stats.get("sdk_error")
+            getattr(options, "env", None),
+            result_message,
+            "\n".join(response_text),
+            "\n".join(session_stats.get("assistant_error_text", ())),
         ):
             logger.error("Claude OAuth revoked; fleet-wide circuit opened")
         if auth_failure and self._should_retry_sdk_auth_failure():
@@ -607,6 +618,7 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             result_message = None
             usage_acc = TokenUsage()
             session_stats.pop("sdk_error", None)
+            session_stats.pop("assistant_error_text", None)
             _msg_args["usage_acc"] = usage_acc
             if session_type in _RESUMABLE_SESSION_TYPES:
                 _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
@@ -733,7 +745,7 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                             getattr(fresh_opts, "env", None),
                             state.result_message,
                             "\n".join(state.response_text),
-                            state.sdk_error,
+                            "\n".join(state.assistant_error_text),
                         )
                     finally:
                         if self._active_client is fc:
@@ -792,7 +804,7 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                         getattr(run_options, "env", None),
                         state.result_message,
                         "\n".join(state.response_text),
-                        state.sdk_error,
+                        "\n".join(state.assistant_error_text),
                     )
                 finally:
                     if self._active_client is client:
@@ -850,7 +862,10 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
         )
         auth_failure = _detect_sdk_auth_failure(auth_failure_text)
         if trip_claude_oauth_circuit_from_result(
-            getattr(options, "env", None), state.result_message, "\n".join(state.response_text), state.sdk_error
+            getattr(options, "env", None),
+            state.result_message,
+            "\n".join(state.response_text),
+            "\n".join(state.assistant_error_text),
         ):
             logger.error("Claude OAuth revoked; fleet-wide circuit opened")
         if auth_failure and self._should_retry_sdk_auth_failure() and not emitted_text_delta:

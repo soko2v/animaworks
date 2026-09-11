@@ -138,6 +138,7 @@ _AUTH_TEXT = "API Error: 401 OAuth access token has been revoked"
         ("unflagged_mirrored", False),
         ("unflagged_after_progress", False),
         ("flagged_assistant_error", True),
+        ("mixed_quoted_then_flagged_unrelated", False),
         ("quoted_then_max_turns", False),
         ("quoted_success", False),
         ("quoted_result_prose", False),
@@ -158,8 +159,13 @@ def test_result_circuit_never_trips_from_generated_text(tmp_path, shape, expecte
         result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT), ""
     elif shape == "flagged_assistant_error":
         result, text = SimpleNamespace(subtype="success", result=None), _AUTH_TEXT
-        assert trip_claude_oauth_circuit_from_result(env, result, text, "authentication_failed") is True
+        assert trip_claude_oauth_circuit_from_result(env, result, text, _AUTH_TEXT) is True
         assert claude_circuit_path(profile).exists()
+        return
+    elif shape == "mixed_quoted_then_flagged_unrelated":
+        result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT), quoted
+        assert trip_claude_oauth_circuit_from_result(env, result, text, "Provider request failed") is False
+        assert not claude_circuit_path(profile).exists()
         return
     elif shape == "verbatim_success":
         result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT, is_error=False), _AUTH_TEXT + "\n\nThat is the exact line from the log."

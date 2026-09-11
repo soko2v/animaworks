@@ -47,13 +47,13 @@ def trip_claude_oauth_circuit_from_result(
     env: dict[str, str] | None,
     result: object,
     text: str,
-    assistant_error: str | None = None,
+    assistant_error_text: str | None = None,
 ) -> bool:
     """Inspect SDK failure results, never ordinary generated assistant text.
 
-    Generated assistant *text* only counts when the SDK flagged that assistant
-    message itself as an error.  Result-level failures are judged from the
-    result envelope and error list alone, so quoted prose followed by an
+    Generated assistant *text* only counts when that specific assistant
+    message was SDK-flagged as an error.  Result-level failures are judged from
+    the result envelope and error list alone, so quoted prose followed by an
     unrelated SDK error (for example ``error_max_turns``) cannot open the
     fleet-wide circuit.
 
@@ -74,7 +74,7 @@ def trip_claude_oauth_circuit_from_result(
     errors = getattr(result, "errors", None)
     details = [item for item in errors if isinstance(item, str)] if isinstance(errors, list) else []
     if isinstance(result_text, str):
-        if result_error or assistant_error:
+        if result_error:
             details.append(result_text)
         elif not text.strip():
             # Some SDK versions return only an auth error result without marking
@@ -84,8 +84,8 @@ def trip_claude_oauth_circuit_from_result(
             envelope = detect_cli_error_envelope(result_text)
             if envelope:
                 details.append(envelope)
-    if assistant_error:
-        details.extend([text, assistant_error])
+    if assistant_error_text:
+        details.append(assistant_error_text)
     if not details:
         return False
     return trip_claude_oauth_circuit(env, "\n".join(details))

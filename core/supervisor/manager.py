@@ -49,7 +49,7 @@ def _is_runner_cmdline(cmdline: list[str]) -> bool:
     (the interpreter), interpreter options are skipped until the first
     execution target, which must be ``-m core.supervisor.runner`` (the launch
     form used by :mod:`core.supervisor.process_handle`).  A script path, ``-c``
-    or stdin target ends the scan, so ``python unrelated.py -m
+    (including an attached command) or stdin target ends the scan, so ``python unrelated.py -m
     core.supervisor.runner`` and ``rg core.supervisor.runner`` never classify
     an unrelated process as a runner after PID reuse.
     """
@@ -58,7 +58,7 @@ def _is_runner_cmdline(cmdline: list[str]) -> bool:
         arg = cmdline[index]
         if arg == "-m":
             return index + 1 < len(cmdline) and cmdline[index + 1] == _RUNNER_MODULE
-        if arg in ("-c", "-", "--") or not arg.startswith("-"):
+        if arg == "-" or arg == "--" or arg.startswith("-c") or not arg.startswith("-"):
             return False
         index += 2 if arg in _PY_OPTIONS_WITH_VALUE else 1
     return False
