@@ -5,7 +5,7 @@ from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.schemas import ImageData
 
@@ -49,7 +49,7 @@ class ChatRequest(BaseModel):
     from_person: str = "human"
     intent: str = ""
     images: list[ImageAttachment] = []
-    files: list[FileAttachment] = []
+    files: list[FileAttachment] = Field(default_factory=list, max_length=10)
     resume: str | None = None
     last_event_id: str | None = None
     thread_id: str = "default"

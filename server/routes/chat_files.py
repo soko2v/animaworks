@@ -6,6 +6,8 @@ import re
 import uuid
 from pathlib import Path
 
+from fastapi import HTTPException
+
 from core.i18n import t
 from core.time_utils import now_local
 from server.routes.chat_models import MAX_FILE_PAYLOAD_SIZE, MAX_FILE_SIZE, FileAttachment
@@ -33,6 +35,8 @@ def _validate_files(files: list[FileAttachment]) -> str | None:
             decoded = base64.b64decode(item.data, validate=True)
         except (binascii.Error, ValueError):
             return t("chat.invalid_file_data")
+        if not decoded:
+            raise HTTPException(status_code=400, detail=t("chat.invalid_file_data"))
         if len(decoded) > MAX_FILE_SIZE:
             return t("chat.file_too_large")
         if extension == ".pdf" and not decoded.startswith(b"%PDF-"):
