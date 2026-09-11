@@ -680,9 +680,15 @@ class TestAgentSDKExecutorStreaming:
             ):
                 events.append(event)
 
-        done_events = [e for e in events if e["type"] == "done"]
-        assert len(done_events) == 1
-        assert auth_text in done_events[0]["full_text"]
+        # v0.13 correctly classifies a structured SDK authentication envelope
+        # as a terminal provider error.  The integration invariant here is
+        # that it is reported once and never causes a second SDK spawn.
+        assert not [event for event in events if event.get("type") == "retry_start"]
+        assert not [event for event in events if event.get("type") == "done"]
+        error_events = [event for event in events if event.get("type") == "error"]
+        assert len(error_events) == 1
+        assert error_events[0]["terminal"] is True
+        assert auth_text in error_events[0]["message"]
 
 
 # ── Image input (multimodal) ──────────────────────────────────
