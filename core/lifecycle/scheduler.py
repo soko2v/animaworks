@@ -47,14 +47,14 @@ class SchedulerMixin:
         Symmetric with
         ``core/supervisor/scheduler_manager.py::_check_schedule_freshness``.
         Staleness is claimed only when the currently firing job's
-        ``(name, schedule, type)`` tuple is no longer present in the
+        full task definition is no longer present in the
         reloaded ``cron.md``.
 
         Invariants:
-          (1) cron.md change + same ``(name, schedule, type)`` present → False (run)
-          (2) job removed or ``name``/``schedule``/``type`` mutated       → True (skip)
-          (3) heartbeat.md-only change                                    → False (run)
-          (4) ``fired_job=None`` (heartbeat call-site, no job context)    → False
+          (1) cron.md change + identical task definition present → False (run)
+          (2) job removed or any task field mutated               → True (skip)
+          (3) heartbeat.md-only change                            → False (run)
+          (4) ``fired_job=None`` (heartbeat call-site)             → False
 
         Returns False when no change is detected or the anima is unknown.
         See the supervisor twin's docstring and
@@ -105,7 +105,7 @@ class SchedulerMixin:
 
         # cron.md changed AND we have the fired job identity.  Re-parse the
         # (post-reload) cron.md and mark stale ONLY if the fired job's
-        # (name, schedule, type) tuple no longer appears.
+        # full task definition no longer appears.
         try:
             new_config = anima.memory.read_cron_config()
         except Exception:
@@ -129,7 +129,7 @@ class SchedulerMixin:
             return True
 
         for t in new_tasks:
-            if t.name == fired_job.name and t.schedule == fired_job.schedule and t.type == fired_job.type:
+            if t == fired_job:
                 logger.debug(
                     "Freshness: fired job '%s' still present after cron.md reload for '%s' — running",
                     fired_job.name,

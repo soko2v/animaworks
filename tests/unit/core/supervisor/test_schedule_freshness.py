@@ -13,14 +13,13 @@ Two-stage evolution:
    reverse-variant regression.
 2. Second fix (this suite, alex 2026-07-29 22:44 review):
    cron.md edits that leave the currently firing job's
-   ``(name, schedule, type)`` unchanged must also NOT skip.  Staleness is
-   now claimed only when the fired job is *removed* or its
-   ``name`` / ``schedule`` / ``type`` is *mutated*.
+   full definition unchanged must also NOT skip. Staleness is claimed
+   when the fired job is removed or any execution field is mutated.
 
 Key invariants under test (all four call-paths must honour them):
 
-  (1) cron.md change + same ``(name, schedule, type)`` still present    → False (run)
-  (2) job removed OR ``name`` / ``schedule`` / ``type`` mutated         → True  (skip)
+  (1) cron.md change + identical task definition still present    → False (run)
+  (2) job removed OR any task field mutated         → True  (skip)
   (3) heartbeat.md-only change                                          → False (run)
   (4) ``fired_job=None`` (heartbeat call-site, no job context)          → False
   (5) ``_heartbeat_check`` polls freshness every minute (forward-variant fix)
@@ -47,8 +46,8 @@ def _cron_md(*jobs: tuple[str, str, str]) -> str:
     """Build a cron.md document from (name, schedule, type) tuples.
 
     Each tuple emits a ``## name\\nschedule: ...\\ntype: ...`` section that
-    ``core.schedule_parser.parse_cron_md`` accepts.  Description is a fixed
-    stub because it is not part of the identity we compare.
+    ``core.schedule_parser.parse_cron_md`` accepts. Description matches
+    ``_job`` so unchanged tasks compare equal across all fields.
     """
     parts: list[str] = []
     for name, schedule, task_type in jobs:
@@ -62,7 +61,7 @@ def _cron_md(*jobs: tuple[str, str, str]) -> str:
 
 
 def _job(name: str, schedule: str, task_type: str) -> CronTask:
-    return CronTask(name=name, schedule=schedule, type=task_type)
+    return CronTask(name=name, schedule=schedule, type=task_type, description="Description stub.")
 
 
 # ── Supervisor-side fixtures ─────────────────────────────────────────────
@@ -667,3 +666,31 @@ class TestLifecycleSchedulerFreshnessSymmetry:
             "REGRESSION (lifecycle): unrelated cron.md edit skipped a due job "
             "whose (name, schedule, type) identity was preserved."
         )
+
+
+@pytest.mark.parametrize("field,value", [
+    ("description", "New instructions"), ("command", "echo new"),
+    ("tool", "new_tool"), ("args", {"target": "new"}),
+    ("skills", ["new-skill"]), ("skip_pattern", "skip"),
+    ("trigger_heartbeat", False),
+])
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_execution_field_edit_skips_stale_task(scheduler_mgr, tmp_path, field, value, lifecycle):
+    fired = _job("alpha", "0 9 * * *", "llm")
+    changed = fired.model_copy(update={field: value})
+    (tmp_path / "cron.md").write_text("changed")
+    if lifecycle:
+        stub = _StubLifecycleScheduler("test", tmp_path)
+        stub._schedule_mtimes["test"] = (0.0, 0.0)
+        stub.animas["test"].memory.read_cron_config.return_value = "changed"
+        with patch("core.lifecycle.scheduler._parse_cron_md", return_value=[changed]):
+            assert _bind_freshness_to_stub(stub)("test", fired) is True
+        assert stub.reload_calls == ["test"]
+    else:
+        scheduler_mgr._anima.memory.read_cron_config.return_value = "changed"
+        with (
+            patch.object(scheduler_mgr, "reload_schedule") as reload,
+            patch("core.supervisor.scheduler_manager.parse_cron_md", return_value=[changed]),
+        ):
+            assert scheduler_mgr._check_schedule_freshness(fired) is True
+        reload.assert_called_once_with("test")
