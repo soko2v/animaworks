@@ -490,4 +490,4 @@ async def test_one_shot_oauth_circuit_ignores_generated_quotes(tmp_path, shape):
         patch("core.execution._sdk_options._resolve_sdk_cli_path", return_value=None),
     ):
         await llm_utils._try_agent_sdk("test", system_prompt="", model="claude-sonnet-4-6", max_tokens=10)
-    assert claude_circuit_path(profile).exists() is (shape not in {"quoted_success", "quoted_max_turns"})
+    assert claude_circuit_path(profile).exists() is (shape not in {"quoted_success", "quoted_max_turns", "result_only_mirrored"})

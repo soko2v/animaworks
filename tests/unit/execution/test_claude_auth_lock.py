@@ -134,15 +134,17 @@ _AUTH_TEXT = "API Error: 401 OAuth access token has been revoked"
 @pytest.mark.parametrize(
     "shape,expected",
     [
-        ("unflagged_mirrored", True),
-        ("unflagged_after_progress", True),
         ("unflagged_result_only", True),
+        ("unflagged_mirrored", False),
+        ("unflagged_after_progress", False),
+        ("flagged_assistant_error", True),
         ("quoted_then_max_turns", False),
         ("quoted_success", False),
         ("quoted_result_prose", False),
+        ("verbatim_success", False),
     ],
 )
-def test_result_circuit_judges_sdk_envelopes_not_generated_text(tmp_path, shape, expected) -> None:
+def test_result_circuit_never_trips_from_generated_text(tmp_path, shape, expected) -> None:
     from types import SimpleNamespace
 
     profile = tmp_path / "claude-profile"
@@ -154,6 +156,13 @@ def test_result_circuit_judges_sdk_envelopes_not_generated_text(tmp_path, shape,
         result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT), "Reading files...\nStill working."
     elif shape == "unflagged_result_only":
         result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT), ""
+    elif shape == "flagged_assistant_error":
+        result, text = SimpleNamespace(subtype="success", result=None), _AUTH_TEXT
+        assert trip_claude_oauth_circuit_from_result(env, result, text, "authentication_failed") is True
+        assert claude_circuit_path(profile).exists()
+        return
+    elif shape == "verbatim_success":
+        result, text = SimpleNamespace(subtype="success", result=_AUTH_TEXT, is_error=False), _AUTH_TEXT + "\n\nThat is the exact line from the log."
     elif shape == "quoted_then_max_turns":
         result, text = SimpleNamespace(subtype="error_max_turns", is_error=True, result=None), quoted
     elif shape == "quoted_success":

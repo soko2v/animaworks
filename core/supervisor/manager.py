@@ -38,17 +38,30 @@ from core.time_utils import ensure_aware, now_local
 logger = logging.getLogger(__name__)
 
 _RUNNER_MODULE = "core.supervisor.runner"
+# Interpreter options that consume the following argv element.
+_PY_OPTIONS_WITH_VALUE = frozenset({"-W", "-X", "--check-hash-based-pycs"})
 
 
 def _is_runner_cmdline(cmdline: list[str]) -> bool:
     """Return whether *cmdline* executes the anima runner module.
 
-    Only the ``-m core.supervisor.runner`` launch form used by
-    :mod:`core.supervisor.process_handle` counts; the module name appearing as
-    an ordinary argument of an unrelated process (``rg core.supervisor.runner``)
-    must not classify that process as a runner after PID reuse.
+    Mirrors how the interpreter resolves its execution target: after argv[0]
+    (the interpreter), interpreter options are skipped until the first
+    execution target, which must be ``-m core.supervisor.runner`` (the launch
+    form used by :mod:`core.supervisor.process_handle`).  A script path, ``-c``
+    or stdin target ends the scan, so ``python unrelated.py -m
+    core.supervisor.runner`` and ``rg core.supervisor.runner`` never classify
+    an unrelated process as a runner after PID reuse.
     """
-    return any(arg == "-m" and cmdline[index + 1] == _RUNNER_MODULE for index, arg in enumerate(cmdline[:-1]))
+    index = 1
+    while index < len(cmdline):
+        arg = cmdline[index]
+        if arg == "-m":
+            return index + 1 < len(cmdline) and cmdline[index + 1] == _RUNNER_MODULE
+        if arg in ("-c", "-", "--") or not arg.startswith("-"):
+            return False
+        index += 2 if arg in _PY_OPTIONS_WITH_VALUE else 1
+    return False
 
 
 # ── Configuration ──────────────────────────────────────────────────

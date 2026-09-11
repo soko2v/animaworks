@@ -978,4 +978,4 @@ async def test_oauth_circuit_only_trips_for_sdk_failure(model_config, anima_dir,
                 await executor.execute("test")
             else:
                 _ = [event async for event in executor.execute_streaming("sys", "test", ContextTracker(model=model_config.model))]
-    assert claude_circuit_path(profile).exists() is (shape not in {"quoted_success", "quoted_max_turns"})
+    assert claude_circuit_path(profile).exists() is (shape not in {"quoted_success", "quoted_max_turns", "result_only_mirrored"})

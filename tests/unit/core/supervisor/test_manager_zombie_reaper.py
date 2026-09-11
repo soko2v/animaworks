@@ -179,7 +179,12 @@ async def test_reaper_preserves_real_exit_status_and_foreign_child(supervisor, r
     (["python", "-m", "core.supervisor.runner_extra", "alice"], True, False),
     (["rg", "core.supervisor.runner", "/srv/logs"], True, False),
     (["python", "core.supervisor.runner", "alice"], True, False),
-    (["python", "-c", "print(1)", "-m", "core.supervisor.runner"], True, True),
+    (["python", "unrelated.py", "-m", "core.supervisor.runner"], True, False),
+    (["python", "-c", "print(1)", "-m", "core.supervisor.runner"], True, False),
+    (["python", "-u", "-X", "utf8", "-W", "ignore", "-m", "core.supervisor.runner", "alice"], True, True),
+    (["python", "-Xutf8", "-m", "core.supervisor.runner"], True, True),
+    (["python", "-m"], True, False),
+    (["python"], True, False),
 ])
 def test_zombie_runner_identified_by_exact_module(supervisor, cmdline, same_user, should_kill):
     pid_dir = supervisor.run_dir / "animas"

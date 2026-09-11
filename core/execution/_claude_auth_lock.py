@@ -55,9 +55,16 @@ def trip_claude_oauth_circuit_from_result(
     message itself as an error.  Result-level failures are judged from the
     result envelope and error list alone, so quoted prose followed by an
     unrelated SDK error (for example ``error_max_turns``) cannot open the
-    fleet-wide circuit.  An unflagged result is judged solely by whether its
-    ``result`` field is a synthetic CLI error envelope; mirrored error text or
-    earlier assistant progress does not rule that fallback out.
+    fleet-wide circuit.
+
+    An unflagged result (no ``is_error``, no ``error_`` subtype, no flagged
+    assistant message) is only trusted when the run produced no assistant
+    content at all and its ``result`` field is a synthetic CLI error envelope:
+    a genuine success mirrors the final assistant text into ``result``, so an
+    envelope there without any assistant content cannot be model output.  Any
+    assistant content disables this fallback on purpose -- a false trip is a
+    persistent fleet-wide outage until a human re-logs in, whereas a missed
+    unflagged failure is self-correcting (the next flagged failure trips it).
     """
     subtype = getattr(result, "subtype", "")
     result_error = getattr(result, "is_error", False) is True or (
@@ -69,7 +76,7 @@ def trip_claude_oauth_circuit_from_result(
     if isinstance(result_text, str):
         if result_error or assistant_error:
             details.append(result_text)
-        else:
+        elif not text.strip():
             # Some SDK versions return only an auth error result without marking
             # it as an error; recognize the CLI error envelope, never prose.
             from core.execution.error_classifier import detect_cli_error_envelope
