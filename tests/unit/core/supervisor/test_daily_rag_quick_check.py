@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -33,6 +33,7 @@ async def test_daily_indexing_skips_anima_when_quick_check_finds_corruption(
     (anima_dir / "knowledge").mkdir(parents=True)
     (data_dir / "shared" / "common_knowledge").mkdir(parents=True)
     get_vector_store = MagicMock()
+    notify_health_anomaly = AsyncMock()
 
     monkeypatch.setattr(
         "core.config.load_config", lambda: SimpleNamespace(rag=SimpleNamespace(quick_check_timeout_seconds=2.0))
@@ -40,6 +41,7 @@ async def test_daily_indexing_skips_anima_when_quick_check_finds_corruption(
     monkeypatch.setattr("core.memory.rag.singleton.get_embedding_model_name", lambda: "model")
     monkeypatch.setattr("core.memory.rag.singleton.get_vector_store", get_vector_store)
     monkeypatch.setattr("core.memory.rag.repair.is_repair_locked", lambda _anima_name: False)
+    monkeypatch.setattr("core.response_canary.notify_health_anomaly", notify_health_anomaly)
     monkeypatch.setattr(
         "core.memory.rag.sqlite_health.check_anima_vectordb_health_via_worker_or_direct",
         lambda anima_name, **_kwargs: SQLiteHealthResult(
@@ -53,3 +55,7 @@ async def test_daily_indexing_skips_anima_when_quick_check_finds_corruption(
     await _DailyIndexingHarness(data_dir)._run_daily_indexing()
 
     get_vector_store.assert_not_called()
+    notify_health_anomaly.assert_awaited_once_with(
+        "AnimaWorks RAG health anomaly",
+        "anima=sora quick_check=corrupt; supervised repair requested",
+    )

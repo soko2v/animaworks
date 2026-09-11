@@ -29,3 +29,14 @@ async def test_notification_uses_mocked_external_notifier(monkeypatch: pytest.Mo
 
     assert await notify_health_anomaly("RAG anomaly", "quick_check requested repair") == ["mocked"]
     notifier.notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_notification_is_a_noop_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = MagicMock(enabled=False)
+    notifier_factory = MagicMock()
+    monkeypatch.setattr("core.config.load_config", lambda: MagicMock(human_notification=config))
+    monkeypatch.setattr("core.notification.notifier.HumanNotifier.from_config", notifier_factory)
+
+    assert await notify_health_anomaly("RAG anomaly", "quick_check requested repair") == []
+    notifier_factory.assert_not_called()
