@@ -3518,6 +3518,7 @@
   cursor: pointer;
 }
 .meeting-title-edit-btn:hover,
+.meeting-title-edit-btn:active,
 .meeting-title-edit-btn:focus-visible {
   color: var(--aw-color-accent);
   background: var(--aw-color-bg-tertiary, #e9ecef);
