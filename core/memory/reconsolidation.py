@@ -379,6 +379,11 @@ class ReconsolidationEngine:
             from core.memory.consolidation import ConsolidationEngine
 
             text = ConsolidationEngine._sanitize_llm_output(text)
+            from core.memory._llm_utils import looks_like_cli_error
+
+            if looks_like_cli_error(text):
+                logger.warning("Rejected invalid LLM procedure revision")
+                return None
 
             if text.strip():
                 return text.strip()
@@ -617,6 +622,11 @@ class ReconsolidationEngine:
             from core.memory.consolidation import ConsolidationEngine
 
             text = ConsolidationEngine._sanitize_llm_output(text)
+            from core.memory._llm_utils import looks_like_cli_error
+
+            if looks_like_cli_error(text):
+                logger.warning("Rejected invalid LLM knowledge revision")
+                return None
 
             if text.strip():
                 return text.strip()

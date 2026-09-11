@@ -297,6 +297,7 @@ async def compact_sdk_session(
 
         from core.config import load_config
         from core.execution._claude_auth_lock import claude_execution_lock
+        from core.execution._sdk_env import sdk_client_context
         from core.execution._sdk_options import _resolve_sdk_cli_path
 
         _cli = _resolve_sdk_cli_path()
@@ -321,7 +322,7 @@ async def compact_sdk_session(
         found_session_id = False
         async with asyncio.timeout(COMPACT_TIMEOUT_SEC):
             async with claude_execution_lock(env):
-                async with ClaudeSDKClient(options=options) as client:
+                async with sdk_client_context(ClaudeSDKClient, options) as client:
                     await client.query("/compact")
                     async for message in client.receive_messages():
                         if hasattr(message, "session_id") and message.session_id:

@@ -41,6 +41,7 @@ def _make_config(
     cfg.consolidation.llm_model = llm_model
     cfg.consolidation.llm_credential = llm_credential
     cfg.credentials = credentials or {}
+    cfg.anima_defaults.mode_s_auth = "api"
     return cfg
 
 
@@ -201,6 +202,22 @@ class TestGetMemoryLlmKwargsForModel:
 
 class TestEnsureCredentialsInEnv:
     """Tests for ensure_credentials_in_env()."""
+
+    @pytest.mark.parametrize("auth", ["max", None, "bedrock", "vertex", "api"])
+    def test_export_is_auth_scoped(self, monkeypatch: pytest.MonkeyPatch, auth: str | None) -> None:
+        cfg = _make_config(
+            credentials={
+                "anthropic": _make_cred(api_key="test-anthropic"),
+                "openai": _make_cred(api_key="test-openai"),
+            }
+        )
+        cfg.anima_defaults.mode_s_auth = auth
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with patch("core.config.load_config", return_value=cfg):
+            llm_utils.ensure_credentials_in_env()
+        assert os.environ.get("ANTHROPIC_API_KEY") == ("test-anthropic" if auth == "api" else None)
+        assert os.environ["OPENAI_API_KEY"] == "test-openai"
 
     def test_exports_credentials_to_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """ensure_credentials_in_env exports credentials to environment."""

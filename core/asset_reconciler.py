@@ -571,7 +571,7 @@ async def _synthesize_prompt_via_llm(
         system_prompt_name = "fragments/asset_synthesis_system"
         user_prompt_key = "asset_reconciler.llm_user_prompt"
 
-    from core.memory._llm_utils import one_shot_completion
+    from core.memory._llm_utils import looks_like_cli_error, one_shot_completion
 
     system_content = load_prompt(system_prompt_name)
     user_content = t(user_prompt_key, character_text=character_text)
@@ -600,6 +600,10 @@ async def _synthesize_prompt_via_llm(
         return None
 
     if not result or result == "NO_APPEARANCE_DATA":
+        return None
+
+    if looks_like_cli_error(result):
+        logger.warning("Rejected invalid LLM prompt synthesis for %s (%s)", anima_name, style)
         return None
 
     cache_filename = "prompt_realistic.txt" if style == "realistic" else "prompt.txt"

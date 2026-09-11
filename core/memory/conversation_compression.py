@@ -76,10 +76,11 @@ async def _call_llm(
     Raises RuntimeError when all LLM backends fail so callers
     can keep raw turns instead of saving an empty summary.
     """
-    from core.memory._llm_utils import one_shot_completion
+    from core.memory._llm_utils import looks_like_cli_error, one_shot_completion
 
     result = await one_shot_completion(user_content, system_prompt=system, max_tokens=max_tokens)
-    if result is None:
+    if result is None or looks_like_cli_error(result):
+        logger.warning("Rejected missing or invalid conversation LLM output")
         raise RuntimeError("All LLM backends failed for conversation LLM call")
     return result
 
@@ -173,7 +174,7 @@ async def _generate_compression_summary(
         errors.append(f"primary failed: {type(e).__name__}: {e}")
 
     try:
-        from core.memory._llm_utils import one_shot_completion_with_model_config
+        from core.memory._llm_utils import looks_like_cli_error, one_shot_completion_with_model_config
 
         system = load_prompt("memory/conversation_compression")
         user_content = ""
@@ -188,8 +189,9 @@ async def _generate_compression_summary(
             model_config=model_config,
             max_tokens=2000,
         )
-        if active_summary and active_summary.strip():
+        if active_summary and active_summary.strip() and not looks_like_cli_error(active_summary):
             return active_summary, "llm_active_model", "active_model", "; ".join(errors)
+        logger.warning("Rejected missing or invalid active-model compression output")
         errors.append("active model returned empty summary")
     except Exception as e:
         errors.append(f"active model failed: {type(e).__name__}: {e}")
