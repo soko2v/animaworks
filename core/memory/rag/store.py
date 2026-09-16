@@ -691,7 +691,13 @@ class ChromaVectorStore(VectorStore):
         top_k: int = 10,
         filter_metadata: dict[str, str | int | float] | None = None,
     ) -> list[SearchResult]:
-        coll = self.client.get_collection(name=collection)
+        try:
+            coll = self.client.get_collection(name=collection)
+        except Exception as exc:
+            if _is_missing_collection_error(exc):
+                logger.debug("Query skipped: collection '%s' does not exist yet", collection)
+                return []
+            raise
 
         # Build where clause for metadata filtering
         where = None
@@ -753,7 +759,13 @@ class ChromaVectorStore(VectorStore):
             return []
 
     def _delete_documents_once(self, collection: str, ids: list[str]) -> bool:
-        coll = self.client.get_collection(name=collection)
+        try:
+            coll = self.client.get_collection(name=collection)
+        except Exception as exc:
+            if _is_missing_collection_error(exc):
+                logger.debug("delete_documents skipped: collection '%s' does not exist yet", collection)
+                return True  # nothing to delete
+            raise
         coll.delete(ids=ids)
         logger.debug("Deleted %d documents from collection '%s'", len(ids), collection)
         return True
@@ -785,7 +797,13 @@ class ChromaVectorStore(VectorStore):
         ids: list[str],
         metadatas: list[dict[str, str | int | float]],
     ) -> bool:
-        coll = self.client.get_collection(name=collection)
+        try:
+            coll = self.client.get_collection(name=collection)
+        except Exception as exc:
+            if _is_missing_collection_error(exc):
+                logger.debug("update_metadata skipped: collection '%s' does not exist yet", collection)
+                return False  # cannot update non-existent documents
+            raise
         serialized = [self._serialize_metadata(dict(m)) for m in metadatas]
         access_fields = {
             "access_count",
@@ -903,7 +921,13 @@ class ChromaVectorStore(VectorStore):
             return []
 
     def _get_by_ids_once(self, collection: str, ids: list[str]) -> list[Document]:
-        coll = self.client.get_collection(name=collection)
+        try:
+            coll = self.client.get_collection(name=collection)
+        except Exception as exc:
+            if _is_missing_collection_error(exc):
+                logger.debug("get_by_ids skipped: collection '%s' does not exist yet", collection)
+                return []
+            raise
         data = coll.get(ids=ids, include=["documents", "metadatas"])
         documents: list[Document] = []
         for i, doc_id in enumerate(data["ids"]):

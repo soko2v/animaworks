@@ -457,7 +457,7 @@ def _build_group3(
         kind: str = "rigid",
         *,
         trim_from: Literal["head", "tail"] = "tail",
-        budget_group: Literal["framework", "recall"] = "framework",
+        budget_group: Literal["framework", "recall", "shortterm"] = "framework",
     ) -> None:
         if c and c.strip():
             out.append(
@@ -554,7 +554,7 @@ def _build_group3(
         except Exception:
             logger.debug("Failed to inject recent tool results", exc_info=True)
     if shortterm_text:
-        _add(shortterm_text, "shortterm", 3, "elastic", trim_from="head")
+        _add(shortterm_text, "shortterm", 3, "elastic", budget_group="shortterm")
     return out
 
 
