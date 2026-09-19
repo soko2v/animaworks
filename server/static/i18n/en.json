@@ -252,7 +252,7 @@
   "chat.file_processing": "Processing file…",
   "chat.file_read_failed": "The file could not be read. Choose a valid PDF or CSV.",
   "chat.file_ready": "Attached {count} file(s).",
-  "chat.file_too_large_client": "Each file must be 10 MiB or smaller (selected: {size} MiB).",
+  "chat.file_too_large_client": "Each file must be 50 MiB or smaller (selected: {size} MiB).",
   "chat.image_converted_too_large": "The converted image exceeds 5 MiB. Please resize it.",
   "chat.image_converting_heic": "Converting the HEIC/HEIF image to JPEG…",
   "chat.image_decode_failed": "The image could not be read. Choose a valid JPEG, PNG, GIF, or WebP image.",

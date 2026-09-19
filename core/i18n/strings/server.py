@@ -178,9 +178,9 @@ STRINGS: dict[str, dict[str, str]] = {
         "ko": "첨부 파일의 형식 또는 내용이 올바르지 않습니다.",
     },
     "chat.file_too_large": {
-        "ja": "ファイルは1件10MB以下にしてください。",
-        "en": "Each file must be 10MB or smaller.",
-        "ko": "파일은 각각 10MB 이하여야 합니다.",
+        "ja": "ファイルは1件50MB以下にしてください。",
+        "en": "Each file must be 50MB or smaller.",
+        "ko": "파일은 각각 50MB 이하여야 합니다.",
     },
     "chat.csv_encoding_invalid": {
         "ja": "CSVはUTF-8形式で保存してください。",

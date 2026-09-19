@@ -9,7 +9,7 @@ import { createLogger } from "/shared/logger.js";
 const logger = createLogger("image-input");
 
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB per image
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per document
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB per document
 const MAX_DIMENSION = 1568; // Max pixel dimension (Anthropic recommendation)
 const SUPPORTED_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const HEIC_TYPES = new Set(["image/heic", "image/heif"]);

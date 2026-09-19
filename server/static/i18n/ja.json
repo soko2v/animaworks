@@ -252,7 +252,7 @@
   "chat.file_processing": "ファイルを処理しています…",
   "chat.file_read_failed": "ファイルを読み込めませんでした。破損していないPDFまたはCSVを選択してください。",
   "chat.file_ready": "ファイル{count}件を添付しました。",
-  "chat.file_too_large_client": "ファイルは1件10 MiB以下にしてください（選択したファイル: {size} MiB）。",
+  "chat.file_too_large_client": "ファイルは1件50 MiB以下にしてください（選択したファイル: {size} MiB）。",
   "chat.image_converted_too_large": "変換後の画像が5 MiBを超えています。画像を縮小してください。",
   "chat.image_converting_heic": "HEIC／HEIF画像をJPEGへ変換しています…",
   "chat.image_decode_failed": "画像を読み込めませんでした。破損していないJPEG・PNG・GIF・WebPを選択してください。",

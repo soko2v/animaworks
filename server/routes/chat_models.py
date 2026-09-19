@@ -12,8 +12,8 @@ from core.schemas import ImageData
 MAX_CHAT_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB decoded per image
 MAX_IMAGE_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB total base64
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB decoded per file
-MAX_FILE_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB total base64
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB decoded per file
+MAX_FILE_PAYLOAD_SIZE = 134 * 1024 * 1024  # ~100MB decoded total (base64 is ~4/3 of raw)
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 MIME_TO_EXT = {
