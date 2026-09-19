@@ -89,6 +89,7 @@ from core.execution._sdk_session import (  # noqa: F401
     _RESUMABLE_SESSION_TYPES,
     _SDK_MAX_BUFFER_SIZE,
     INTERRUPT_TIMEOUT_SEC,
+    RESUME_MAX_ATTEMPTS,
     RESUME_TIMEOUT_SEC,
     SESSION_TYPE_CHAT,
     SESSION_TYPE_CRON,
@@ -298,6 +299,89 @@ def _kill_sdk_process(pid: int | None, create_time: float | None) -> None:
         logger.info("terminated leaked Claude SDK subprocess tree (pid=%s)", pid)
     except Exception:
         logger.debug("SDK cleanup: unexpected error for pid=%s", pid, exc_info=True)
+
+
+# ── Resume fallback context recovery (Fix 4b) ────────────────
+
+
+def _build_resume_fallback_handoff(
+    anima_dir: Path,
+    session_type: str,
+    thread_id: str,
+    failed_session_id: str | None,
+) -> str:
+    """Recover conversation context after a failed SDK session resume.
+
+    Fix 4b: mid-conversation (below the context threshold, before idle
+    compaction fires) the SDK session transcript is the *only* holder of
+    the conversation memory — no shortterm handoff exists.  When a resume
+    fails, falling back to a plain fresh session therefore loses the whole
+    conversation ("total amnesia").
+
+    This reuses ``session_compactor._extract_recent_chat_context`` to build
+    an activity_log digest of the recent conversation, persists it as a
+    shortterm handoff with ``trigger="resume_fallback"`` (so the context
+    also survives if the fresh session itself fails), and returns a
+    rendered digest block for injection into the fresh-session prompt —
+    turning total loss into graceful degradation.
+
+    A pending higher-fidelity handoff (e.g. the context-threshold save) is
+    never overwritten (same protection as Fix 1); the digest is then only
+    injected into the current prompt.
+
+    Best-effort: returns ``""`` when there is nothing to recover or on any
+    error, in which case the fresh session proceeds exactly as before.
+    """
+    if session_type != SESSION_TYPE_CHAT:
+        # The digest extractor scans chat activity_log entries only.
+        return ""
+    try:
+        from core.memory.shortterm import SessionState, ShortTermMemory
+        from core.session_compactor import _extract_recent_chat_context
+
+        extracted = _extract_recent_chat_context(anima_dir, thread_id=thread_id)
+        if not (extracted.get("accumulated_response") or extracted.get("tool_uses")):
+            return ""
+        digest_state = SessionState(
+            accumulated_response=extracted.get("accumulated_response", ""),
+            tool_uses=extracted.get("tool_uses", []),
+            original_prompt=extracted.get("original_prompt", ""),
+            timestamp=extracted.get("timestamp", ""),
+            trigger="resume_fallback",
+            notes=(f"Auto-extracted from activity_log after SDK resume failure (session_id={failed_session_id})"),
+        )
+        shortterm = ShortTermMemory(anima_dir, session_type=session_type, thread_id=thread_id)
+        existing = shortterm.load()
+        if existing is not None and existing.trigger not in ("", "idle_compaction", "resume_fallback"):
+            logger.info(
+                "resume_fallback: pending shortterm preserved (trigger=%s); digest injected without save (thread=%s)",
+                existing.trigger,
+                thread_id,
+            )
+        else:
+            shortterm.save(digest_state)
+            logger.info(
+                "resume_fallback: shortterm digest saved from activity_log (session_id=%s, thread=%s)",
+                failed_session_id,
+                thread_id,
+            )
+        return shortterm._render_markdown(digest_state)
+    except Exception:
+        logger.warning("resume_fallback: context recovery failed", exc_info=True)
+        return ""
+
+
+def _inject_recovered_context(prompt: str, recovered: str) -> str:
+    """Prepend the recovered conversation digest to the fresh-session prompt."""
+    return (
+        "<recovered_context>\n"
+        "The previous session could not be resumed. The following digest was "
+        "recovered from the activity log. Treat it as the immediately "
+        "preceding conversation and continue seamlessly.\n\n"
+        f"{recovered}\n"
+        "</recovered_context>\n\n"
+        f"{prompt}"
+    )
 
 
 # ── AgentSDKExecutor ─────────────────────────────────────────
@@ -786,7 +870,10 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
                         except TimeoutError:
                             logger.warning("Resume timed out (session_id=%s)", session_id_to_resume)
                             await gen.aclose()
-                            _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
+                            # Fix 4c: do NOT clear the session id here — the
+                            # session file in ~/.claude survives a first-event
+                            # timeout, so the caller retries the resume before
+                            # discarding the id for good.
                             raise
                         except StopAsyncIteration:
                             logger.warning("Resume stream empty (session_id=%s)", session_id_to_resume)
@@ -814,30 +901,78 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             logger.info("ClaudeSDKClient connecting (streaming, resume=%s)", session_id_to_resume)
             if session_id_to_resume:
                 fell_back = False
-                try:
-                    async for ev in _run_stream_options(options, resume_guard=True):
-                        yield ev
-                except (TimeoutError, StopAsyncIteration):
-                    fell_back = True
-                except (ProcessError, ClaudeSDKError) as e:
-                    if trip_claude_oauth_circuit(getattr(options, "env", None), str(e)):
-                        logger.error("Claude OAuth revoked; fleet-wide circuit opened")
-                        raise StreamDisconnectedError(
-                            f"Agent SDK stream error ({type(e).__name__}): {e}",
-                            partial_text="\n".join(state.response_text),
-                        ) from e
-                    logger.warning("SDK resume failed (session_id=%s): %s", session_id_to_resume, e)
-                    _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
-                    fell_back = True
-                except ClaudeOAuthCircuitOpen:
-                    raise
-                except Exception as e:
-                    logger.warning(
-                        "SDK resume failed with unexpected error (session_id=%s): %s", session_id_to_resume, e
-                    )
-                    _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
-                    fell_back = True
+                for resume_attempt in range(1, RESUME_MAX_ATTEMPTS + 1):
+                    resume_yielded = False
+                    try:
+                        async for ev in _run_stream_options(options, resume_guard=True):
+                            resume_yielded = True
+                            yield ev
+                        break
+                    except TimeoutError:
+                        if resume_yielded:
+                            # Mid-stream timeout after the resume handshake
+                            # succeeded — not a resume failure; keep the old
+                            # behavior (fresh-session fallback, no retry).
+                            fell_back = True
+                            break
+                        # Fix 4c: first-event timeout — retry the resume once
+                        # before discarding the session id (the session file
+                        # in ~/.claude is still intact; the timeout is usually
+                        # transient host load, not a broken session).
+                        if resume_attempt < RESUME_MAX_ATTEMPTS:
+                            logger.warning(
+                                "Resume attempt %d/%d timed out; retrying (session_id=%s)",
+                                resume_attempt,
+                                RESUME_MAX_ATTEMPTS,
+                                session_id_to_resume,
+                            )
+                            continue
+                        logger.warning(
+                            "Resume failed after %d attempts; discarding session_id=%s",
+                            RESUME_MAX_ATTEMPTS,
+                            session_id_to_resume,
+                        )
+                        _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
+                        fell_back = True
+                        break
+                    except StopAsyncIteration:
+                        fell_back = True
+                        break
+                    except (ProcessError, ClaudeSDKError) as e:
+                        if trip_claude_oauth_circuit(getattr(options, "env", None), str(e)):
+                            logger.error("Claude OAuth revoked; fleet-wide circuit opened")
+                            raise StreamDisconnectedError(
+                                f"Agent SDK stream error ({type(e).__name__}): {e}",
+                                partial_text="\n".join(state.response_text),
+                            ) from e
+                        logger.warning("SDK resume failed (session_id=%s): %s", session_id_to_resume, e)
+                        _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
+                        fell_back = True
+                        break
+                    except ClaudeOAuthCircuitOpen:
+                        raise
+                    except Exception as e:
+                        logger.warning(
+                            "SDK resume failed with unexpected error (session_id=%s): %s", session_id_to_resume, e
+                        )
+                        _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
+                        fell_back = True
+                        break
                 if fell_back:
+                    # Fix 4b: recover the recent conversation from the
+                    # activity_log so the fresh session does not start with
+                    # total amnesia. Best-effort — on failure the fallback
+                    # behaves exactly as before.
+                    recovered = _build_resume_fallback_handoff(
+                        self._anima_dir,
+                        session_type,
+                        thread_id,
+                        session_id_to_resume,
+                    )
+                    if recovered:
+                        from dataclasses import replace as _dc_replace
+
+                        ctx = _dc_replace(ctx, prompt=_inject_recovered_context(prompt, recovered))
                     async for ev in _fresh_session():
                         yield ev
             else:

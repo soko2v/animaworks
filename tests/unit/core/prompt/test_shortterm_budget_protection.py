@@ -213,3 +213,137 @@ class TestShorttermDropWarning:
             assert "original" in shortterm.content, (
                 "shortterm must preserve the head (original request)"
             )
+
+
+class TestShorttermRigidSection:
+    """Fix 2: builder emits shortterm as priority-2 rigid; assembler protects it."""
+
+    def test_builder_emits_shortterm_as_rigid_priority_2(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """_build_group3 must add the shortterm section as rigid priority-2."""
+        from unittest.mock import MagicMock
+
+        from core.prompt.builder import _build_group3
+
+        anima_dir = tmp_path / "animas" / "sakura"
+        (anima_dir / "state").mkdir(parents=True)
+        memory = MagicMock()
+        memory.anima_dir = anima_dir
+        memory.read_current_state.return_value = ""
+        memory.read_resolutions.return_value = []
+
+        entries = _build_group3(
+            anima_dir,
+            memory,
+            1.0,
+            "",
+            "",
+            "s",
+            False,
+            True,
+            False,
+            {"group3_header": "# 6. Current Situation"},
+            {"truncated": "(earlier portion omitted)"},
+            shortterm_text="## session handoff\ncontinue the deploy discussion",
+        )
+
+        shortterm = next((e for e in entries if e.id == "shortterm"), None)
+        assert shortterm is not None, "shortterm section must be emitted"
+        assert shortterm.kind == "rigid", "shortterm must be rigid (Fix 2)"
+        assert shortterm.priority == 2, "shortterm must be priority 2"
+        assert shortterm.budget_group == "shortterm"
+
+    def test_rigid_shortterm_survives_target_and_elastic_ceiling_trim(self) -> None:
+        """A rigid shortterm section is fully preserved while elastic content
+        of the same priority is trimmed to fit the target."""
+        identity_content = "identity " * 10
+        framework_content = "framework " * 300
+        shortterm_content = "handoff " * 200
+
+        sections = [
+            SectionEntry("identity", 1, "rigid", identity_content),
+            SectionEntry(
+                "optional_framework",
+                3,
+                "elastic",
+                framework_content,
+                budget_group="framework",
+            ),
+            SectionEntry(
+                "shortterm",
+                2,
+                "rigid",
+                shortterm_content,
+                budget_group="shortterm",
+            ),
+        ]
+
+        allocated = _allocate_sections(
+            sections,
+            PromptBudget(target=100, ceiling=5000),
+        )
+
+        shortterm = _by_id(allocated, "shortterm")
+        framework = _by_id(allocated, "optional_framework")
+        assert shortterm is not None, "rigid shortterm must never be target-trimmed"
+        assert shortterm.content == shortterm_content, (
+            "rigid shortterm content must be preserved verbatim within ceiling"
+        )
+        assert framework is None or len(framework.content) < len(framework_content), (
+            "framework elastic must still yield to the target"
+        )
+
+    def test_rigid_shortterm_evicted_only_at_hard_ceiling(self) -> None:
+        """A rigid shortterm section is evicted when the hard ceiling cannot
+        hold it (all-or-nothing rigid eviction)."""
+        identity_content = "identity " * 10
+        shortterm_content = "handoff " * 500
+
+        sections = [
+            SectionEntry("identity", 1, "rigid", identity_content),
+            SectionEntry(
+                "shortterm",
+                2,
+                "rigid",
+                shortterm_content,
+                budget_group="shortterm",
+            ),
+        ]
+
+        allocated = _allocate_sections(
+            sections,
+            PromptBudget(target=100, ceiling=100),
+        )
+
+        assert _by_id(allocated, "shortterm") is None, (
+            "rigid shortterm must yield to the hard ceiling"
+        )
+        assert _by_id(allocated, "identity") is not None, (
+            "priority-1 rigid content must survive"
+        )
+
+    def test_warning_log_on_rigid_shortterm_eviction(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        """Evicting a rigid shortterm section must log at WARNING level."""
+        sections = [
+            SectionEntry("identity", 1, "rigid", "identity " * 10),
+            SectionEntry(
+                "shortterm",
+                2,
+                "rigid",
+                "handoff " * 500,
+                budget_group="shortterm",
+            ),
+        ]
+
+        with caplog.at_level(logging.DEBUG, logger="animaworks.prompt_builder"):
+            _allocate_sections(
+                sections,
+                PromptBudget(target=100, ceiling=100),
+            )
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "shortterm" in r.getMessage()
+        ]
+        assert warning_records, (
+            "Evicting a rigid shortterm section must produce a WARNING log"
+        )

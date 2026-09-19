@@ -554,7 +554,12 @@ def _build_group3(
         except Exception:
             logger.debug("Failed to inject recent tool results", exc_info=True)
     if shortterm_text:
-        _add(shortterm_text, "shortterm", 3, "elastic", budget_group="shortterm")
+        # rigid (not elastic): the session handoff must never be trimmed away
+        # while the model still has context headroom. As priority-2 rigid it
+        # survives all target trims and elastic ceiling trims, and is evicted
+        # only in the last hard-ceiling pass together with other priority-2
+        # rigid sections (see _allocate_sections in assembler.py).
+        _add(shortterm_text, "shortterm", 2, "rigid", budget_group="shortterm")
     return out
 
 

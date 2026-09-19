@@ -254,10 +254,12 @@ def _allocate_sections(
             logger.debug("Using default recall prompt budget", exc_info=True)
     trim_elastic(budget.target, "framework")
     trim_elastic(max(0, min(recall_target, budget.ceiling)), "recall")
-    # shortterm (session handoff) is protected from target trim. It is only
-    # trimmed by the hard ceiling pass at the very end so that a saved
-    # handoff is never silently discarded while the model still has plenty
-    # of context window headroom.
+    # shortterm (session handoff) is protected from target trim. The builder
+    # now emits it as a priority-2 *rigid* section, so it also survives every
+    # elastic trim and can only be evicted by the hard-ceiling rigid pass
+    # below. The group-specific skip is kept for any legacy elastic shortterm
+    # entries so a saved handoff is never silently discarded while the model
+    # still has plenty of context window headroom.
     # (no group-specific trim_elastic call for "shortterm")
 
     dropped_rigid: list[str] = []
@@ -290,7 +292,8 @@ def _allocate_sections(
     if dropped_items or dropped_rigid:
         item_details = ",".join(f"{name}:{count}" for name, count in dropped_items.items()) or "none"
         rigid_details = ",".join(dropped_rigid) or "none"
-        log_fn = logger.warning if "shortterm" in dropped_items else logger.info
+        shortterm_dropped = "shortterm" in dropped_items or "shortterm" in dropped_rigid
+        log_fn = logger.warning if shortterm_dropped else logger.info
         log_fn(
             "Prompt allocation: dropped_items=%s dropped_rigid=%s before_tokens=%d "
             "after_tokens=%d target=%d ceiling=%d",
