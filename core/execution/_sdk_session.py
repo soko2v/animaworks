@@ -17,6 +17,7 @@ Leaf module in the dependency graph — no internal framework imports
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sys
 from collections.abc import AsyncGenerator
