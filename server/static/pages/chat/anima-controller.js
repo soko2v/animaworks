@@ -397,6 +397,19 @@ export function createAnimaController(ctx) {
       ]);
       state.animas = animas || [];
       state.users = Array.isArray(users) ? users : [];
+
+      // Defensive: if an early render ran before state.users was populated from the API
+      // (race condition: streaming/polling events can trigger renderChat while loadAnimas
+      // is still in flight), re-render now so knownUserNames includes the real user list.
+      const _preAnima = state.selectedAnima;
+      const _preTid = state.selectedThreadId || "default";
+      if (_preAnima) {
+        const _preHs = state.manager.getHistoryState(_preAnima, _preTid);
+        if (_preHs && _preHs.sessions.length > 0) {
+          ctx.controllers.renderer.renderChat();
+        }
+      }
+
       restoreChatUiState(uiState);
       renderAddConversationMenu();
       renderAnimaTabs();

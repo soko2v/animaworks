@@ -32,7 +32,17 @@ export function defaultThreadLabel(threadId, lastTs, timeStr) {
  * @returns {{ updatedList: Array, newThreadId: string, newEntry: object }}
  */
 export function createThread(threadList, _animaName) {
-  const threadId = crypto.randomUUID().slice(0, 8);
+  // crypto.randomUUID requires a secure context (HTTPS or localhost). Over plain
+  // HTTP + LAN/Tailscale IP it is undefined, which threw a TypeError here and made
+  // the "+" (new thread) button silently do nothing. Same fallback as logger.js.
+  let threadId;
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    threadId = crypto.randomUUID().slice(0, 8);
+  } else {
+    const arr = new Uint8Array(4);
+    crypto.getRandomValues(arr);
+    threadId = Array.from(arr, b => b.toString(16).padStart(2, "0")).join("");
+  }
   // Stamp creation time so the new thread sorts to the top of
   // recency-ordered lists (tabs / dropdown) instead of the bottom.
   const newEntry = { id: threadId, label: t("thread.new"), unread: false, lastTs: new Date().toISOString() };

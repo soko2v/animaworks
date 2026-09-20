@@ -292,6 +292,14 @@ export function createChatRenderer(ctx) {
     const prevScrollHeight = messagesEl.scrollHeight;
 
     const opts = _renderOpts();
+    {
+      const lastSess = hs.sessions[hs.sessions.length - 1];
+      console.log("[renderChat] anima:", name, "sessions:", hs.sessions.length, "live:", history.length,
+        "lastTrigger:", lastSess?.trigger, "lastMsgs:", lastSess?.messages?.length,
+        "knownUsers:", [...(opts.knownUserNames || [])],
+        "lastMsgFrom:", lastSess?.messages?.[0]?.from_person,
+        "lastMsgTo:", lastSess?.messages?.[0]?.to_person);
+    }
     let sessionsHtml = "";
     let si = 0;
     let hasRenderedTimelineItem = false;
@@ -304,6 +312,7 @@ export function createChatRenderer(ctx) {
       return true;
     };
 
+    try {
     while (si < hs.sessions.length) {
       const session = hs.sessions[si];
 
@@ -316,6 +325,14 @@ export function createChatRenderer(ctx) {
         if (session.messages) {
           for (const msg of session.messages) {
             const messageActivityType = _sharedGetMessageActivityType(msg, opts);
+            // デバッグ: getMessageActivityType が何を返しているか確認
+            if (session.trigger === "chat" || name === "nico") {
+              console.log("[renderChat] msg classify:", {
+                anima: name, trigger: session.trigger,
+                role: msg.role, from: msg.from_person, to: msg.to_person,
+                actType: messageActivityType, content: String(msg.content || "").slice(0, 40),
+              });
+            }
             if (messageActivityType) {
               activityRun.push({ type: messageActivityType, message: msg });
               continue;
@@ -326,7 +343,15 @@ export function createChatRenderer(ctx) {
               sessionsHtml += renderSessionDivider(session, !hasRenderedTimelineItem);
               sessionDividerRendered = true;
             }
-            sessionsHtml += renderHistoryMessage(msg);
+            try {
+              sessionsHtml += renderHistoryMessage(msg);
+            } catch (msgErr) {
+              console.error("[renderChat] renderHistoryMessage failed:", msgErr,
+                { role: msg.role, from: msg.from_person, to: msg.to_person,
+                  content: String(msg.content || "").slice(0, 60) });
+              // フォールバック: エラーが起きても後続メッセージの描画を続ける
+              sessionsHtml += `<div class="chat-bubble assistant" style="opacity:0.4;font-style:italic;">[描画エラー]</div>`;
+            }
             hasRenderedTimelineItem = true;
           }
         }
@@ -334,6 +359,9 @@ export function createChatRenderer(ctx) {
       }
     }
     flushActivityRun();
+    } catch (renderLoopErr) {
+      console.error("[renderChat] RENDER LOOP ERROR:", renderLoopErr, {si, sessionsLen: hs.sessions.length, activityRunLen: activityRun.length, sessionsHtmlLen: sessionsHtml.length});
+    }
 
     let liveHtml = "";
     if (history.length > 0) {

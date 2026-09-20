@@ -98,10 +98,13 @@ export function createStreamingController(ctx) {
       sendBtn.disabled = !hasInput || isMeetingStreaming;
     } else if (!isChatStreaming) {
       setSendButtonIcon(sendBtn, "send");
-      sendBtn.disabled = !name || (!hasInput && pendingQueue.length === 0);
-    } else if (hasInput) {
+      sendBtn.disabled = !name || (!hasInput && !hasAttachment && pendingQueue.length === 0);
+    } else if (hasInput || hasAttachment) {
+      // ストリーミング中は送信ボタンを無効化（現行応答が完了してから再送させる）
+      // キューイングは pendingQueue 経由で対応済みだが、
+      // ストリーミング中の直接再送は割り込みを起こし応答を壊すため禁止する。
       setSendButtonIcon(sendBtn, "send");
-      sendBtn.disabled = false;
+      sendBtn.disabled = true;
     } else if (pendingQueue.length > 0) {
       setSendButtonIcon(sendBtn, "interrupt");
       sendBtn.classList.add("interrupt");

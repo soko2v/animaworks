@@ -488,6 +488,11 @@ export function renderHistoryMessage(msg, opts) {
   }
 
   if (msg.role === "assistant") {
+    // 空応答（ストリーミング割り込みなどで生じた "(no response)"）は
+    // 斜体グレーの placeholder として表示し、描画経路を止めない。
+    if ((msg.content || "").trim() === "(no response)" && !msg.tool_calls?.length) {
+      return `<div class="chat-msg-row assistant"><div class="chat-bubble assistant" style="opacity:0.4;font-style:italic;">${escapeHtml(t("chat.no_response") || "(no response)")}</div></div>`;
+    }
     const speakerName = msg.speaker || opts.animaName;
     const speakerLabel = msg.speaker
       ? `<div class="chat-speaker-label">${escapeHtml(msg.speaker)}</div>`
@@ -507,13 +512,19 @@ export function renderHistoryMessage(msg, opts) {
     return _wrapRow("assistant", bubble, _renderAvatar(speakerName, avatarMap, opts.companyColors));
   }
 
-  const isAnima = msg.from_person && msg.from_person !== "human";
+  // isAnima: 既知のユーザー名（knownUserNames）は除外して、
+  // 既知のAnima名（knownAnimaNames）のみをAnimaとして扱う。
+  // "human" / 空文字列 / 既知ユーザー名 はすべて人間メッセージとして描画する。
+  const isAnima = !!(msg.from_person
+    && msg.from_person !== "human"
+    && !_isKnownUserName(msg.from_person, opts)
+    && _isKnownAnimaName(msg.from_person, opts));
   const fromLabel = isAnima
     ? `<div style="font-size:0.72rem; opacity:0.7; margin-bottom:2px;">${escapeHtml(msg.from_person)}</div>`
     : "";
   const userContent = _stripVoiceSuffix(msg.content || "");
   const contentHtml = isAnima
-    ? renderMarkdown(userContent)
+    ? renderMarkdown(userContent, opts.animaName)
     : `<div class="chat-text">${_linkifyEscaped(escapeHtml, userContent)}</div>`;
   const bubbleWs = isAnima ? ' style="white-space:normal"' : "";
   const bubble = `<div class="chat-bubble user"${bubbleWs}>${fromLabel}${contentHtml}${tsHtml}</div>`;
