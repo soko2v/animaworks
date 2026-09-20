@@ -21,6 +21,9 @@ import { createScrollObserver } from "../../shared/chat/scroll-observer.js";
 import { mergePolledHistory } from "../../shared/chat/history-loader.js";
 import { initTextArtifactHandlers } from "../../shared/text-artifact.js";
 import { companyColor } from "../../shared/avatar-utils.js";
+import { createLogger } from "../../shared/logger.js";
+
+const logger = createLogger("chat-renderer");
 
 export function createChatRenderer(ctx) {
   const $ = ctx.$;
@@ -471,12 +474,34 @@ export function createChatRenderer(ctx) {
 
   // ── Polling ──
 
+  // Key of the stream (anima:thread:since) whose guard bypass was already logged,
+  // so the fail-safe warns once per stuck stream instead of every poll tick.
+  let _guardBypassLoggedKey = null;
+
+  /**
+   * Fail-safe for the streaming guard: true when the current stream has been
+   * running longer than CONSTANTS.STREAMING_GUARD_MAX_MS. A stuck SSE read that
+   * never clears `isStreaming` would otherwise block history polling forever.
+   */
+  function _streamingGuardExpired(mgr, name, tid) {
+    const since = mgr.getStreamingSince?.(name, tid);
+    if (!since) return false;
+    const elapsed = Date.now() - since;
+    if (elapsed < CONSTANTS.STREAMING_GUARD_MAX_MS) return false;
+    const key = `${name}:${tid}:${since}`;
+    if (_guardBypassLoggedKey !== key) {
+      _guardBypassLoggedKey = key;
+      logger.warn(`pollSelectedChat: streaming guard exceeded ${CONSTANTS.STREAMING_GUARD_MAX_MS}ms (elapsed=${elapsed}ms); polling history anyway`, { anima: name, thread: tid });
+    }
+    return true;
+  }
+
   async function pollSelectedChat() {
     const name = state.selectedAnima;
     const tid = state.selectedThreadId || "default";
     if (!name || state.chatPollingInFlight) return;
     const mgr = state.manager;
-    if (mgr.isStreamingFor(name, tid)) return;
+    if (mgr.isStreamingFor(name, tid) && !_streamingGuardExpired(mgr, name, tid)) return;
 
     state.chatPollingInFlight = true;
     try {

@@ -29,7 +29,7 @@ def cmd_task(args: argparse.Namespace) -> None:
             "Error: ANIMAWORKS_ANIMA_DIR not set.\n"
             "`animaworks-tool task` runs inside an anima's tool context (the server sets this variable).\n"
             "To hand work to an anima from outside, use:\n"
-            "  animaworks send <your-name> <anima> \"<instruction>\"",
+            '  animaworks send <your-name> <anima> "<instruction>"',
             file=sys.stderr,
         )
         sys.exit(1)

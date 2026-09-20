@@ -575,3 +575,161 @@ describe("streamChat", () => {
     assert.ok(releaseLockCalled, "reader.releaseLock() should have been called in finally block");
   });
 });
+
+// ── Idle timeout watchdog ──────────────────────────────
+
+describe("streamChat idle timeout", () => {
+  const encoder = new TextEncoder();
+
+  /**
+   * Reader that yields `initialChunks` then hangs forever (never resolves read()).
+   * Simulates a server that stops sending bytes without emitting `done`.
+   */
+  function createHangingBody(initialChunks, hooks = {}) {
+    let index = 0;
+    return {
+      getReader() {
+        return {
+          async read() {
+            if (index < initialChunks.length) {
+              return { done: false, value: encoder.encode(initialChunks[index++]) };
+            }
+            return new Promise(() => {}); // never settles
+          },
+          cancel(reason) { hooks.onCancel?.(reason); return Promise.resolve(); },
+          releaseLock() { hooks.onRelease?.(); },
+        };
+      },
+    };
+  }
+
+  beforeEach(() => {
+    globalThis.console.info = () => {};
+    globalThis.console.warn = () => {};
+    globalThis.console.error = () => {};
+  });
+
+  it("should reject with SseIdleTimeoutError when the stream goes silent without done", async () => {
+    let cancelReason = null;
+    let released = false;
+    const body = createHangingBody(
+      [sseEvent("text_delta", { text: "partial" })],
+      { onCancel: (r) => { cancelReason = r; }, onRelease: () => { released = true; } },
+    );
+    globalThis.fetch = async () => ({ ok: true, status: 200, body });
+
+    const received = [];
+    let doneCalled = false;
+    const t0 = Date.now();
+    await assert.rejects(
+      () => streamChat(
+        "test-anima", '{"message":"hi"}', null,
+        { onTextDelta: (text) => received.push(text), onDone: () => { doneCalled = true; } },
+        { idleTimeoutMs: 40 },
+      ),
+      (err) => {
+        assert.strictEqual(err.name, "SseIdleTimeoutError");
+        assert.ok(err.message.includes("40ms"));
+        return true;
+      },
+    );
+
+    assert.deepStrictEqual(received, ["partial"]);
+    assert.strictEqual(doneCalled, false);
+    assert.ok(Date.now() - t0 >= 35, "should wait for the idle timeout before rejecting");
+    assert.ok(cancelReason, "reader.cancel() should be called to tear down the connection");
+    assert.ok(released, "reader.releaseLock() should still be called");
+  });
+
+  it("should not time out while keepalive comments keep arriving", async () => {
+    // 5 keepalives 15ms apart (75ms total) with a 60ms idle timeout: each chunk re-arms the timer.
+    const chunks = [
+      ": keepalive\n\n", ": keepalive\n\n", ": keepalive\n\n", ": keepalive\n\n", ": keepalive\n\n",
+      sseEvent("done", { summary: "ok" }),
+    ];
+    let index = 0;
+    const body = {
+      getReader() {
+        return {
+          async read() {
+            await new Promise((r) => setTimeout(r, 15));
+            if (index < chunks.length) return { done: false, value: encoder.encode(chunks[index++]) };
+            return { done: true, value: undefined };
+          },
+          releaseLock() {},
+        };
+      },
+    };
+    globalThis.fetch = async () => ({ ok: true, status: 200, body });
+
+    let doneData = null;
+    await streamChat(
+      "test-anima", '{"message":"hi"}', null,
+      { onDone: (data) => { doneData = data; } },
+      { idleTimeoutMs: 60 },
+    );
+    assert.strictEqual(doneData.summary, "ok");
+  });
+
+  it("should attempt reconnection after idle timeout when a response_id is known", async () => {
+    let fetchCount = 0;
+    const bodies = [];
+    globalThis.fetch = async (url, options) => {
+      fetchCount++;
+      bodies.push(options.body);
+      if (fetchCount === 1) {
+        return {
+          ok: true, status: 200,
+          body: createHangingBody([sseEvent("stream_start", { response_id: "resp-1" })]),
+        };
+      }
+      return { ok: true, status: 200, body: createMockBody([sseEvent("done", { summary: "resumed" })]) };
+    };
+
+    let doneData = null;
+    let reconnecting = 0;
+    let reconnected = 0;
+    await streamChat(
+      "test-anima", '{"message":"hi","from_person":"human"}', null,
+      {
+        onDone: (data) => { doneData = data; },
+        onReconnecting: () => { reconnecting++; },
+        onReconnected: () => { reconnected++; },
+      },
+      { idleTimeoutMs: 40 },
+    );
+
+    assert.strictEqual(fetchCount, 2);
+    assert.strictEqual(reconnecting, 1);
+    assert.strictEqual(reconnected, 1);
+    assert.strictEqual(doneData.summary, "resumed");
+    const resumeBody = JSON.parse(bodies[1]);
+    assert.strictEqual(resumeBody.resume, "resp-1");
+    assert.strictEqual(resumeBody.from_person, "human");
+  });
+
+  it("should disable the watchdog when idleTimeoutMs <= 0", async () => {
+    let index = 0;
+    const chunks = [sseEvent("done", { summary: "ok" })];
+    let readCalls = 0;
+    const body = {
+      getReader() {
+        return {
+          async read() {
+            readCalls++;
+            await new Promise((r) => setTimeout(r, 30));
+            if (index < chunks.length) return { done: false, value: encoder.encode(chunks[index++]) };
+            return { done: true, value: undefined };
+          },
+          releaseLock() {},
+        };
+      },
+    };
+    globalThis.fetch = async () => ({ ok: true, status: 200, body });
+
+    let doneData = null;
+    await streamChat("test-anima", '{"message":"hi"}', null, { onDone: (d) => { doneData = d; } }, { idleTimeoutMs: 0 });
+    assert.strictEqual(doneData.summary, "ok");
+    assert.strictEqual(readCalls, 2);
+  });
+});

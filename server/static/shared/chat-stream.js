@@ -10,6 +10,54 @@ import { basePath } from "/shared/base-path.js";
 const logger = createLogger("chat-stream");
 
 /**
+ * Idle watchdog for SSE reads (ms).
+ *
+ * The server tail emits a ": keepalive" comment every 30s while a stream is
+ * alive, so 90s of complete silence (3 missed keepalives) means the connection
+ * is dead or the producer hung without ever sending `done`. Without this
+ * watchdog `reader.read()` can block forever, the promise never settles, and
+ * the caller's `isStreaming` state is never cleared (history polling stalls).
+ */
+export const SSE_IDLE_TIMEOUT_MS = 90_000;
+
+/**
+ * Wrap `reader.read()` with an idle timeout.
+ *
+ * Any bytes (including SSE keepalive comments) reset the timer because the
+ * timer is re-armed on every read call.
+ *
+ * @param {ReadableStreamDefaultReader} reader
+ * @param {number} timeoutMs - <= 0 disables the watchdog
+ * @returns {Promise<{done: boolean, value?: Uint8Array}>}
+ */
+function _readWithIdleTimeout(reader, timeoutMs) {
+  if (!(timeoutMs > 0)) return reader.read();
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`SSE idle timeout: no data received for ${timeoutMs}ms`);
+      err.name = "SseIdleTimeoutError";
+      reject(err);
+    }, timeoutMs);
+  });
+  return Promise.race([reader.read(), timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Best-effort cancel of a reader (tears down the underlying fetch body).
+ * Never throws; safe to call on partial/mock readers without `cancel()`.
+ */
+function _cancelReaderQuietly(reader, reason) {
+  try {
+    if (typeof reader.cancel === "function") {
+      Promise.resolve(reader.cancel(reason)).catch(() => {});
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
  * Fetch the active stream for an anima.
  * @param {string} animaName
  * @param {string} [threadId] - Optional thread ID to filter by
@@ -74,10 +122,13 @@ export async function fetchStreamProgress(animaName, responseId) {
  * @param {function(): void} [callbacks.onReconnected] - Reconnection successful
  * @param {function({speaker: string, role: string}): void} [callbacks.onSpeakerStart] - Meeting speaker started
  * @param {function({speaker: string}): void} [callbacks.onSpeakerEnd] - Meeting speaker ended
+ * @param {object} [options]
+ * @param {number} [options.idleTimeoutMs=SSE_IDLE_TIMEOUT_MS] - Reject when no bytes arrive for this long
  * @returns {Promise<void>}
- * @throws {Error} On HTTP error (non-ok response) or network failure
+ * @throws {Error} On HTTP error (non-ok response), network failure, or idle timeout
+ *   (`err.name === "SseIdleTimeoutError"`) after reconnection attempts are exhausted
  */
-export async function streamChat(animaName, body, signal, callbacks) {
+export async function streamChat(animaName, body, signal, callbacks, options = {}) {
   const url = `${basePath}/api/animas/${encodeURIComponent(animaName)}/chat/stream`;
   const start = performance.now();
   logger.info(`[SSE-FE] streamChat START anima=${animaName} url=${url}`);
@@ -102,7 +153,7 @@ export async function streamChat(animaName, body, signal, callbacks) {
   }
 
   try {
-    await _processStream(res, callbacks, (id) => { responseId = id; }, (id) => { lastEventId = id; }, signal);
+    await _processStream(res, callbacks, (id) => { responseId = id; }, (id) => { lastEventId = id; }, signal, options);
   } catch (err) {
     const elapsed = ((performance.now() - start) / 1000).toFixed(1);
     logger.info(`[SSE-FE] _processStream ERROR anima=${animaName} err=${err.name}:${err.message} elapsed=${elapsed}s responseId=${responseId} lastEventId=${lastEventId}`);
@@ -112,7 +163,7 @@ export async function streamChat(animaName, body, signal, callbacks) {
     if (responseId) {
       logger.info(`[SSE-FE] reconnect attempt anima=${animaName} responseId=${responseId} lastEventId=${lastEventId}`);
       const reconnected = await _reconnectWithBackoff(
-        animaName, responseId, lastEventId, body, signal, callbacks,
+        animaName, responseId, lastEventId, body, signal, callbacks, options,
       );
       if (reconnected) {
         logger.info(`[SSE-FE] reconnect SUCCESS anima=${animaName}`);
@@ -172,22 +223,27 @@ export async function streamMeetingChat(roomId, body, signal, callbacks) {
 
 /**
  * Process a ReadableStream response, parsing SSE events.
+ *
+ * @param {object} [options]
+ * @param {number} [options.idleTimeoutMs=SSE_IDLE_TIMEOUT_MS] - Idle watchdog; <= 0 disables
+ * @throws {Error} `SseIdleTimeoutError` when no bytes arrive within the idle timeout
  */
-async function _processStream(res, callbacks, setResponseId, setLastEventId, signal) {
+async function _processStream(res, callbacks, setResponseId, setLastEventId, signal, options = {}) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
+  const idleTimeoutMs = options.idleTimeoutMs ?? SSE_IDLE_TIMEOUT_MS;
   let buffer = "";
   let chunkCount = 0;
   let sseEventCount = 0;
   const streamStart = performance.now();
 
-  logger.debug("[SSE-FE] _processStream: reader opened");
+  logger.debug(`[SSE-FE] _processStream: reader opened idleTimeoutMs=${idleTimeoutMs}`);
 
   try {
     while (true) {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
-      const { done, value } = await reader.read();
+      const { done, value } = await _readWithIdleTimeout(reader, idleTimeoutMs);
 
       if (done) {
         const totalElapsed = ((performance.now() - streamStart) / 1000).toFixed(1);
@@ -335,6 +391,14 @@ async function _processStream(res, callbacks, setResponseId, setLastEventId, sig
         }
       }
     }
+  } catch (err) {
+    if (err?.name === "SseIdleTimeoutError") {
+      const totalElapsed = ((performance.now() - streamStart) / 1000).toFixed(1);
+      logger.warn(`[SSE-FE] IDLE TIMEOUT chunks=${chunkCount} sseEvents=${sseEventCount} elapsed=${totalElapsed}s idleTimeoutMs=${idleTimeoutMs}`);
+      // Tear down the underlying connection; the pending read() is settled by cancel().
+      _cancelReaderQuietly(reader, err.message);
+    }
+    throw err;
   } finally {
     const totalElapsed = ((performance.now() - streamStart) / 1000).toFixed(1);
     logger.info(`[SSE-FE] reader.releaseLock chunks=${chunkCount} sseEvents=${sseEventCount} elapsed=${totalElapsed}s`);
@@ -345,7 +409,7 @@ async function _processStream(res, callbacks, setResponseId, setLastEventId, sig
 /**
  * Reconnect with exponential backoff (1s -> 2s -> 4s -> ... max 30s, 5 attempts).
  */
-async function _reconnectWithBackoff(animaName, responseId, lastEventId, originalBody, signal, callbacks) {
+async function _reconnectWithBackoff(animaName, responseId, lastEventId, originalBody, signal, callbacks, options = {}) {
   const MAX_RETRIES = 5;
   const MAX_DELAY = 30000;
   let delay = 1000;
@@ -397,7 +461,7 @@ async function _reconnectWithBackoff(animaName, responseId, lastEventId, origina
 
       callbacks.onReconnected?.();
       logger.info(`[SSE-FE] reconnect SUCCESS attempt=${attempt} processing resumed stream`);
-      await _processStream(res, callbacks, () => {}, (id) => { lastEventId = id; }, signal);
+      await _processStream(res, callbacks, () => {}, (id) => { lastEventId = id; }, signal, options);
       const elapsed = ((performance.now() - reconnectStart) / 1000).toFixed(1);
       logger.info(`[SSE-FE] reconnect COMPLETE anima=${animaName} elapsed=${elapsed}s`);
       return true;

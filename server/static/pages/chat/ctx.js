@@ -24,6 +24,9 @@ export const CONSTANTS = Object.freeze({
   TOOL_RESULT_TRUNCATE: 500,
   THREAD_VISIBLE_NON_DEFAULT: 5,
   CHAT_POLL_INTERVAL_MS: 5000,
+  // Fail-safe: once a stream has been "in progress" this long, history polling
+  // ignores the streaming guard so a stuck SSE read cannot freeze the chat view.
+  STREAMING_GUARD_MAX_MS: 120000,
 });
 
 export function createChatContext() {

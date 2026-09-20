@@ -326,6 +326,7 @@ class TestSlackSocketModeManagerHandlers:
         from server.slack_socket import SlackSocketModeManager
 
         slack_cfg = MagicMock(enabled=True, mode="socket", anima_mapping={"C_KNOWN": "sakura"}, default_anima="")
+        slack_cfg.resolve_anima.return_value = None  # C_UNKNOWN is unmapped
         mock_config.return_value = MagicMock(
             external_messaging=MagicMock(slack=slack_cfg),
         )
