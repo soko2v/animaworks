@@ -120,6 +120,17 @@ def _cache_subordinate_paths(
 # ── Hook factories ───────────────────────────────────────────
 
 
+def _read_status_json(anima_dir: Path) -> dict[str, Any]:
+    """Read and parse status.json for an anima. Returns empty dict on failure."""
+    status_path = anima_dir / "status.json"
+    if not status_path.exists():
+        return {}
+    try:
+        return json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def _build_pre_tool_hook(
     anima_dir: Path,
     *,
