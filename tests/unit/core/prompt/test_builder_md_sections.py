@@ -19,7 +19,11 @@ def test_group1_uses_file_backed_environment_and_behavior_rules(tmp_path: Path) 
     ):
         load.side_effect = lambda name, **kwargs: {
             "environment": "file environment",
-        }[name]
+            "builder/instruction_internalization": "",
+            "builder/task_recording_chat": "",
+            "builder/task_recording_heartbeat": "",
+            "tool_data_interpretation": "",
+        }.get(name, "")
         sections = _build_group1(tmp_path / "anima", tmp_path, memory, False, {})
 
     contents = {section.id: section.content for section in sections}
