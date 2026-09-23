@@ -278,9 +278,7 @@ def _refresh_keychain_claude_token(refresh_token: str) -> str | None:
         return None
 
 
-def _write_keychain_claude_credential(
-    access_token: str, refresh_token: str, expires_in: int
-) -> None:
+def _write_keychain_claude_credential(access_token: str, refresh_token: str, expires_in: int) -> None:
     """Write refreshed Claude OAuth credentials back to macOS Keychain.
 
     Reads the existing Keychain entry, updates OAuth fields, and writes
