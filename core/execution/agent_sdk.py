@@ -439,8 +439,8 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
         }
 
     def _should_retry_sdk_auth_failure(self) -> bool:
-        """Do not multiply SDK processes after a shared-OAuth auth failure."""
-        return False
+        """Return True when auth failures should trigger a fresh-session retry."""
+        return (self._model_config.mode_s_auth or "max") == "max"
 
     def _rate_guard_preflight(self) -> None:
         """Log when this model's realm is rate-guarded (start-time suppression only).

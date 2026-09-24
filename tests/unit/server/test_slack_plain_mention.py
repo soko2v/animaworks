@@ -77,6 +77,7 @@ class TestPlainMentionRouting:
             anima_mapping={"C_TEST_CHAN": "sakura"},
             board_mapping={},
         )
+        slack_cfg.resolve_anima.return_value = "sakura"
         mock_config.return_value = MagicMock(
             external_messaging=MagicMock(slack=slack_cfg),
         )
@@ -145,6 +146,7 @@ class TestPlainMentionRouting:
             anima_mapping={"C_TEST_CHAN": "sakura"},
             board_mapping={},
         )
+        slack_cfg.resolve_anima.return_value = "sakura"
         mock_config.return_value = MagicMock(
             external_messaging=MagicMock(slack=slack_cfg),
         )
@@ -207,6 +209,7 @@ class TestPlainMentionRouting:
             anima_mapping={"C_TEST_CHAN": "sakura"},
             board_mapping={},
         )
+        slack_cfg.resolve_anima.return_value = "sakura"
         mock_config.return_value = MagicMock(
             external_messaging=MagicMock(slack=slack_cfg),
         )

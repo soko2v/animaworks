@@ -43,7 +43,6 @@ from core.prompt.assembler import (
 from core.prompt.messaging import (
     _build_human_notification_guidance,  # noqa: F401
     _build_messaging_section,
-    _build_recent_tool_section,
     _load_a_reflection,  # noqa: F401 -- compatibility export
 )
 from core.prompt.org_context import (
@@ -546,13 +545,6 @@ def _build_group3(
         _add("\n\n".join(recall), "priming", 2, "elastic", budget_group="recall")
     if pending_human_notifications and (is_chat or is_heartbeat):
         _add(pending_human_notifications, "pending_human_notifications", 1, "rigid")
-    if is_chat and execution_mode.upper() == "B":
-        try:
-            recent = _build_recent_tool_section(pd, memory.read_model_config())
-            if recent:
-                _add(recent, "recent_tools", 3, "elastic")
-        except Exception:
-            logger.debug("Failed to inject recent tool results", exc_info=True)
     if shortterm_text:
         # rigid (not elastic): the session handoff must never be trimmed away
         # while the model still has context headroom. As priority-2 rigid it

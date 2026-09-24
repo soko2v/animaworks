@@ -82,6 +82,7 @@ export function createStreamingController(ctx) {
     const sendBtn = $("chatPageSendBtn");
     const inputVal = $("chatPageInput")?.value?.trim() || "";
     const hasInput = inputVal.length > 0;
+    const hasAttachment = (state.imageInputManager?.getImageCount?.() || 0) > 0;
     const meetingActive = ctx.controllers.meeting?.isActive?.();
     const name = state.selectedAnima;
     const tid = state.selectedThreadId;
