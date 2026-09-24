@@ -325,7 +325,9 @@ class TestSlackSocketModeManagerHandlers:
         """Messages from unmapped channels are ignored when no default_anima."""
         from server.slack_socket import SlackSocketModeManager
 
-        slack_cfg = MagicMock(enabled=True, mode="socket", anima_mapping={"C_KNOWN": "sakura"}, default_anima="")
+        _anima_map = {"C_KNOWN": "sakura"}
+        slack_cfg = MagicMock(enabled=True, mode="socket", anima_mapping=_anima_map, default_anima="")
+        slack_cfg.resolve_anima.side_effect = lambda ch: _anima_map.get(ch, "")
         mock_config.return_value = MagicMock(
             external_messaging=MagicMock(slack=slack_cfg),
         )
