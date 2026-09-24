@@ -3,6 +3,16 @@
 // All functions are DOM-independent (return HTML strings) except bindToolCallHandlers.
 import { t } from "../i18n.js";
 
+// ── File attachment rendering ────────────────────────
+function _renderFiles(files, escapeHtml) {
+  if (!Array.isArray(files) || files.length === 0) return "";
+  return `<div class="chat-attached-files">${files.map(file => {
+    const name = typeof file === "string" ? file.split("/").pop() : file?.name;
+    const kind = String(name || "").toLowerCase().endsWith(".pdf") ? "PDF" : "CSV";
+    return `<span class="chat-attached-file"><b>${kind}</b> ${escapeHtml(name || t("chat.file_attachment"))}</span>`;
+  }).join("")}</div>`;
+}
+
 // ── Think-tag strip (frontend safety net) ─────────────
 const _THINK_CLOSE_RE = /<\/think>\s*/;
 const _THINK_CLOSE_GLOBAL_RE = /<\/think>\s*/g;
@@ -523,11 +533,15 @@ export function renderHistoryMessage(msg, opts) {
     ? `<div style="font-size:0.72rem; opacity:0.7; margin-bottom:2px;">${escapeHtml(msg.from_person)}</div>`
     : "";
   const userContent = _stripVoiceSuffix(msg.content || "");
+  const filesHtml = _renderFiles(
+    msg.files || (msg.attachments || []).filter(path => /\.(?:pdf|csv)$/i.test(path)),
+    escapeHtml,
+  );
   const contentHtml = isAnima
     ? renderMarkdown(userContent, opts.animaName)
     : `<div class="chat-text">${_linkifyEscaped(escapeHtml, userContent)}</div>`;
   const bubbleWs = isAnima ? ' style="white-space:normal"' : "";
-  const bubble = `<div class="chat-bubble user"${bubbleWs}>${fromLabel}${contentHtml}${tsHtml}</div>`;
+  const bubble = `<div class="chat-bubble user"${bubbleWs}>${fromLabel}${filesHtml}${contentHtml}${tsHtml}</div>`;
   const avatarHtml = _renderAvatar(isAnima ? msg.from_person : null, avatarMap, opts.companyColors);
   return _wrapRow("user", bubble, avatarHtml);
 }
@@ -1024,9 +1038,10 @@ export function renderLiveBubble(msg, opts) {
 
   if (msg.role === "user") {
     const imagesHtml = renderImages(msg.images, { animaName: opts.animaName });
+    const filesHtml = _renderFiles(msg.files, escapeHtml);
     const userText = _stripVoiceSuffix(msg.text || "");
     const textHtml = userText ? `<div class="chat-text">${_linkifyEscaped(escapeHtml, userText)}</div>` : "";
-    const bubble = `<div class="chat-bubble user">${imagesHtml}${textHtml}${tsHtml}</div>`;
+    const bubble = `<div class="chat-bubble user">${imagesHtml}${filesHtml}${textHtml}${tsHtml}</div>`;
     return _wrapRow("user", bubble, _renderAvatar(null, avatarMap));
   }
 
