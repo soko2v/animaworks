@@ -43,7 +43,19 @@ _active_interrupt_event: ContextVar[asyncio.Event | None] = ContextVar(
 
 # ── Adaptive Thinking helpers ─────────────────────────────────
 
-_ADAPTIVE_MODELS = frozenset({"claude-opus-4-6", "claude-sonnet-4-6"})
+# Models that accept ``thinking={"type": "adaptive"}`` + ``effort``.
+# claude-opus-5-5: adaptive thinking is always on; ``thinking.type=enabled``
+# (budget_tokens) returns 400, so it MUST take the adaptive path.
+# https://platform.claude.com/docs/en/models/opus-5-5/whats-new-opus-5-5
+_ADAPTIVE_MODELS = frozenset({"claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-5-5"})
+
+# Models for which ``effort="max"`` is passed through unchanged.  All other
+# models have ``"max"`` clamped to ``"high"`` by :func:`resolve_thinking_effort`.
+# Keep this as an explicit allow-list (not a single-name comparison) so new
+# models only need to be added here.  claude-opus-4-7 is intentionally absent:
+# its existing behaviour (``max`` → ``high``; use ``xhigh`` explicitly) is kept.
+# https://platform.claude.com/docs/en/build-with-claude/effort
+_MAX_EFFORT_MODELS = frozenset({"claude-opus-4-6", "claude-opus-5-5"})
 
 _PROVIDER_PREFIX_RE = re.compile(
     r"^(?:anthropic|bedrock|vertex_ai)/"
@@ -66,7 +78,7 @@ def _bare_model_name(model: str) -> str:
 
 
 def is_adaptive_model(model: str) -> bool:
-    """Return True if *model* supports Anthropic adaptive thinking (4.6 series)."""
+    """Return True if *model* supports Anthropic adaptive thinking (see ``_ADAPTIVE_MODELS``)."""
     return _bare_model_name(model) in _ADAPTIVE_MODELS
 
 
@@ -127,11 +139,13 @@ def supports_streaming_tool_use(model: str) -> bool:
 
 
 def resolve_thinking_effort(model: str, effort: str | None) -> str:
-    """Resolve thinking effort, clamping ``"max"`` to ``"high"`` for non-Opus-4.6."""
+    """Resolve thinking effort, clamping ``"max"`` to ``"high"`` unless allowed.
+
+    ``"max"`` is kept only for models in :data:`_MAX_EFFORT_MODELS`.
+    """
     resolved = effort or "high"
-    if resolved == "max":
-        if _bare_model_name(model) != "claude-opus-4-6":
-            return "high"
+    if resolved == "max" and _bare_model_name(model) not in _MAX_EFFORT_MODELS:
+        return "high"
     return resolved
 
 
