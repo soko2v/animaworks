@@ -48,6 +48,15 @@ class TestIsAdaptiveModel:
     def test_bedrock_without_region(self):
         assert is_adaptive_model("bedrock/claude-sonnet-4-6") is True
 
+    def test_opus_5_5(self):
+        assert is_adaptive_model("claude-opus-5-5") is True
+
+    def test_opus_5_5_with_prefix(self):
+        assert is_adaptive_model("anthropic/claude-opus-5-5") is True
+
+    def test_opus_4_7_unchanged(self):
+        assert is_adaptive_model("claude-opus-4-7") is False
+
     def test_old_sonnet(self):
         assert is_adaptive_model("claude-sonnet-4-5-20250929") is False
 
@@ -180,6 +189,37 @@ class TestResolveThinkingEffort:
 
     def test_low(self):
         assert resolve_thinking_effort("claude-sonnet-4-6", "low") == "low"
+
+    # ── claude-opus-5-5 (adaptive always on, supports low..max) ──
+
+    def test_max_on_opus_5_5(self):
+        assert resolve_thinking_effort("claude-opus-5-5", "max") == "max"
+
+    def test_max_on_prefixed_opus_5_5(self):
+        assert resolve_thinking_effort("anthropic/claude-opus-5-5", "max") == "max"
+        assert resolve_thinking_effort("bedrock/jp.anthropic.claude-opus-5-5", "max") == "max"
+
+    def test_xhigh_passthrough_on_opus_5_5(self):
+        assert resolve_thinking_effort("claude-opus-5-5", "xhigh") == "xhigh"
+
+    def test_default_on_opus_5_5(self):
+        assert resolve_thinking_effort("claude-opus-5-5", None) == "high"
+
+    # ── claude-opus-4-7: existing behaviour must not change ──
+
+    def test_max_clamped_on_opus_4_7(self):
+        assert resolve_thinking_effort("claude-opus-4-7", "max") == "high"
+
+    def test_xhigh_passthrough_on_opus_4_7(self):
+        assert resolve_thinking_effort("claude-opus-4-7", "xhigh") == "xhigh"
+
+    def test_max_effort_models_is_set_based(self):
+        from core.execution.base import _ADAPTIVE_MODELS, _MAX_EFFORT_MODELS
+
+        assert isinstance(_MAX_EFFORT_MODELS, frozenset)
+        assert {"claude-opus-4-6", "claude-opus-5-5"} <= _MAX_EFFORT_MODELS
+        assert "claude-opus-4-7" not in _MAX_EFFORT_MODELS
+        assert _MAX_EFFORT_MODELS <= _ADAPTIVE_MODELS
 
 
 # ── resolve_max_tokens ────────────────────────────────────────
