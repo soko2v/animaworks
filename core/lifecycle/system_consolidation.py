@@ -180,7 +180,8 @@ async def run_daily_consolidation_post_processing(
         from core.memory.maintenance.consolidation import ConsolidationEngine
 
         engine = ConsolidationEngine(anima_dir, anima_name)
-        engine._rebuild_rag_index()
+        # Run off the event loop so a blocking vector-store call cannot stall the server loop.
+        await asyncio.to_thread(engine._rebuild_rag_index)
     except Exception:
         logger.exception("RAG index rebuild failed for anima=%s", anima_name)
 
@@ -210,7 +211,8 @@ async def run_weekly_integration_post_processing(
         from core.memory.maintenance.consolidation import ConsolidationEngine
 
         engine = ConsolidationEngine(anima_dir, anima_name)
-        engine._rebuild_rag_index()
+        # Run off the event loop so a blocking vector-store call cannot stall the server loop.
+        await asyncio.to_thread(engine._rebuild_rag_index)
     except Exception:
         logger.exception("RAG index rebuild failed for anima=%s", anima_name)
 
