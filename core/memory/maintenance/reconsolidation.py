@@ -22,6 +22,7 @@ Pipeline:
 """
 
 import logging
+import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +39,65 @@ def _metadata_count(value: Any) -> int:
         return max(0, int(float(value)))
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+_BARE_LLM_FAILURE_RE = re.compile(
+    r"""
+    ^\s*(?:
+        you(?:['’]ve|\s+have)\s+(?:hit|reached)\s+(?:your\s+)?[^\n]{0,64}\blimit\b
+        | (?:usage|weekly|daily|monthly|token|request|rate)\s+limit\s+(?:exceeded|reached)\b
+        | quota\s+(?:exceeded|exhausted)\b
+        | insufficient[_\s-]+quota\b
+        | too\s+many\s+requests\b
+        | authentication\s+(?:failed|error)\b
+        | unauthorized\b
+        | forbidden\b
+        | (?:request\s+)?timed\s+out\b
+        | timeout\s+(?:error|occurred)\b
+        | (?:unable\s+to\s+connect|connection\s+(?:refused|reset|aborted|error))\b
+        | (?:internal\s+server\s+error|service\s+unavailable|bad\s+gateway|gateway\s+timeout|overloaded)\b
+        | (?:context\s+length\s+exceeded|maximum\s+context\s+length)\b
+        | (?:payment\s+required|insufficient\s+credits)\b
+        | (?:an?\s+)?(?:unexpected\s+)?error\s+(?:occurred|while\s+processing)\b
+        | something\s+went\s+wrong\b
+    )
+    (?=
+        $
+        | [\t ]*(?:[.!:·,\n]
+        | (?:please|try|retry|reset|resets|switch|visit|for|on|until|at|while|after|because|due)\b)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_BARE_QUOTA_FAILURE_RE = re.compile(
+    r"""
+    ^\s*(?:
+        you(?:['’]ve|\s+have)\s+(?:hit|reached)\s+(?:your\s+)?[^\n]{0,64}\blimit\b
+        | (?:usage|weekly|daily|monthly|token|request|rate)\s+limit\s+(?:exceeded|reached)\b
+        | quota\s+(?:exceeded|exhausted)\b
+        | insufficient[_\s-]+quota\b
+        | too\s+many\s+requests\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+class InvalidReconsolidationOutput(ValueError):
+    """Raised when an LLM revision is unsafe to persist as canonical memory."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        output_chars: int,
+        minimum_chars: int = 0,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.output_chars = output_chars
+        self.minimum_chars = minimum_chars
 
 
 def _iter_reconsolidation_files(root: Path) -> list[Path]:
@@ -526,6 +586,10 @@ class ReconsolidationEngine:
 
                 # Use LLM to revise the knowledge
                 revised = await self._revise_knowledge(content, meta, model)
+                revised = self._validate_knowledge_revision(
+                    revised,
+                    original_content=content,
+                )
                 if revised:
                     version = meta.get("version", 1)
                     self._archive_version(know_path, content, version)
@@ -569,10 +633,28 @@ class ReconsolidationEngine:
                     )
 
             except Exception as e:
-                logger.warning(
-                    "Knowledge reconsolidation failed for %s: %s",
+                if isinstance(e, InvalidReconsolidationOutput):
+                    failure_reason = e.reason
+                    output_chars = e.output_chars
+                    minimum_chars = e.minimum_chars
+                else:
+                    failure_reason = f"exception:{type(e).__name__}"
+                    output_chars = 0
+                    minimum_chars = 0
+
+                self._log_knowledge_reconsolidation_failure(
                     know_path,
-                    e,
+                    reason=failure_reason,
+                    output_chars=output_chars,
+                    minimum_chars=minimum_chars,
+                )
+                logger.warning(
+                    "Knowledge reconsolidation failed for %s: reason=%s output_chars=%d minimum_chars=%d",
+                    know_path,
+                    failure_reason,
+                    output_chars,
+                    minimum_chars,
+                    exc_info=not isinstance(e, InvalidReconsolidationOutput),
                 )
                 results["errors"] += 1
 
@@ -585,6 +667,109 @@ class ReconsolidationEngine:
             results["errors"],
         )
         return results
+
+    @staticmethod
+    def _validate_knowledge_revision(
+        revised: str | None,
+        *,
+        original_content: str,
+    ) -> str:
+        """Validate an LLM revision immediately before canonical persistence.
+
+        One-shot SDK backends can occasionally return a provider error as
+        ordinary assistant text.  Treating that text as a successful revision
+        would replace the canonical knowledge file and archive the corrupted
+        value on a later run.  This persistence-boundary guard therefore fails
+        closed for empty, provider-error, and implausibly short responses.
+
+        Args:
+            revised: Sanitized LLM output, or ``None`` when every backend failed.
+            original_content: Current canonical body used to size the minimum
+                plausible replacement.
+
+        Returns:
+            Stripped, validated revision text.
+
+        Raises:
+            InvalidReconsolidationOutput: If the output is unsafe to persist.
+        """
+        text = (revised or "").strip()
+        original_chars = len(original_content.strip())
+        minimum_chars = max(32, min(160, original_chars // 20))
+
+        if not text:
+            raise InvalidReconsolidationOutput(
+                "empty_response",
+                output_chars=0,
+                minimum_chars=minimum_chars,
+            )
+
+        # Provider transports sometimes return a synthetic failure envelope as
+        # ordinary assistant text.  Envelope detection is unconditional: a
+        # long diagnostic must not bypass the persistence guard.  The narrower
+        # bare-message check covers quota/rate-limit text that lacks an API
+        # prefix, without treating normal documents about those topics as an
+        # error merely because they contain classifier keywords.
+        from core.execution.error_classifier import (
+            FailoverReason,
+            classify_llm_error_message,
+            detect_cli_error_envelope,
+        )
+
+        explicit_envelope = detect_cli_error_envelope(text) is not None or re.match(
+            r"^(?:API\s+Error\s*:|Failed\s+to\s+authenticate\b)",
+            text,
+            re.IGNORECASE,
+        )
+        nonempty_lines = [line for line in text.splitlines() if line.strip()]
+        has_setext_heading = len(nonempty_lines) >= 2 and re.fullmatch(r"[=-]+", nonempty_lines[1].strip())
+        bare_failure = _BARE_QUOTA_FAILURE_RE.match(text) or (
+            not has_setext_heading and _BARE_LLM_FAILURE_RE.match(text)
+        )
+        if explicit_envelope or bare_failure:
+            reason, _ = classify_llm_error_message(text)
+            reason_name = reason.value if reason is not FailoverReason.UNKNOWN else "provider_error"
+            raise InvalidReconsolidationOutput(
+                f"llm_error_response:{reason_name}",
+                output_chars=len(text),
+                minimum_chars=minimum_chars,
+            )
+
+        if len(text) < minimum_chars:
+            raise InvalidReconsolidationOutput(
+                "response_too_short",
+                output_chars=len(text),
+                minimum_chars=minimum_chars,
+            )
+
+        return text
+
+    def _log_knowledge_reconsolidation_failure(
+        self,
+        know_path: Path,
+        *,
+        reason: str,
+        output_chars: int,
+        minimum_chars: int,
+    ) -> None:
+        """Record a diagnostic activity event without storing rejected text."""
+        try:
+            relative_path = str(know_path.relative_to(self.anima_dir))
+        except ValueError:
+            relative_path = know_path.name
+
+        self.activity_logger.log(
+            "error",
+            summary=(f"Knowledge reconsolidation failed for {know_path.name}: {reason}"),
+            meta={
+                "phase": "knowledge_reconsolidation",
+                "knowledge": relative_path,
+                "reason": reason,
+                "output_chars": output_chars,
+                "minimum_chars": minimum_chars,
+            },
+            safe=True,
+        )
 
     async def _revise_knowledge(
         self,

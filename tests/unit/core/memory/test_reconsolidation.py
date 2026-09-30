@@ -94,6 +94,31 @@ def _write_procedure(
     return path
 
 
+def _write_knowledge(
+    anima_dir: Path,
+    filename: str,
+    *,
+    failure_count: int = 2,
+    confidence: float = 0.3,
+    version: int = 1,
+    content: str = "# Verified knowledge\n\n" + ("Canonical fact with supporting context. " * 30),
+) -> Path:
+    """Create a knowledge reconsolidation target with realistic body length."""
+    import yaml
+
+    path = anima_dir / "knowledge" / filename
+    meta = {
+        "version": version,
+        "confidence": confidence,
+        "failure_count": failure_count,
+        "success_count": 0,
+        "created_at": "2026-01-01T00:00:00",
+    }
+    fm_str = yaml.dump(meta, default_flow_style=False, allow_unicode=True).rstrip()
+    path.write_text(f"---\n{fm_str}\n---\n\n{content}", encoding="utf-8")
+    return path
+
+
 # ── find_reconsolidation_targets Tests ─────────────────────
 
 
@@ -710,6 +735,280 @@ class TestConstructor:
         )
         assert engine.memory_manager is memory_manager
         assert engine.activity_logger is activity_logger
+
+
+# ── Knowledge Persistence Guard Tests ──────────────────────
+
+
+class TestKnowledgePersistenceGuard:
+    """Fail closed before an unsafe LLM response reaches canonical memory."""
+
+    @staticmethod
+    def _failure_events(anima_dir: Path) -> list[dict]:
+        """Read diagnostic reconsolidation failure events from the test log."""
+        import json
+
+        path = anima_dir / "activity_log" / f"{now_jst().strftime('%Y-%m-%d')}.jsonl"
+        if not path.exists():
+            return []
+        entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        return [
+            entry
+            for entry in entries
+            if entry["type"] == "error" and entry.get("meta", {}).get("phase") == "knowledge_reconsolidation"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_weekly_limit_text_preserves_canonical_and_records_failure(
+        self,
+        engine: ReconsolidationEngine,
+        anima_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A subscription-limit assistant message is never persisted or archived."""
+        target = _write_knowledge(anima_dir, "portfolio.md", version=4)
+        original = target.read_bytes()
+        limit_text = "You've hit your weekly limit · resets Oct 1 at 3am (Asia/Tokyo)"
+
+        with (
+            caplog.at_level("WARNING", logger="animaworks.reconsolidation"),
+            patch(
+                "core.memory._llm_utils.one_shot_completion",
+                new=AsyncMock(return_value=limit_text),
+            ),
+        ):
+            result = await engine.reconsolidate_knowledge(model="test-model")
+
+        assert result == {
+            "targets_found": 1,
+            "updated": 0,
+            "skipped": 0,
+            "errors": 1,
+            "updated_files": [],
+        }
+        assert target.read_bytes() == original
+        assert list((anima_dir / "archive" / "versions").glob("*")) == []
+        assert "llm_error_response:quota_exhausted" in caplog.text
+
+        events = self._failure_events(anima_dir)
+        assert len(events) == 1
+        assert events[0]["meta"]["phase"] == "knowledge_reconsolidation"
+        assert events[0]["meta"]["knowledge"] == "knowledge/portfolio.md"
+        assert events[0]["meta"]["reason"] == "llm_error_response:quota_exhausted"
+        assert events[0]["meta"]["output_chars"] == len(limit_text)
+        assert events[0]["meta"]["minimum_chars"] > 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("response", [None, "", "Too short."])
+    async def test_empty_or_short_response_is_failure_and_preserves_canonical(
+        self,
+        engine: ReconsolidationEngine,
+        anima_dir: Path,
+        response: str | None,
+    ) -> None:
+        """Missing and implausibly short revisions fail instead of skipping."""
+        target = _write_knowledge(anima_dir, "operations.md")
+        original = target.read_bytes()
+
+        with patch(
+            "core.memory._llm_utils.one_shot_completion",
+            new=AsyncMock(return_value=response),
+        ):
+            result = await engine.reconsolidate_knowledge(model="test-model")
+
+        assert result["errors"] == 1
+        assert result["updated"] == 0
+        assert result["skipped"] == 0
+        assert target.read_bytes() == original
+        assert list((anima_dir / "archive" / "versions").glob("*")) == []
+
+        events = self._failure_events(anima_dir)
+        assert len(events) == 1
+        expected = "empty_response" if not response else "response_too_short"
+        assert events[0]["meta"]["reason"] == expected
+
+    @pytest.mark.asyncio
+    async def test_api_error_text_is_failure_and_preserves_canonical(
+        self,
+        engine: ReconsolidationEngine,
+        anima_dir: Path,
+    ) -> None:
+        """A CLI API-error envelope is rejected even when returned as text."""
+        target = _write_knowledge(anima_dir, "api-result.md")
+        original = target.read_bytes()
+
+        with patch(
+            "core.memory._llm_utils.one_shot_completion",
+            new=AsyncMock(return_value="API Error: 500 Internal Server Error"),
+        ):
+            result = await engine.reconsolidate_knowledge(model="test-model")
+
+        assert result["errors"] == 1
+        assert result["updated"] == 0
+        assert target.read_bytes() == original
+        assert list((anima_dir / "archive" / "versions").glob("*")) == []
+        assert self._failure_events(anima_dir)[0]["meta"]["reason"] == "llm_error_response:server_error"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("response", "expected_reason"),
+        [
+            (
+                "API Error: Unable to connect to the provider after several attempts; "
+                "please check network connectivity.",
+                "llm_error_response:provider_error",
+            ),
+            (
+                "Failed to authenticate. API Error: credential was rejected by the provider; please sign in again.",
+                "llm_error_response:provider_error",
+            ),
+            (
+                "API Error: 500 Internal Server Error\n" + ("provider diagnostic detail " * 100),
+                "llm_error_response:server_error",
+            ),
+            (
+                "You've hit your weekly limit · resets Oct 1 at 3am (Asia/Tokyo)\n"
+                + ("provider diagnostic detail " * 100),
+                "llm_error_response:quota_exhausted",
+            ),
+            (
+                "You've reached your usage limit. Switch to another model.\n" + ("provider diagnostic detail " * 100),
+                "llm_error_response:quota_exhausted",
+            ),
+            (
+                "You've hit your weekly limit\n---\n" + ("provider diagnostic detail " * 100),
+                "llm_error_response:quota_exhausted",
+            ),
+            (
+                "Failed to authenticate: API Error: credential rejected.\n" + ("provider diagnostic detail " * 100),
+                "llm_error_response:provider_error",
+            ),
+            (
+                "Failed to authenticate\nAPI Error: credential rejected.\n" + ("provider diagnostic detail " * 100),
+                "llm_error_response:provider_error",
+            ),
+        ],
+    )
+    async def test_explicit_error_envelope_never_bypasses_guard(
+        self,
+        engine: ReconsolidationEngine,
+        anima_dir: Path,
+        response: str,
+        expected_reason: str,
+    ) -> None:
+        """Known envelopes fail closed regardless of classifier or response size."""
+        target = _write_knowledge(anima_dir, "provider-result.md")
+        original = target.read_bytes()
+
+        with patch(
+            "core.memory._llm_utils.one_shot_completion",
+            new=AsyncMock(return_value=response),
+        ):
+            result = await engine.reconsolidate_knowledge(model="test-model")
+
+        assert result["errors"] == 1
+        assert result["updated"] == 0
+        assert target.read_bytes() == original
+        assert list((anima_dir / "archive" / "versions").glob("*")) == []
+        assert self._failure_events(anima_dir)[0]["meta"]["reason"] == expected_reason
+
+    @pytest.mark.asyncio
+    async def test_short_technical_markdown_mentioning_errors_still_updates(
+        self,
+        engine: ReconsolidationEngine,
+        anima_dir: Path,
+    ) -> None:
+        """Classifier words in a real document do not create a false failure."""
+        target = _write_knowledge(anima_dir, "api-operations.md", version=3)
+        revision = (
+            "# API operations\n\n"
+            "- Use OAuth for authentication.\n"
+            "- Retry a timeout twice.\n"
+            "- Back off after the documented rate limit."
+        )
+        assert len(revision) <= 512
+
+        with patch(
+            "core.memory._llm_utils.one_shot_completion",
+            new=AsyncMock(return_value=revision),
+        ):
+            result = await engine.reconsolidate_knowledge(model="test-model")
+
+        assert result["errors"] == 0
+        assert result["updated"] == 1
+        assert engine.memory_manager.read_knowledge_content(target) == revision
+        assert engine.memory_manager.read_knowledge_metadata(target)["version"] == 4
+        assert self._failure_events(anima_dir) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "revision",
+        [
+            (
+                "Authentication error handling\n"
+                "=============================\n\n"
+                "Retry a timeout twice, then back off after the documented rate limit."
+            ),
+            (
+                "Authentication error\n=\n\n"
+                "This technical note documents credential verification, retry behavior, "
+                "timeout handling, rate limits, and safe key rotation."
+            ),
+        ],
+    )
+    async def test_setext_technical_markdown_mentioning_errors_still_updates(
+        self,
+        engine: ReconsolidationEngine,
+        anima_dir: Path,
+        revision: str,
+    ) -> None:
+        """An error-shaped Setext heading is still normal knowledge content."""
+        target = _write_knowledge(anima_dir, "api-error-handling.md", version=3)
+
+        with patch(
+            "core.memory._llm_utils.one_shot_completion",
+            new=AsyncMock(return_value=revision),
+        ):
+            result = await engine.reconsolidate_knowledge(model="test-model")
+
+        assert result["errors"] == 0
+        assert result["updated"] == 1
+        assert engine.memory_manager.read_knowledge_content(target) == revision
+        assert engine.memory_manager.read_knowledge_metadata(target)["version"] == 4
+        assert self._failure_events(anima_dir) == []
+
+    @pytest.mark.asyncio
+    async def test_normal_revision_updates_and_archives_previous_version(
+        self,
+        engine: ReconsolidationEngine,
+        anima_dir: Path,
+    ) -> None:
+        """A substantive revision retains the existing successful behaviour."""
+        target = _write_knowledge(anima_dir, "research.md", version=2)
+        original = target.read_bytes()
+        revision = (
+            "# Verified research knowledge\n\n"
+            "## Evidence\n\n"
+            + ("The revised fact is supported by a dated primary source. " * 16)
+            + "\n\n## Usage\n\nApply this conclusion only within the documented scope."
+        )
+
+        with patch(
+            "core.memory._llm_utils.one_shot_completion",
+            new=AsyncMock(return_value=revision),
+        ):
+            result = await engine.reconsolidate_knowledge(model="test-model")
+
+        assert result["errors"] == 0
+        assert result["updated"] == 1
+        assert result["updated_files"] == ["research.md"]
+        assert engine.memory_manager.read_knowledge_content(target) == revision
+        assert engine.memory_manager.read_knowledge_metadata(target)["version"] == 3
+
+        archived = list((anima_dir / "archive" / "versions").glob("knowledge__research_v2_*.md"))
+        assert len(archived) == 1
+        assert archived[0].read_bytes() == original
+        assert self._failure_events(anima_dir) == []
 
 
 # ── Create Procedures from Resolved Events Tests ─────────
