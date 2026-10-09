@@ -74,6 +74,8 @@ SDK_DOCUMENT_TOTAL_MAX_PAGES = 30
 # them.  Keep everything sent natively within one conversation window under
 # this budget (base64 ~16 MB of the 32 MB Anthropic request limit).
 SDK_SESSION_DOCUMENT_BUDGET_BYTES = 12 * 1024 * 1024
+SDK_SESSION_DOCUMENT_BUDGET_PAGES = 90  # Anthropic: at most 100 PDF pages per request
+NATIVE_USAGE_FILE = "chat_pdf_documents.json"  # <anima>/state/: native PDFs per SDK session
 
 # Extracted text inlined into the prompt for engines without native PDF input.
 PROMPT_TEXT_BUDGET_CHARS = 30_000
@@ -327,16 +329,19 @@ def _drain_with_select(
     stderr_cap: int,
     max_rss_bytes: int | None,
 ) -> CappedRun:
-    import select
+    """Drain both pipes with :mod:`selectors` (kqueue/epoll: no FD_SETSIZE limit)."""
+    import selectors
 
     assert proc.stdout is not None and proc.stderr is not None
     out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
     buffers = {out_fd: bytearray(), err_fd: bytearray()}
     caps = {out_fd: stdout_cap, err_fd: stderr_cap}
-    open_fds = {out_fd, err_fd}
     overflow = killed = group_killed = False
+    selector = selectors.DefaultSelector()
     try:
-        while open_fds:
+        for fd in (out_fd, err_fd):
+            selector.register(fd, selectors.EVENT_READ)
+        while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0 or _rss_exceeded(proc, max_rss_bytes):
                 killed = True
@@ -345,11 +350,11 @@ def _drain_with_select(
                 # Tool finished: descendants in its group must not keep the pipes open.
                 _kill_process_tree(proc)
                 group_killed = True
-            ready, _, _ = select.select(list(open_fds), [], [], min(remaining, 0.2))
-            for fd in ready:
+            for key, _events in selector.select(timeout=min(remaining, 0.2)):
+                fd = key.fd
                 chunk = os.read(fd, 65536)
                 if not chunk:
-                    open_fds.discard(fd)
+                    selector.unregister(fd)
                     continue
                 buf = buffers[fd]
                 room = caps[fd] - len(buf)
@@ -361,6 +366,7 @@ def _drain_with_select(
             if killed:
                 break
     finally:
+        selector.close()
         _kill_process_tree(proc)
         for stream in (proc.stdout, proc.stderr):
             with contextlib.suppress(OSError):
@@ -784,6 +790,15 @@ _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _O_BINARY = getattr(os, "O_BINARY", 0)
 
 
+def pdf_storage_supported() -> bool:
+    """True where PDFs can be analysed, stored and read without races.
+
+    Needs ``dir_fd`` support (directory-relative opens) and pipe polling
+    (bounded subprocess draining): POSIX.  Elsewhere chat PDFs are refused.
+    """
+    return os.name == "posix" and os.open in os.supports_dir_fd
+
+
 def open_confined(base_dir: Path, subdir: str, name: str) -> int | None:
     """Open ``base_dir/subdir/name`` read-only, following no symlink in *subdir* or *name*.
 
@@ -797,8 +812,11 @@ def open_confined(base_dir: Path, subdir: str, name: str) -> int | None:
         if not component or "/" in component or "\\" in component or component in {".", ".."}:
             return None
     if os.open not in os.supports_dir_fd:
-        # e.g. Windows (creating symlinks needs special privileges there):
-        # path confinement check, then open and insist on a regular file.
+        # e.g. Windows: only a path check is possible, which a junction could
+        # race.  Chat PDFs (and their sidecars) fail closed; other files
+        # (images) keep the previous best-effort behaviour.
+        if ".pdf" in name.lower():
+            return None
         path = confined_attachment_file(base_dir, name) if subdir == "attachments" else None
         if path is None:
             return None
@@ -996,14 +1014,17 @@ def select_sdk_documents(
     attachments: Sequence[ChatPdfAttachment],
     *,
     already_sent_bytes: int = 0,
+    already_sent_pages: int = 0,
 ) -> list[ChatPdfAttachment]:
     """Pick PDFs to send as native Claude ``document`` blocks this turn.
 
     Per turn at most :data:`SDK_DOCUMENT_TOTAL_MAX_BYTES` /
-    :data:`SDK_DOCUMENT_TOTAL_MAX_PAGES`; together with *already_sent_bytes*
-    (native PDFs earlier in the conversation window, still in the SDK
-    session) at most :data:`SDK_SESSION_DOCUMENT_BUDGET_BYTES`.  The rest is
-    delivered as extracted text + path like for every other engine.
+    :data:`SDK_DOCUMENT_TOTAL_MAX_PAGES`; together with what was already
+    sent natively into the same SDK session (*already_sent_bytes* /
+    *already_sent_pages*, see :func:`native_usage`) at most
+    :data:`SDK_SESSION_DOCUMENT_BUDGET_BYTES` /
+    :data:`SDK_SESSION_DOCUMENT_BUDGET_PAGES`.  The rest is delivered as
+    extracted text + path like for every other engine.
     """
     chosen: list[ChatPdfAttachment] = []
     total_bytes = 0
@@ -1018,10 +1039,70 @@ def select_sdk_documents(
             continue
         if already_sent_bytes + total_bytes + attachment.size > SDK_SESSION_DOCUMENT_BUDGET_BYTES:
             continue
+        if already_sent_pages + total_pages + attachment.pages > SDK_SESSION_DOCUMENT_BUDGET_PAGES:
+            continue
         chosen.append(attachment)
         total_bytes += attachment.size
         total_pages += attachment.pages
     return chosen
+
+
+UNKNOWN_SESSION = "?"
+
+
+def _usage_path(anima_dir: Path) -> Path:
+    return anima_dir / "state" / NATIVE_USAGE_FILE
+
+
+def _load_usage(anima_dir: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(_usage_path(anima_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def native_usage(anima_dir: Path, thread_id: str, session_id: str | None) -> tuple[int, int]:
+    """Bytes/pages of PDFs already sent natively into the current SDK session.
+
+    *session_id* is the thread's current Claude SDK chat session (None: a
+    fresh session will start, nothing is carried over; ``UNKNOWN_SESSION``:
+    could not be determined, keep what was recorded).  A recorded entry for
+    a different session no longer applies; an entry recorded while the
+    session id was not yet known is attributed to the current session
+    (conservative).
+    """
+    if session_id is None:
+        return 0, 0
+    entry = _load_usage(anima_dir).get(thread_id)
+    if not isinstance(entry, dict):
+        return 0, 0
+    recorded = entry.get("session_id")
+    if session_id != UNKNOWN_SESSION and recorded is not None and recorded != session_id:
+        return 0, 0
+    return _positive_int(entry.get("bytes")) or 0, _positive_int(entry.get("pages")) or 0
+
+
+def record_native_usage(
+    anima_dir: Path,
+    thread_id: str,
+    session_id: str | None,
+    added_bytes: int,
+    added_pages: int,
+) -> None:
+    """Add PDFs sent natively this turn to the thread's session ledger."""
+    used_bytes, used_pages = native_usage(anima_dir, thread_id, session_id)
+    data = _load_usage(anima_dir)
+    data[thread_id] = {
+        "session_id": None if session_id == UNKNOWN_SESSION else session_id,
+        "bytes": used_bytes + added_bytes,
+        "pages": used_pages + added_pages,
+    }
+    path = _usage_path(anima_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def format_size(size: int) -> str:

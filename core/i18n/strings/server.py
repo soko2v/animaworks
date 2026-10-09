@@ -220,6 +220,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "ja": "「{name}」はパスワードで保護されているため読み込めません。パスワードを解除してから添付してください",
         "en": '"{name}" is password-protected and cannot be read. Remove the password and attach it again',
     },
+    "chat.file_busy": {
+        "ja": "PDFの処理が混み合っています。少し待ってからもう一度送ってください",
+        "en": "PDF processing is busy right now. Please send it again in a moment",
+    },
+    "chat.file_platform_unsupported": {
+        "ja": "このサーバー環境ではPDF添付に対応していません",
+        "en": "PDF attachments are not supported on this server platform",
+    },
     "chat.file_save_failed": {
         "ja": "「{name}」を保存できませんでした。もう一度お試しください",
         "en": 'Could not save "{name}". Please try again',

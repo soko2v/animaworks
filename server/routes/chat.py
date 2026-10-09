@@ -20,7 +20,7 @@ from core.i18n import t
 from server.events import emit, emit_notification
 from server.routes.chat_chunk_handler import _chunk_to_event, _format_sse, _handle_chunk
 from server.routes.chat_emotion import _EMOTION_PATTERN, extract_emotion
-from server.routes.chat_files import prepare_files, remove_saved_files, save_files
+from server.routes.chat_files import prepare_files, remove_saved_files, save_files, store_files
 from server.routes.chat_images import _check_image_data, _validate_images, build_content_blocks, save_images
 from server.routes.chat_models import (
     MAX_CHAT_MESSAGE_SIZE,
@@ -77,6 +77,7 @@ __all__ = [
     "prepare_files",
     "save_files",
     "save_images",
+    "store_files",
 ]
 
 
@@ -133,7 +134,7 @@ def create_chat_router() -> APIRouter:
         if prepared_files and name not in supervisor.processes:
             raise HTTPException(status_code=404, detail=f"Anima not found: {name}")
         try:
-            file_paths = await asyncio.to_thread(save_files, name, prepared_files) if prepared_files else []
+            file_paths = await store_files(name, prepared_files)
         except PdfAttachmentError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
         try:
@@ -333,7 +334,7 @@ def create_chat_router() -> APIRouter:
 
         # Store attachments only now that the message will be processed
         try:
-            file_paths = await asyncio.to_thread(save_files, name, prepared_files) if prepared_files else []
+            file_paths = await store_files(name, prepared_files)
         except PdfAttachmentError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
         try:

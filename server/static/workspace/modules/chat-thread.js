@@ -18,13 +18,15 @@ import { wsRestoreModelSelect } from "./chat-streaming.js";
 let _getDom = () => ({});
 let _renderConvMessages = () => {};
 let _refreshSentinel = () => {};
+let _getImageManager = () => null;
 
 // ── Init ──────────────────────
 
-export function initThreads({ getDom, renderConvMessages, refreshSentinel }) {
+export function initThreads({ getDom, renderConvMessages, refreshSentinel, getImageManager }) {
   _getDom = getDom;
   _renderConvMessages = renderConvMessages;
   _refreshSentinel = refreshSentinel;
+  if (getImageManager) _getImageManager = getImageManager;
 }
 
 // ── Thread Tabs ──────────────────────
@@ -84,6 +86,7 @@ export async function selectWsThread(threadId) {
     const maxH = isMobileView() ? 100 : 120;
     dom.convInput.style.height = Math.min(dom.convInput.scrollHeight, maxH) + "px";
   }
+  _getImageManager()?.switchConversation?.(`${animaName}|${threadId}`);
 
   const mgr = ChatSessionManager.getInstance();
   const hs = mgr.getHistoryState(animaName, threadId);
@@ -107,6 +110,8 @@ export function createWsNewThread() {
 
   const nextThreads = { ...threads, [animaName]: updatedList };
   setState({ threads: nextThreads, activeThreadId: newThreadId });
+  // The input keeps its text; pending attachments stay with it, now for the new thread.
+  _getImageManager()?.retargetConversation?.(`${animaName}|${newThreadId}`);
 
   const mgr = ChatSessionManager.getInstance();
   mgr.setMessages(animaName, newThreadId, []);
@@ -135,6 +140,7 @@ export function closeWsThread(threadId) {
     threads: nextThreads,
     ...(switchToDefault ? { activeThreadId: "default" } : {}),
   });
+  if (switchToDefault) _getImageManager()?.retargetConversation?.(`${animaName}|default`);
 
   renderWsThreadTabs();
   _renderConvMessages();

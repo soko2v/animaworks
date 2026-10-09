@@ -111,6 +111,7 @@ export function createThreadController(ctx) {
       input.style.height = "auto";
       input.style.height = Math.min(input.scrollHeight, chatInputMaxHeight()) + "px";
     }
+    state.imageInputManager?.switchConversation?.(`${name}|${threadId}`);
     ctx.controllers.streaming.showPendingIndicator();
     ctx.controllers.streaming.updateSendButton();
 
@@ -152,6 +153,8 @@ export function createThreadController(ctx) {
     if (state.selectedThreadId === threadId) {
       state.selectedThreadId = "default";
       state.activeThreadByAnima[state.selectedAnima] = "default";
+      // The input keeps its text; pending attachments stay with it, now for "default".
+      state.imageInputManager?.retargetConversation?.(`${state.selectedAnima}|default`);
     }
     refreshAnimaUnread(ctx, state.selectedAnima);
     ctx.controllers.anima.renderAnimaTabs();

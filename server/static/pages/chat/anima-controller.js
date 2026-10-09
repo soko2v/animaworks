@@ -239,6 +239,8 @@ export function createAnimaController(ctx) {
       input.style.height = "auto";
       input.style.height = Math.min(input.scrollHeight, chatInputMaxHeight()) + "px";
     }
+    // Attachments are per conversation too (never send A's PDF to B).
+    state.imageInputManager?.switchConversation?.(`${name}|${state.selectedThreadId}`);
     ctx.controllers.streaming.showPendingIndicator();
     ctx.controllers.streaming.updateSendButton();
     ctx.controllers.streaming.restoreContextRing(name);
@@ -281,6 +283,7 @@ export function createAnimaController(ctx) {
     if (!state.threads[name].some(th => th.id === state.selectedThreadId)) {
       state.selectedThreadId = "default";
       state.activeThreadByAnima[name] = "default";
+      state.imageInputManager?.retargetConversation?.(`${name}|default`);
     }
 
     ctx.controllers.thread.renderThreadTabs();

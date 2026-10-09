@@ -22,6 +22,7 @@ from core.anima.emotion_tag import extract_emotion as _extract_emotion_from_tag
 from core.anima.image_artifacts import extract_image_artifacts_from_tool_records, resolve_local_image_paths
 from core.anima.response_normalize import normalize_user_facing_response_text
 from core.chat_attachments import (
+    UNKNOWN_SESSION,
     ChatPdfAttachment,
     append_pdf_prompt_context,
     build_pdf_prompt_context,
@@ -29,7 +30,8 @@ from core.chat_attachments import (
     describe_attachment_paths,
     earlier_thread_pdfs,
     load_chat_pdf_attachments,
-    native_document_eligible,
+    native_usage,
+    record_native_usage,
     reset_chat_sdk_documents,
     select_sdk_documents,
     set_chat_sdk_documents,
@@ -259,7 +261,14 @@ def _resolve_chat_retry_config(
     return retry_config
 
 
-_MAX_WINDOW_PDFS = 200
+def _current_chat_session_id(anima_dir: Any, thread_id: str) -> str | None:
+    """The thread's current Claude SDK chat session id (None: a new one will start)."""
+    try:
+        from core.execution.engines.claude._sdk_session import _load_session_id
+
+        return _load_session_id(anima_dir, "chat", thread_id)
+    except (ImportError, OSError, ValueError, TypeError):
+        return UNKNOWN_SESSION
 
 
 def _prepare_chat_attachments(
@@ -269,6 +278,7 @@ def _prepare_chat_attachments(
     attachment_paths: list[str] | None,
     conv_memory: ConversationMemory,
     mode: str,
+    thread_id: str = "default",
 ) -> tuple[str, list[ChatPdfAttachment], list[dict[str, Any]]]:
     """Resolve chat attachments for one human message.
 
@@ -288,10 +298,19 @@ def _prepare_chat_attachments(
             return content, [], entries
         sdk_documents: list[ChatPdfAttachment] = []
         if mode == "s" and pdfs:
-            # Native PDFs from earlier turns are still in the resumed SDK session.
-            window = earlier_thread_pdfs(owner.anima_dir, turns, exclude=paths, limit=_MAX_WINDOW_PDFS)
-            already_sent = sum(a.size for a in window if native_document_eligible(a))
-            sdk_documents = select_sdk_documents(pdfs, already_sent_bytes=already_sent)
+            # Native PDFs sent earlier stay in the resumed SDK session: budget
+            # per session (ledger keyed by the thread's SDK session id).
+            session_id = _current_chat_session_id(owner.anima_dir, thread_id)
+            used_bytes, used_pages = native_usage(owner.anima_dir, thread_id, session_id)
+            sdk_documents = select_sdk_documents(pdfs, already_sent_bytes=used_bytes, already_sent_pages=used_pages)
+            if sdk_documents:
+                record_native_usage(
+                    owner.anima_dir,
+                    thread_id,
+                    session_id,
+                    sum(a.size for a in sdk_documents),
+                    sum(a.pages or 0 for a in sdk_documents),
+                )
         context = build_pdf_prompt_context(pdfs, sdk_documents=sdk_documents, earlier=earlier)
     except (OSError, ValueError, TypeError, AttributeError):
         logger.exception("[%s] Failed to prepare chat attachments; sending text only", owner.name)
@@ -305,6 +324,39 @@ def _prepare_chat_attachments(
         len(context),
     )
     return append_pdf_prompt_context(content, context), sdk_documents, entries
+
+
+def _carry_native_usage_to_new_session(
+    owner: Any,
+    *,
+    thread_id: str,
+    session_before: str | None,
+    sdk_documents: list[ChatPdfAttachment],
+) -> None:
+    """Count this turn's native PDFs again when the SDK replaced the session.
+
+    :func:`_prepare_chat_attachments` records the usage before execution,
+    against the session that is about to be resumed.  If that resume fails,
+    the Claude Agent SDK retries in a fresh session that receives the same
+    native documents, and the old session's ledger entry no longer applies.
+    Called after execution (also when it was interrupted); never raises.
+    """
+    if not sdk_documents or session_before is None or session_before == UNKNOWN_SESSION:
+        return
+    try:
+        session_after = _current_chat_session_id(owner.anima_dir, thread_id)
+        if session_after is None or session_after in (UNKNOWN_SESSION, session_before):
+            return
+        record_native_usage(
+            owner.anima_dir,
+            thread_id,
+            session_after,
+            sum(a.size for a in sdk_documents),
+            sum(a.pages or 0 for a in sdk_documents),
+        )
+        logger.info("[%s] native PDF usage moved to the replacement SDK session (thread %s)", owner.name, thread_id)
+    except (OSError, ValueError, TypeError, AttributeError):
+        logger.warning("[%s] Failed to carry native PDF usage (thread %s)", owner.name, thread_id, exc_info=True)
 
 
 def _message_received_meta(thread_id: str, attachment_entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -936,6 +988,7 @@ class MessagingMixin:
                     attachment_paths=attachment_paths,
                     conv_memory=conv_memory,
                     mode=mode,
+                    thread_id=thread_id,
                 )
                 prior_messages = None
                 if mode == "s":
@@ -989,17 +1042,28 @@ class MessagingMixin:
                     async with _agent_session_context(self):
                         self.agent.set_interrupt_event(self._get_interrupt_event(thread_id))
                         self.agent._tool_handler.set_session_origin(ORIGIN_HUMAN)
-                        with chat_sdk_documents(sdk_documents):
-                            result = await _run_chat_cycle_with_fallback(
+                        pdf_session_before = (
+                            _current_chat_session_id(self.anima_dir, thread_id) if sdk_documents else None
+                        )
+                        try:
+                            with chat_sdk_documents(sdk_documents):
+                                result = await _run_chat_cycle_with_fallback(
+                                    self,
+                                    prompt=prompt,
+                                    trigger=f"message:{from_person}",
+                                    message_intent=intent,
+                                    images=images,
+                                    prior_messages=prior_messages,
+                                    thread_id=thread_id,
+                                    primary_config=primary_model_config,
+                                    active_config=base_model_config,
+                                )
+                        finally:
+                            _carry_native_usage_to_new_session(
                                 self,
-                                prompt=prompt,
-                                trigger=f"message:{from_person}",
-                                message_intent=intent,
-                                images=images,
-                                prior_messages=prior_messages,
                                 thread_id=thread_id,
-                                primary_config=primary_model_config,
-                                active_config=base_model_config,
+                                session_before=pdf_session_before,
+                                sdk_documents=sdk_documents,
                             )
                     self._last_activity = now_local()
                     result.summary = normalize_user_facing_response_text(result.summary)
@@ -1286,6 +1350,7 @@ class MessagingMixin:
                     attachment_paths=attachment_paths,
                     conv_memory=conv_memory,
                     mode=mode,
+                    thread_id=thread_id,
                 )
                 prior_messages = None
                 if mode == "s":
@@ -1347,12 +1412,15 @@ class MessagingMixin:
                 agent_session_acquired = False
                 self._active_chat_conversations[thread_id] = conv_memory
                 _sdk_documents_token = set_chat_sdk_documents(sdk_documents)
+                pdf_session_before: str | None = None
 
                 try:
                     agent_session_lock = getattr(self, "_agent_session_lock", None)
                     if isinstance(agent_session_lock, asyncio.Lock):
                         await agent_session_lock.acquire()
                         agent_session_acquired = True
+                    if sdk_documents:
+                        pdf_session_before = _current_chat_session_id(self.anima_dir, thread_id)
                     self.agent.set_interrupt_event(self._get_interrupt_event(thread_id))
                     self.agent._tool_handler.set_session_origin(ORIGIN_HUMAN)
                     async for chunk in _run_chat_stream_with_fallback(
@@ -1541,6 +1609,12 @@ class MessagingMixin:
                     }
                 finally:
                     reset_chat_sdk_documents(_sdk_documents_token)
+                    _carry_native_usage_to_new_session(
+                        self,
+                        thread_id=thread_id,
+                        session_before=pdf_session_before,
+                        sdk_documents=sdk_documents,
+                    )
                     if self._active_chat_conversations.get(thread_id) is conv_memory:
                         self._active_chat_conversations.pop(thread_id, None)
                     if agent_session_acquired:
