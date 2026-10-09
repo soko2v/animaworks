@@ -94,6 +94,16 @@ export async function fetchStreamProgress(animaName, responseId) {
   }
 }
 
+/** Readable message from an error body: FastAPI {"detail": "..."} / {"error": "..."} or raw text. */
+function _errorDetail(text) {
+  try {
+    const parsed = JSON.parse(text);
+    const detail = parsed?.detail ?? parsed?.error;
+    if (typeof detail === "string" && detail) return detail;
+  } catch { /* not JSON */ }
+  return text;
+}
+
 /**
  * SSE chat stream processor.
  *
@@ -149,7 +159,7 @@ export async function streamChat(animaName, body, signal, callbacks, options = {
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     logger.error(`[SSE-FE] fetch FAILED status=${res.status} body=${text.slice(0, 200)}`);
-    throw new Error(`API ${res.status}: ${text}`);
+    throw new Error(`API ${res.status}: ${_errorDetail(text)}`);
   }
 
   try {

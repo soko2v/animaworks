@@ -27,7 +27,7 @@ from core.agent.prompt_log import _save_prompt_log, _save_prompt_log_end
 from core.execution.session_context import RuntimeSessionContext, runtime_session_scope
 from core.execution.session_types import is_clean_start_session, resolve_runtime_session_type, trigger_uses_chat_session
 from core.i18n import t
-from core.memory.conversation.shortterm import SessionState, ShortTermMemory
+from core.memory.conversation.shortterm import SessionState, ShortTermMemory, build_thread_context_note
 from core.prompt.builder import build_system_prompt, inject_shortterm  # noqa: F401
 from core.prompt.context import ContextTracker
 from core.prompt.tokens import estimate_tokens
@@ -694,6 +694,7 @@ class CycleMixin:
                         accumulated_response=result.text,
                         context_usage_ratio=tracker.usage_ratio,
                         turn_count=result.result_message.num_turns if result.result_message else 0,
+                        notes=build_thread_context_note(self.anima_dir, thread_id),
                     )
                 )
                 try:
@@ -1023,6 +1024,7 @@ class CycleMixin:
                     accumulated_response=accumulated_text,
                     context_usage_ratio=tracker.usage_ratio,
                     turn_count=result_msg.num_turns if result_msg else 0,
+                    notes=build_thread_context_note(self.anima_dir, thread_id),
                 )
             )
             # Clear SDK session ID so the next session starts fresh
@@ -1812,6 +1814,7 @@ class CycleMixin:
                     accumulated_response="\n".join(full_text_parts),
                     context_usage_ratio=tracker.usage_ratio,
                     turn_count=result_message.num_turns if result_message else 0,
+                    notes=build_thread_context_note(self.anima_dir, thread_id),
                 )
             )
             # Clear SDK session ID so the next session starts fresh

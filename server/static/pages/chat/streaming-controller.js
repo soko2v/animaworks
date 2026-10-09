@@ -18,6 +18,40 @@ export function createStreamingController(ctx) {
   const { t, escapeHtml, logger, fetchActiveStream, fetchStreamProgress } = deps;
   const mgr = state.manager;
 
+  // ── Attachments (images + PDF files) ──────────────────────
+  function inputAttachments() {
+    const im = state.imageInputManager;
+    return {
+      images: im?.getPendingImages() || [],
+      displayImages: im?.getDisplayImages() || [],
+      files: im?.getPendingFiles?.() || [],
+      displayFiles: im?.getDisplayFiles?.() || [],
+    };
+  }
+
+  function attachmentsOf(item) {
+    return {
+      images: item?.images || [],
+      displayImages: item?.displayImages || [],
+      files: item?.files || [],
+      displayFiles: item?.displayFiles || [],
+    };
+  }
+
+  function hasInputAttachments() {
+    const im = state.imageInputManager;
+    if (!im) return false;
+    return (im.getAttachmentCount ? im.getAttachmentCount() : im.getImageCount()) > 0;
+  }
+
+  /** Block sending while a dropped file is still being read. */
+  function attachmentsLoading() {
+    const im = state.imageInputManager;
+    if (!im?.isBusy?.()) return false;
+    im.showStatus?.("info", t("chat.attach_still_loading"));
+    return true;
+  }
+
   mgr.addEventListener("stream-state-changed", () => {
     updateSendButton();
     ctx.controllers.anima?.renderAnimaTabs();
@@ -81,7 +115,7 @@ export function createStreamingController(ctx) {
   function updateSendButton() {
     const sendBtn = $("chatPageSendBtn");
     const inputVal = $("chatPageInput")?.value?.trim() || "";
-    const hasInput = inputVal.length > 0;
+    const hasInput = inputVal.length > 0 || hasInputAttachments();
     const meetingActive = ctx.controllers.meeting?.isActive?.();
     const name = state.selectedAnima;
     const tid = state.selectedThreadId;
@@ -125,8 +159,9 @@ export function createStreamingController(ctx) {
     if (label) label.textContent = `${t("chat.queue_label")} (${pendingQueue.length})`;
     list.innerHTML = pendingQueue.map((p, i) => {
       const txt = escapeHtml(p.text.length > 60 ? p.text.slice(0, 60) + "\u2026" : p.text);
-      const img = p.images?.length ? ` <span style="opacity:0.6">(+${p.images.length} images)</span>` : "";
-      return `<div class="pending-queue-item" data-idx="${i}"><span class="pending-queue-item-num">${i + 1}.</span><span class="pending-queue-item-text">${txt || "(images only)"}${img}</span><button class="pending-queue-item-del" data-idx="${i}" type="button">\u2715</button></div>`;
+      const attachCount = (p.images?.length || 0) + (p.files?.length || 0);
+      const img = attachCount ? ` <span style="opacity:0.6">${escapeHtml(t("chat.attach_count", { count: attachCount }))}</span>` : "";
+      return `<div class="pending-queue-item" data-idx="${i}"><span class="pending-queue-item-num">${i + 1}.</span><span class="pending-queue-item-text">${txt || escapeHtml(t("chat.attach_only"))}${img}</span><button class="pending-queue-item-del" data-idx="${i}" type="button">\u2715</button></div>`;
     }).join("");
     bar.style.display = "";
 
@@ -150,6 +185,7 @@ export function createStreamingController(ctx) {
             input.style.height = Math.min(input.scrollHeight, chatInputMaxHeight()) + "px";
             input.focus();
           }
+          state.imageInputManager?.restoreAttachments?.(removed);
         }
         showPendingIndicator();
         updateSendButton();
@@ -166,15 +202,12 @@ export function createStreamingController(ctx) {
     const input = $("chatPageInput");
     if (!input) return;
     const msg = input.value.trim();
-    const hasImages = state.imageInputManager && state.imageInputManager.getImageCount() > 0;
+    const hasImages = hasInputAttachments();
     if (!msg && !hasImages) return;
+    if (attachmentsLoading()) return;
     const name = state.selectedAnima;
     const tid = state.selectedThreadId;
-    mgr.enqueue(name, tid, {
-      text: msg,
-      images: state.imageInputManager?.getPendingImages() || [],
-      displayImages: state.imageInputManager?.getDisplayImages() || [],
-    });
+    mgr.enqueue(name, tid, { text: msg, ...inputAttachments() });
     input.value = "";
     input.style.height = "auto";
     saveDraft(name, "", tid);
@@ -196,7 +229,9 @@ export function createStreamingController(ctx) {
     const input = $("chatPageInput");
     if (!input) return;
     const msg = input.value.trim();
-    const hasImages = state.imageInputManager && state.imageInputManager.getImageCount() > 0;
+    const hasImages = hasInputAttachments();
+    // A file still being read: wait instead of sending without it (or stopping the stream).
+    if (attachmentsLoading()) return;
     const meetingActive = ctx.controllers.meeting?.isActive?.();
     const name = state.selectedAnima;
     const tid = state.selectedThreadId;
@@ -205,6 +240,10 @@ export function createStreamingController(ctx) {
     const pendingQueue = name ? mgr.getPendingQueue(name, tid) : [];
 
     if (meetingActive && (msg || hasImages)) {
+      if (state.imageInputManager?.getFileCount?.() > 0) {
+        state.imageInputManager.showStatus?.("error", t("chat.attach_meeting_unsupported"));
+        return;
+      }
       sendMeetingChat(msg, {
         images: state.imageInputManager?.getPendingImages() || [],
         displayImages: state.imageInputManager?.getDisplayImages() || [],
@@ -217,11 +256,7 @@ export function createStreamingController(ctx) {
 
     if (!isChatStreaming) {
       if (msg || hasImages) {
-        mgr.enqueue(name, tid, {
-          text: msg,
-          images: state.imageInputManager?.getPendingImages() || [],
-          displayImages: state.imageInputManager?.getDisplayImages() || [],
-        });
+        mgr.enqueue(name, tid, { text: msg, ...inputAttachments() });
         input.value = "";
         input.style.height = "auto";
         saveDraft(name, "", tid);
@@ -231,16 +266,12 @@ export function createStreamingController(ctx) {
       const next = mgr.dequeue(name, tid);
       showPendingIndicator();
       if (mgr.getPendingQueue(name, tid).length === 0) hidePendingIndicator();
-      sendChat(next.text, { images: next.images, displayImages: next.displayImages });
+      sendChat(next.text, { ...attachmentsOf(next), targetAnima: name, targetThread: tid });
       return;
     }
 
     if (msg || hasImages) {
-      mgr.enqueue(name, tid, {
-        text: msg,
-        images: state.imageInputManager?.getPendingImages() || [],
-        displayImages: state.imageInputManager?.getDisplayImages() || [],
-      });
+      mgr.enqueue(name, tid, { text: msg, ...inputAttachments() });
       input.value = "";
       input.style.height = "auto";
       saveDraft(name, "", tid);
@@ -255,7 +286,10 @@ export function createStreamingController(ctx) {
   }
 
   async function sendChat(message, overrideImages = null) {
-    if (ctx.controllers.meeting?.isActive?.()) {
+    // Queued messages carry their own Anima/thread: deliver them there even if
+    // meeting mode was switched on meanwhile (a meeting would drop PDFs and
+    // re-route the text).
+    if (ctx.controllers.meeting?.isActive?.() && !overrideImages?.targetAnima) {
       sendMeetingChat(message, overrideImages);
       return;
     }
@@ -263,8 +297,12 @@ export function createStreamingController(ctx) {
     const name = overrideImages?.targetAnima || state.selectedAnima;
     const images = overrideImages?.images || state.imageInputManager?.getPendingImages() || [];
     const displayImages = overrideImages?.displayImages || state.imageInputManager?.getDisplayImages() || [];
+    const files = overrideImages ? (overrideImages.files || []) : (state.imageInputManager?.getPendingFiles?.() || []);
+    const displayFiles = overrideImages
+      ? (overrideImages.displayFiles || [])
+      : (state.imageInputManager?.getDisplayFiles?.() || []);
     const tid = overrideImages?.targetThread || state.selectedThreadId;
-    if (!name || (!message.trim() && images.length === 0)) return;
+    if (!name || (!message.trim() && images.length === 0 && files.length === 0)) return;
     if (mgr.isStreamingFor(name, tid)) {
       logger.warn("Blocked: this thread is already streaming", { anima: name, thread: tid });
       return;
@@ -375,6 +413,8 @@ export function createStreamingController(ctx) {
       model: state.modelByThread[`${name}|${tid}`] || undefined,
       images,
       displayImages,
+      files,
+      displayFiles,
       callbacks: {
         onStreamCreated: msg => {
           streamingMsg = msg;
@@ -588,7 +628,7 @@ export function createStreamingController(ctx) {
             const next = mgr.dequeue(name, tid);
             showPendingIndicator();
             if (mgr.getPendingQueue(name, tid).length === 0) hidePendingIndicator();
-            setTimeout(() => sendChat(next.text, { images: next.images, displayImages: next.displayImages, targetAnima: name, targetThread: tid }), 150);
+            setTimeout(() => sendChat(next.text, { ...attachmentsOf(next), targetAnima: name, targetThread: tid }), 150);
           }
         }
       },
@@ -906,7 +946,7 @@ export function createStreamingController(ctx) {
             const next = mgr.dequeue(animaName, tid);
             showPendingIndicator();
             if (mgr.getPendingQueue(animaName, tid).length === 0) hidePendingIndicator();
-            setTimeout(() => sendChat(next.text, { images: next.images, displayImages: next.displayImages, targetAnima: animaName, targetThread: tid }), 150);
+            setTimeout(() => sendChat(next.text, { ...attachmentsOf(next), targetAnima: animaName, targetThread: tid }), 150);
           }
         }
       },

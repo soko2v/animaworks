@@ -3,12 +3,17 @@ from __future__ import annotations
 # AnimaWorks - Digital Anima Framework
 # Copyright (C) 2026 AnimaWorks Authors
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
+import contextlib
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
+import anyio
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, field_validator
@@ -83,6 +88,86 @@ _ASSET_CONTENT_TYPES = {
 # Server-side avatar thumbnail sizes (matches client image-cache.js)
 _THUMB_SIZES: dict[str, int] = {"S": 96, "M": 192, "L": 400}
 _THUMB_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+_SAFE_ASCII_FILENAME_RE = re.compile(r"[A-Za-z0-9._ -]+")
+
+
+def _inline_disposition(filename: str) -> str:
+    """``Content-Disposition: inline`` with an RFC 5987 UTF-8 filename."""
+    fallback = filename if _SAFE_ASCII_FILENAME_RE.fullmatch(filename) else "document.pdf"
+    return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
+def _open_attachment(anima_dir: Path, tmp_dir: Path, name: str) -> tuple[Path, int, int] | None:
+    """Open ``attachments/<name>`` (the Anima's, then the shared tmp dir).
+
+    Opened via :func:`core.chat_attachments.open_confined` (no symlinks,
+    regular files only).  Returns ``(base_dir, fd, size)``; the caller owns
+    the descriptor.
+    """
+    from core.chat_attachments import open_confined
+
+    for base_dir in (anima_dir, tmp_dir):
+        fd = open_confined(base_dir, "attachments", name)
+        if fd is None:
+            continue
+        try:
+            return base_dir, fd, os.fstat(fd).st_size
+        except OSError:
+            os.close(fd)
+            return None
+    return None
+
+
+def _read_at(fd: int, size: int, offset: int) -> bytes:
+    if hasattr(os, "pread"):
+        return os.pread(fd, size, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.read(fd, size)
+
+
+class _DescriptorResponse(Response):
+    """Stream an open file descriptor in 64 KiB chunks.
+
+    The response owns the descriptor and closes it whatever happens: after
+    the last chunk, when the client disconnects or the request is cancelled
+    (``finally``), and even if the response is never sent (``__del__``).
+    Memory stays at one chunk per download.
+    """
+
+    chunk_size = 64 * 1024
+
+    def __init__(self, fd: int, *, size: int, head_only: bool, headers: dict[str, str], media_type: str) -> None:
+        self._fd: int | None = fd
+        self._size = size
+        self._head_only = head_only
+        super().__init__(content=None, status_code=200, headers=headers, media_type=media_type)
+
+    def _close(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def __del__(self) -> None:
+        self._close()
+
+    async def __call__(self, scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+        try:
+            await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+            offset = 0
+            while not self._head_only and self._fd is not None and offset < self._size:
+                chunk = await anyio.to_thread.run_sync(
+                    _read_at, self._fd, min(self.chunk_size, self._size - offset), offset
+                )
+                if not chunk:
+                    break
+                offset += len(chunk)
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            self._close()
 
 
 def _resolve_thumbnail(file_path: Path, size_key: str) -> Path | None:
@@ -540,30 +625,42 @@ def create_assets_router() -> APIRouter:
     @router.api_route("/animas/{name}/attachments/{filename}", methods=["GET", "HEAD"])
     async def get_attachment(name: str, filename: str, request: Request):
         """Serve a user-uploaded attachment from a anima's attachments directory."""
+        from core.chat_attachments import PDF_MEDIA_TYPE, pdf_display_name
+
         animas_dir = request.app.state.animas_dir
         anima_dir = animas_dir / name
-        if not anima_dir.exists():
+        if name in {".", ".."} or not anima_dir.exists():
             raise HTTPException(status_code=404, detail=f"Anima not found: {name}")
 
         safe_name = Path(filename).name
         if safe_name != filename or ".." in filename:
             raise HTTPException(status_code=400, detail="Invalid filename")
 
-        file_path = anima_dir / "attachments" / safe_name
-        if not file_path.exists() or not file_path.is_file():
-            tmp_path = animas_dir.parent / "tmp" / "attachments" / safe_name
-            if tmp_path.exists() and tmp_path.is_file():
-                file_path = tmp_path
+        # A regular file directly inside this Anima's attachments/ (or the
+        # shared tmp/attachments), opened without following any symlink; the
+        # response streams that very descriptor and always closes it.
+        opened = await asyncio.to_thread(_open_attachment, anima_dir, animas_dir.parent / "tmp", safe_name)
+        if opened is None:
+            raise HTTPException(status_code=404, detail="Attachment not found")
+        base_dir, fd, size = opened
+        try:
+            headers = {"Cache-Control": "no-store", "Content-Length": str(size)}
+            suffix = Path(safe_name).suffix.lower()
+            if suffix == ".pdf":
+                # Chat PDF attachment: open inline in the browser's PDF viewer
+                # under its original name.
+                media_type = PDF_MEDIA_TYPE
+                headers["X-Content-Type-Options"] = "nosniff"
+                display = await asyncio.to_thread(pdf_display_name, base_dir / "attachments" / safe_name)
+                headers["Content-Disposition"] = _inline_disposition(display)
             else:
-                raise HTTPException(status_code=404, detail="Attachment not found")
-
-        suffix = file_path.suffix.lower()
-        content_type = _ASSET_CONTENT_TYPES.get(suffix, "application/octet-stream")
-
-        return FileResponse(
-            file_path,
-            media_type=content_type,
-            headers={"Cache-Control": "no-store"},
+                media_type = _ASSET_CONTENT_TYPES.get(suffix, "application/octet-stream")
+        except BaseException:
+            os.close(fd)
+            raise
+        # From here on the response owns (and always closes) the descriptor.
+        return _DescriptorResponse(
+            fd, size=size, head_only=request.method == "HEAD", headers=headers, media_type=media_type
         )
 
     @router.get("/media/proxy")

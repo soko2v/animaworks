@@ -28,6 +28,14 @@ class ImageAttachment(BaseModel):
     media_type: str  # "image/jpeg", "image/png", "image/gif", "image/webp"
 
 
+class FileAttachment(BaseModel):
+    """A single base64-encoded file attachment (PDF)."""
+
+    data: str  # Base64 encoded string (no data: prefix)
+    media_type: str = ""  # "application/pdf" (browsers may send "" for .pdf)
+    name: str = ""  # Original filename, shown in history
+
+
 def _to_image_data(attachments: list[ImageAttachment]) -> list[ImageData]:
     """Convert API-layer ImageAttachment list to core-layer ImageData list."""
     return [{"data": img.data, "media_type": img.media_type} for img in attachments]
@@ -38,6 +46,7 @@ class ChatRequest(BaseModel):
     from_person: str = "human"
     intent: str = ""
     images: list[ImageAttachment] = []
+    files: list[FileAttachment] = []
     resume: str | None = None
     last_event_id: str | None = None
     thread_id: str = "default"

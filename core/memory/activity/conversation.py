@@ -61,6 +61,30 @@ def _is_inbox_raw_entry(raw: dict[str, Any]) -> bool:
     )
 
 
+_MAX_HISTORY_ATTACHMENTS = 20
+_HISTORY_ATTACHMENT_KEYS = ("path", "name", "media_type", "size", "pages")
+
+
+def _history_attachments(meta: Any) -> list[dict[str, Any]]:
+    """Return sanitised chat attachments recorded on a ``message_received``.
+
+    Only ``attachments/<file>`` paths are passed through, with a fixed set
+    of display keys, so the history API never exposes other fields.
+    """
+    raw = meta.get("attachments") if isinstance(meta, dict) else None
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in raw[:_MAX_HISTORY_ATTACHMENTS]:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        if not isinstance(path, str) or not path.startswith("attachments/") or "/" in path[len("attachments/") :]:
+            continue
+        result.append({key: item[key] for key in _HISTORY_ATTACHMENT_KEYS if key in item})
+    return result
+
+
 def _truncate_tool_field(value: Any, limit: int) -> Any:
     """Truncate tool input/result for the conversation view API."""
     if isinstance(value, str):
@@ -237,17 +261,19 @@ class ConversationMixin:
         for e in entries:
             if e.type == "message_received":
                 self._flush_tool_calls(messages, pending_tool_calls)
-                messages.append(
-                    {
-                        "ts": e.ts,
-                        "role": "human",
-                        "content": e.content,
-                        "from_person": e.from_person,
-                        "to_person": e.to_person,
-                        "source_key": _source_key_for_entry(e),
-                        "tool_calls": [],
-                    }
-                )
+                human_msg: dict[str, Any] = {
+                    "ts": e.ts,
+                    "role": "human",
+                    "content": e.content,
+                    "from_person": e.from_person,
+                    "to_person": e.to_person,
+                    "source_key": _source_key_for_entry(e),
+                    "tool_calls": [],
+                }
+                attachments = _history_attachments(e.meta)
+                if attachments:
+                    human_msg["attachments"] = attachments
+                messages.append(human_msg)
 
             elif e.type == "message_sent":
                 self._flush_tool_calls(messages, pending_tool_calls)

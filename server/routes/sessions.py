@@ -9,6 +9,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
+from core.chat_attachments import describe_attachment_paths
 from core.memory.activity.logger import ActivityLogger
 from core.memory.conversation.memory import ConversationMemory
 from core.memory.conversation.shortterm import ShortTermMemory
@@ -59,17 +60,21 @@ def _thread_file_conversation_view(anima_dir, thread_id: str) -> dict | None:
                     "is_error": bool(rec.get("is_error", False)),
                 }
             )
-        messages.append(
-            {
-                "ts": turn.get("timestamp", ""),
-                "role": role,
-                "content": turn.get("content", ""),
-                "from_person": "",
-                "to_person": "",
-                "source_key": "chat",
-                "tool_calls": tool_calls,
-            }
-        )
+        message = {
+            "ts": turn.get("timestamp", ""),
+            "role": role,
+            "content": turn.get("content", ""),
+            "from_person": "",
+            "to_person": "",
+            "source_key": "chat",
+            "tool_calls": tool_calls,
+        }
+        raw_attachments = turn.get("attachments")
+        if role == "human" and isinstance(raw_attachments, list) and raw_attachments:
+            attachments = describe_attachment_paths(anima_dir, raw_attachments)
+            if attachments:
+                message["attachments"] = attachments
+        messages.append(message)
 
     if not messages:
         return None

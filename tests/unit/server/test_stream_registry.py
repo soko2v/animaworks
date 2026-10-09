@@ -400,7 +400,7 @@ class TestStreamRegistryCleanup:
         registry = StreamRegistry()
         stream = registry.register("alice")
 
-        monkeypatch.setattr(stream, "created_at", time.time() - registry.TTL - 1)
+        monkeypatch.setattr(stream, "last_activity", time.time() - registry.TTL - 1)
 
         removed = registry.cleanup()
         assert removed == 1
@@ -418,7 +418,7 @@ class TestStreamRegistryCleanup:
         registry = StreamRegistry()
         stream = registry.register("alice")
 
-        monkeypatch.setattr(stream, "created_at", time.time() - registry.TTL - 1)
+        monkeypatch.setattr(stream, "last_activity", time.time() - registry.TTL - 1)
 
         registry.cleanup()
         assert registry.get_active("alice") is None
@@ -429,7 +429,7 @@ class TestStreamRegistryCleanup:
         fresh_stream = registry.register("bob")
 
         monkeypatch.setattr(
-            old_stream, "created_at", time.time() - registry.TTL - 1,
+            old_stream, "last_activity", time.time() - registry.TTL - 1,
         )
 
         removed = registry.cleanup()
@@ -440,6 +440,18 @@ class TestStreamRegistryCleanup:
     def test_returns_zero_when_nothing_to_clean(self):
         registry = StreamRegistry()
         assert registry.cleanup() == 0
+
+    def test_keeps_long_running_stream_with_recent_activity(self, monkeypatch):
+        """Regression: a response older than TTL that is still emitting events
+        must not be cancelled mid-run (sofia chat cut at ~62min, 2026-10-03)."""
+        registry = StreamRegistry()
+        stream = registry.register("sofia")
+        monkeypatch.setattr(stream, "created_at", time.time() - registry.TTL - 600)
+        stream.add_event("text_delta", {"text": "still working"})
+
+        removed = registry.cleanup()
+        assert removed == 0
+        assert registry.get(stream.response_id) is stream
 
 
 class TestStreamRegistryFormatSSE:
