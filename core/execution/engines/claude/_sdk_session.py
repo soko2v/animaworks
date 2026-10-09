@@ -38,7 +38,7 @@ logger = logging.getLogger("animaworks.execution.agent_sdk")
 # Safety margin for Agent SDK JSON-RPC buffer.  The default (1 MB) is too
 # small when system_prompt + conversation history grow large; 4 MB gives
 # comfortable headroom while still catching genuinely broken messages.
-_SDK_MAX_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB
+_SDK_MAX_BUFFER_SIZE = 64 * 1024 * 1024  # 64 MB (PDF page reads can exceed 4 MB)
 
 # When the system prompt is too large for a CLI argument, it is written to a
 # temp file and passed via the CLI's --system-prompt-file flag.
@@ -383,14 +383,16 @@ def clear_session_id_for_type(anima_dir: Path, session_type: str, thread_id: str
 async def _image_prompt_messages(
     prompt: str,
     images: list[ImageData],
+    documents: list[dict[str, Any]] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Yield a single SDK user message with image content blocks.
+    """Yield a single SDK user message with document/image content blocks.
 
     The Agent SDK ``query()`` accepts ``str | AsyncIterable[dict]``.
-    When images are present we build an Anthropic-format multimodal
-    content block list and wrap it in the SDK's message envelope.
+    When images or PDF documents are present we build an Anthropic-format
+    multimodal content block list (documents first, then images, then the
+    text) and wrap it in the SDK's message envelope.
     """
-    content_blocks: list[dict[str, Any]] = []
+    content_blocks: list[dict[str, Any]] = list(documents or [])
     for img in images:
         content_blocks.append(
             {
@@ -416,12 +418,17 @@ def _build_sdk_query_input(
 ) -> str | AsyncGenerator[dict[str, Any], None]:
     """Return the appropriate input for ``ClaudeSDKClient.query()``.
 
-    Text-only prompts are passed as plain strings.  When images are
-    present, an async generator of Anthropic-format message dicts is
-    returned.  Each call produces a fresh generator (they are single-use).
+    Text-only prompts are passed as plain strings.  When images or chat PDF
+    documents (published for this turn via
+    :func:`core.chat_attachments.chat_sdk_documents`) are present, an async
+    generator of Anthropic-format message dicts is returned.  Each call
+    produces a fresh generator (they are single-use).
     """
-    if images:
-        return _image_prompt_messages(prompt, images)
+    from core.chat_attachments import chat_sdk_document_blocks
+
+    documents = chat_sdk_document_blocks()
+    if images or documents:
+        return _image_prompt_messages(prompt, images or [], documents)
     return prompt
 
 

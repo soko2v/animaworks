@@ -397,6 +397,26 @@ function _renderMessageMeta(msg, escapeHtml) {
 }
 
 /**
+ * Render attachments recorded on a human history message
+ * ({ path, media_type, name, size, pages }): images as thumbnails,
+ * PDFs as file chips.
+ */
+function _renderHumanAttachments(attachments, opts) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return "";
+  const renderImages = opts.renderChatImages || (() => "");
+  const renderFiles = opts.renderChatFiles || (() => "");
+  const images = [];
+  const files = [];
+  for (const a of attachments) {
+    if (!a || typeof a.path !== "string") continue;
+    const type = String(a.media_type || "");
+    if (type.startsWith("image/")) images.push({ path: a.path });
+    else if (type === "application/pdf") files.push(a);
+  }
+  return renderImages(images, { animaName: opts.animaName }) + renderFiles(files, { animaName: opts.animaName });
+}
+
+/**
  * Render a history message (from conversation API) to HTML.
  * @param {object} msg - Message object with role, content, tool_calls, images, ts, from_person
  * @param {object} opts
@@ -516,7 +536,8 @@ export function renderHistoryMessage(msg, opts) {
     ? renderMarkdown(userContent)
     : `<div class="chat-text">${_linkifyEscaped(escapeHtml, userContent)}</div>`;
   const bubbleWs = isAnima ? ' style="white-space:normal"' : "";
-  const bubble = `<div class="chat-bubble user"${bubbleWs}>${fromLabel}${contentHtml}${tsHtml}</div>`;
+  const attachmentsHtml = _renderHumanAttachments(msg.attachments, opts);
+  const bubble = `<div class="chat-bubble user"${bubbleWs}>${fromLabel}${attachmentsHtml}${contentHtml}${tsHtml}</div>`;
   const avatarHtml = _renderAvatar(isAnima ? msg.from_person : null, avatarMap, opts.companyColors);
   return _wrapRow("user", bubble, avatarHtml);
 }
@@ -1013,9 +1034,10 @@ export function renderLiveBubble(msg, opts) {
 
   if (msg.role === "user") {
     const imagesHtml = renderImages(msg.images, { animaName: opts.animaName });
+    const filesHtml = (opts.renderChatFiles || (() => ""))(msg.files, { animaName: opts.animaName });
     const userText = _stripVoiceSuffix(msg.text || "");
     const textHtml = userText ? `<div class="chat-text">${_linkifyEscaped(escapeHtml, userText)}</div>` : "";
-    const bubble = `<div class="chat-bubble user">${imagesHtml}${textHtml}${tsHtml}</div>`;
+    const bubble = `<div class="chat-bubble user">${imagesHtml}${filesHtml}${textHtml}${tsHtml}</div>`;
     return _wrapRow("user", bubble, _renderAvatar(null, avatarMap));
   }
 

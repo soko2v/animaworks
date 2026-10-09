@@ -132,6 +132,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "ja": "## 既存の要約",
         "en": "## Existing summary",
     },
+    "conversation.handover_digest_header": {
+        "ja": "### それ以前のやり取り（古い順・各発言は冒頭のみ）",
+        "en": "### Earlier exchanges (oldest first, each message clipped)",
+    },
     "conversation.history_summary_header": {
         "ja": "### 会話の要約（{count}ターン分）",
         "en": "### Conversation summary ({count} turns)",
@@ -287,6 +291,22 @@ STRINGS: dict[str, dict[str, str]] = {
     "shortterm.session_id": {
         "ja": "- セッションID: {value}",
         "en": "- Session ID: {value}",
+    },
+    "shortterm.thread_context_header": {
+        "ja": "## このスレッドで先に話していた話題・依頼",
+        "en": "## Earlier topics and requests in this thread",
+    },
+    "shortterm.thread_context_note": {
+        "ja": (
+            "上の「これまでの作業内容」は直前の作業だけです。"
+            "ユーザーが「さっきの話」「一旦これはおいといて」などで話題を戻したら、"
+            "以下の要約とやり取りから該当する話題を特定してください。"
+        ),
+        "en": (
+            'The "Work so far" above covers only the latest work. '
+            "When the user returns to an earlier topic, identify it from the "
+            "summary and exchanges below."
+        ),
     },
     "shortterm.timestamp": {
         "ja": "- 時刻: {value}",

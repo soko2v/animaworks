@@ -4,7 +4,7 @@ import { api } from "../../modules/api.js";
 import { escapeHtml, renderMarkdown, renderSafeMarkdown, timeStr, smartTimestamp } from "../../modules/state.js";
 import { streamChat, streamMeetingChat, fetchActiveStream, fetchStreamProgress } from "../../shared/chat-stream.js";
 import { createLogger } from "../../shared/logger.js";
-import { createImageInput, initLightbox, renderChatImages } from "../../shared/image-input.js";
+import { createImageInput, initLightbox, renderChatImages, renderChatFiles } from "../../shared/image-input.js";
 import { initVoiceUI, updateVoiceUIAnima } from "../../modules/voice-ui.js";
 import { getIcon, getDisplaySummary } from "../../shared/activity-types.js";
 import {
@@ -79,7 +79,7 @@ export function createChatContext() {
     t, api, escapeHtml, renderMarkdown, renderSafeMarkdown, timeStr, smartTimestamp,
     streamChat, streamMeetingChat, fetchActiveStream, fetchStreamProgress,
     logger,
-    createImageInput, initLightbox, renderChatImages,
+    createImageInput, initLightbox, renderChatImages, renderChatFiles,
     initVoiceUI, updateVoiceUIAnima,
     getIcon, getDisplaySummary,
   };

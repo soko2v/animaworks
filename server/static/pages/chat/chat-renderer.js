@@ -28,7 +28,7 @@ const logger = createLogger("chat-renderer");
 export function createChatRenderer(ctx) {
   const $ = ctx.$;
   const { state, deps } = ctx;
-  const { api, t, escapeHtml, renderMarkdown, smartTimestamp, timeStr, renderChatImages } = deps;
+  const { api, t, escapeHtml, renderMarkdown, smartTimestamp, timeStr, renderChatImages, renderChatFiles } = deps;
 
   // ── Smart Scroll (sticky-bottom with floating button) ──
   const NEAR_BOTTOM_PX = 80;
@@ -66,7 +66,7 @@ export function createChatRenderer(ctx) {
   }
 
   const _renderOpts = () => ({
-    escapeHtml, renderMarkdown, smartTimestamp, renderChatImages,
+    escapeHtml, renderMarkdown, smartTimestamp, renderChatImages, renderChatFiles,
     animaName: state.selectedAnima,
     avatarMap: state.animaTabAvatarUrls || {},
     companyColors: Object.fromEntries(

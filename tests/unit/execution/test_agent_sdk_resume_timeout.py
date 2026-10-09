@@ -551,3 +551,153 @@ class TestResumeTimeoutGuard:
             f"Expected _clear_session_id to be called on resume timeout, but got: {clear_calls}"
         )
         assert "chat" in clear_calls, f"Expected 'chat' session to be cleared, got: {clear_calls}"
+
+
+# ── _with_resume_fallback_history: shortterm injection ────────
+
+
+class TestWithResumeFallbackHistoryShortterm:
+    """_with_resume_fallback_history injects shortterm accumulated_response for Mode S."""
+
+    def test_returns_prompt_unmodified_for_non_chat_session(self, anima_dir: Path) -> None:
+        from core.execution.engines.claude.agent_sdk import _with_resume_fallback_history
+        from core.schemas import ModelConfig
+
+        mc = ModelConfig(model="claude-sonnet-4-6", api_key="sk-test")
+        result = _with_resume_fallback_history(anima_dir, mc, "hello", "heartbeat", "default")
+        assert result == "hello"
+
+    def test_returns_prompt_when_both_conv_and_shortterm_empty(self, anima_dir: Path) -> None:
+        from core.execution.engines.claude.agent_sdk import _with_resume_fallback_history
+        from core.schemas import ModelConfig
+
+        mc = ModelConfig(model="claude-sonnet-4-6", api_key="sk-test")
+        result = _with_resume_fallback_history(anima_dir, mc, "hello", "chat", "default")
+        assert result == "hello"
+
+    def test_injects_shortterm_accumulated_response_when_conv_empty(self, anima_dir: Path) -> None:
+        """When ConversationMemory is empty (Mode S), shortterm accumulated_response is injected."""
+        import json
+
+        from core.execution.engines.claude.agent_sdk import _with_resume_fallback_history
+        from core.schemas import ModelConfig
+
+        # Write a shortterm session_state.json with session_id='' (idle_compaction style).
+        # thread_id="default" → ShortTermMemory uses shortterm/chat/ (no sub-dir).
+        shortterm_dir = anima_dir / "shortterm" / "chat"
+        shortterm_dir.mkdir(parents=True, exist_ok=True)
+        session_state = {
+            "session_id": "",
+            "timestamp": "2026-09-28T22:00:00",
+            "trigger": "idle_compaction",
+            "original_prompt": "URLを教えて",
+            "accumulated_response": "URL教えて→http://160.16.231.57/discord/ idとパスワード形式でもいいよ",
+            "tool_uses": [],
+            "context_usage_ratio": 0.6,
+            "turn_count": 2,
+            "notes": "",
+        }
+        (shortterm_dir / "session_state.json").write_text(
+            json.dumps(session_state, ensure_ascii=False), encoding="utf-8"
+        )
+
+        mc = ModelConfig(model="claude-sonnet-4-6", api_key="sk-test")
+        result = _with_resume_fallback_history(anima_dir, mc, "パスワードを確認して", "chat", "default")
+
+        assert "URL教えて" in result
+        assert "http://160.16.231.57/discord/" in result
+        assert "パスワードを確認して" in result
+        assert "前のセッションを再開できなかったため" in result
+        assert "最新メッセージ" in result
+
+    def test_shortterm_not_injected_when_session_id_nonempty(self, anima_dir: Path) -> None:
+        """shortterm with non-empty session_id is not injected (it's from an active session)."""
+        import json
+
+        from core.execution.engines.claude.agent_sdk import _with_resume_fallback_history
+        from core.schemas import ModelConfig
+
+        # thread_id="default" → ShortTermMemory uses shortterm/chat/ (no sub-dir)
+        shortterm_dir = anima_dir / "shortterm" / "chat"
+        shortterm_dir.mkdir(parents=True, exist_ok=True)
+        session_state = {
+            "session_id": "active-session-abc123",
+            "timestamp": "2026-09-28T22:00:00",
+            "trigger": "chat",
+            "original_prompt": "test",
+            "accumulated_response": "this should not be injected",
+            "tool_uses": [],
+            "context_usage_ratio": 0.3,
+            "turn_count": 1,
+            "notes": "",
+        }
+        (shortterm_dir / "session_state.json").write_text(
+            json.dumps(session_state, ensure_ascii=False), encoding="utf-8"
+        )
+
+        mc = ModelConfig(model="claude-sonnet-4-6", api_key="sk-test")
+        result = _with_resume_fallback_history(anima_dir, mc, "new message", "chat", "default")
+
+        # Session with non-empty session_id is not injected
+        assert result == "new message"
+
+    def test_shortterm_not_injected_when_accumulated_response_empty(self, anima_dir: Path) -> None:
+        """shortterm with empty accumulated_response yields no injection."""
+        import json
+
+        from core.execution.engines.claude.agent_sdk import _with_resume_fallback_history
+        from core.schemas import ModelConfig
+
+        # thread_id="default" → ShortTermMemory uses shortterm/chat/ (no sub-dir)
+        shortterm_dir = anima_dir / "shortterm" / "chat"
+        shortterm_dir.mkdir(parents=True, exist_ok=True)
+        session_state = {
+            "session_id": "",
+            "timestamp": "2026-09-28T22:00:00",
+            "trigger": "idle_compaction",
+            "original_prompt": "",
+            "accumulated_response": "",
+            "tool_uses": [],
+            "context_usage_ratio": 0.0,
+            "turn_count": 0,
+            "notes": "",
+        }
+        (shortterm_dir / "session_state.json").write_text(
+            json.dumps(session_state, ensure_ascii=False), encoding="utf-8"
+        )
+
+        mc = ModelConfig(model="claude-sonnet-4-6", api_key="sk-test")
+        result = _with_resume_fallback_history(anima_dir, mc, "hello", "chat", "default")
+        assert result == "hello"
+
+    def test_shortterm_injected_for_nondefault_thread_id(self, anima_dir: Path) -> None:
+        """shortterm is read from the correct thread-specific subdirectory."""
+        import json
+
+        from core.execution.engines.claude.agent_sdk import _with_resume_fallback_history
+        from core.schemas import ModelConfig
+
+        thread_id = "meeting-f78d72c334fb"
+        shortterm_dir = anima_dir / "shortterm" / "chat" / thread_id
+        shortterm_dir.mkdir(parents=True, exist_ok=True)
+        session_state = {
+            "session_id": "",
+            "timestamp": "2026-09-28T22:00:00",
+            "trigger": "idle_compaction",
+            "original_prompt": "discord URLを教えて",
+            "accumulated_response": "こちらがURLです: http://example.com/discord",
+            "tool_uses": [],
+            "context_usage_ratio": 0.5,
+            "turn_count": 3,
+            "notes": "",
+        }
+        (shortterm_dir / "session_state.json").write_text(
+            json.dumps(session_state, ensure_ascii=False), encoding="utf-8"
+        )
+
+        mc = ModelConfig(model="claude-sonnet-4-6", api_key="sk-test")
+        result = _with_resume_fallback_history(anima_dir, mc, "続き", "chat", thread_id)
+
+        assert "http://example.com/discord" in result
+        assert "続き" in result
+        assert "前のセッションを再開できなかったため" in result

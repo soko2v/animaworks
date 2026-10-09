@@ -39,6 +39,7 @@ class ResponseStream:
     from_person: str = "human"
     thread_id: str = "default"
     created_at: float = field(default_factory=time.time)
+    last_activity: float = field(default_factory=time.time)  # updated on every event
     events: list[SSEEvent] = field(default_factory=list)
     complete: bool = False
     full_text: str = ""
@@ -58,6 +59,7 @@ class ResponseStream:
         """Append an event to the buffer and return it."""
         seq = self._seq_counter
         self._seq_counter += 1
+        self.last_activity = time.time()
         event_id = f"{self.response_id}:{seq}"
 
         sse_event = SSEEvent(
@@ -247,7 +249,7 @@ class StreamRegistry:
     """In-memory registry of active and recently completed response streams.
 
     Stores per-response event buffers for SSE replay and progress polling.
-    Entries are kept for TTL seconds after creation, then cleaned up.
+    Entries are kept for TTL seconds after their last event, then cleaned up.
     """
 
     TTL = 3600  # 1 hour
@@ -419,7 +421,9 @@ class StreamRegistry:
     def cleanup(self) -> int:
         """Remove expired streams. Returns count of removed entries."""
         now = time.time()
-        expired = [rid for rid, s in self._streams.items() if now - s.created_at > self.TTL]
+        # Expire by inactivity, not age: a long-running producer that is still
+        # emitting events must not be cancelled mid-response.
+        expired = [rid for rid, s in self._streams.items() if now - s.last_activity > self.TTL]
         for rid in expired:
             stream = self._streams.pop(rid, None)
             if stream:

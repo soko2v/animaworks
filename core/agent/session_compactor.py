@@ -385,12 +385,17 @@ async def _compact_mode_s_shared(
 ) -> bool:
     """Extract context, save shortterm, and discard a Mode S session."""
     from core.execution.engines.claude._sdk_session import SESSION_TYPE_CHAT, _clear_session_id
-    from core.memory.conversation.shortterm import SessionState, ShortTermMemory
+    from core.memory.conversation.shortterm import SessionState, ShortTermMemory, build_thread_context_note
 
     logger.debug("_compact_mode_s: entry (anima=%s, thread=%s)", anima_name, thread_id)
     ctx = _extract_recent_chat_context(anima_dir, thread_id=thread_id)
     if ctx.get("accumulated_response") or ctx.get("tool_uses"):
         shortterm = ShortTermMemory(anima_dir, session_type="chat", thread_id=thread_id)
+        # The activity-log extract covers only the last few rounds; append the
+        # thread's earlier topics so the memo is not just the latest work.
+        memo_notes = "\n\n".join(
+            part for part in (notes or ctx.get("notes", ""), build_thread_context_note(anima_dir, thread_id)) if part
+        )
         shortterm.save(
             SessionState(
                 accumulated_response=ctx.get("accumulated_response", ""),
@@ -398,7 +403,7 @@ async def _compact_mode_s_shared(
                 original_prompt=ctx.get("original_prompt", ""),
                 timestamp=ctx.get("timestamp", ""),
                 trigger=trigger,
-                notes=notes or ctx.get("notes", ""),
+                notes=memo_notes,
             )
         )
         logger.info("_compact_mode_s: shortterm saved from activity_log")

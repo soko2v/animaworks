@@ -28,7 +28,7 @@ from core.execution.engine_session import clear_all_engine_sessions, clear_engin
 from core.execution.session_context import RuntimeSessionContext, runtime_session_scope
 from core.execution.session_types import is_clean_start_session, resolve_runtime_session_type, trigger_uses_chat_session
 from core.i18n import t
-from core.memory.conversation.shortterm import SessionState, ShortTermMemory
+from core.memory.conversation.shortterm import SessionState, ShortTermMemory, build_thread_context_note
 from core.prompt.builder import build_system_prompt, inject_shortterm  # noqa: F401
 from core.prompt.context import ContextTracker
 from core.schemas import CycleResult, ImageData, ModelConfig
@@ -121,8 +121,14 @@ def _save_handoff_shortterm(
     trigger: str,
     prompt: str,
     tracker: ContextTracker,
+    notes: str = "",
 ) -> None:
-    """Persist response and tool history when a chat session must be handed off."""
+    """Persist response and tool history when a chat session must be handed off.
+
+    ``notes`` carries the thread's earlier topics (see
+    :func:`core.memory.conversation.shortterm.build_thread_context_note`) so the
+    fresh session's handoff memo is not limited to the latest exchange.
+    """
     from dataclasses import asdict, is_dataclass
 
     tool_uses = [asdict(record) if is_dataclass(record) else dict(record) for record in tool_records]
@@ -136,6 +142,7 @@ def _save_handoff_shortterm(
             tool_uses=tool_uses,
             context_usage_ratio=tracker.usage_ratio,
             turn_count=turn_count,
+            notes=notes,
         )
     )
 
@@ -777,6 +784,7 @@ class CycleMixin:
                     trigger=trigger,
                     prompt=prompt,
                     tracker=tracker,
+                    notes=build_thread_context_note(self.anima_dir, thread_id),
                 )
             active_executor.clear_session(trigger, thread_id)
         elif uses_chat_session and result.session_rotation_pending:
@@ -1534,6 +1542,7 @@ class CycleMixin:
                 trigger=trigger,
                 prompt=prompt,
                 tracker=tracker,
+                notes=build_thread_context_note(self.anima_dir, thread_id),
             )
             active_executor.clear_session(trigger, thread_id)
         elif uses_chat_session and rotation_pending:

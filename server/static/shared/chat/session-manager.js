@@ -263,23 +263,27 @@ export class ChatSessionManager extends EventTarget {
    * @param {object} options
    * @param {Array}  [options.images] - Base64 images for API
    * @param {Array}  [options.displayImages] - Display images for chat bubble
+   * @param {Array}  [options.files] - Base64 PDF files for API ({ data, media_type, name })
+   * @param {Array}  [options.displayFiles] - File chips for chat bubble ({ name, size, url })
    * @param {object} [options.callbacks] - SSE event callbacks (onTextDelta, onDone, etc.)
    * @param {function} [options.onFinally]
    * @returns {Promise<{ streamingMsg, success, queued, error }>}
    */
   async sendChat(anima, thread, text, options = {}) {
-    const { images = [], displayImages = [], callbacks = {}, onFinally, model } = options;
+    const {
+      images = [], displayImages = [], files = [], displayFiles = [], callbacks = {}, onFinally, model,
+    } = options;
 
     const session = this.getSession(anima, thread);
     if (session.isStreaming) {
-      this.enqueue(anima, thread, { text, images, displayImages });
+      this.enqueue(anima, thread, { text, images, displayImages, files, displayFiles });
       return { streamingMsg: null, success: false, queued: true };
     }
     const streamId = session.nextStreamId();
     const sendTs = new Date().toISOString();
     const user = this.#config.getUser();
 
-    session.messages.push({ role: "user", text, images: displayImages, timestamp: sendTs });
+    session.messages.push({ role: "user", text, images: displayImages, files: displayFiles, timestamp: sendTs });
 
     const streamingMsg = {
       role: "assistant", text: "", streaming: true, activeTool: null,
@@ -302,6 +306,7 @@ export class ChatSessionManager extends EventTarget {
     try {
       const bodyObj = { message: text || "", from_person: user, thread_id: thread };
       if (images.length > 0) bodyObj.images = images;
+      if (files.length > 0) bodyObj.files = files;
       if (model) bodyObj.model = model;
 
       await this.#config.streamChat(

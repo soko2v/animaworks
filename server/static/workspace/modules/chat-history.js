@@ -5,7 +5,7 @@
 import { getState, setState } from "./state.js";
 import { t } from "../../shared/i18n.js";
 import { escapeHtml, renderSimpleMarkdown, smartTimestamp } from "./utils.js";
-import { renderChatImages } from "../../shared/image-input.js";
+import { renderChatImages, renderChatFiles } from "../../shared/image-input.js";
 import {
   renderHistoryMessage, renderSessionDivider, bindToolCallHandlers,
   bindBubbleActionHandlers, bindHumanNotifyHandlers,
@@ -37,6 +37,7 @@ export function renderOpts() {
     renderMarkdown: renderSimpleMarkdown,
     smartTimestamp,
     renderChatImages,
+    renderChatFiles,
     animaName: getState().conversationAnima,
     avatarMap: getState().chatAvatarMap || {},
     truncateLen: TOOL_RESULT_TRUNCATE,

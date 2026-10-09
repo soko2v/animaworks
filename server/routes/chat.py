@@ -9,17 +9,19 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from core.chat_attachments import PdfAttachmentError
 from core.exceptions import AnimaNotFoundError  # noqa: F401
 from core.exceptions import IPCConnectionError as IPCConnError
 from core.i18n import t
 from server.events import emit, emit_notification
 from server.routes.chat_chunk_handler import _chunk_to_event, _format_sse, _handle_chunk
 from server.routes.chat_emotion import _EMOTION_PATTERN, extract_emotion
-from server.routes.chat_images import _validate_images, build_content_blocks, save_images
+from server.routes.chat_files import prepare_files, remove_saved_files, save_files
+from server.routes.chat_images import _check_image_data, _validate_images, build_content_blocks, save_images
 from server.routes.chat_models import (
     MAX_CHAT_MESSAGE_SIZE,
     MAX_IMAGE_PAYLOAD_SIZE,
@@ -27,6 +29,7 @@ from server.routes.chat_models import (
     SUPPORTED_IMAGE_TYPES,
     ChatRequest,
     ChatResponse,
+    FileAttachment,
     ImageAttachment,
     _to_image_data,
 )
@@ -52,6 +55,7 @@ __all__ = [
     "ChatRequest",
     "ChatResponse",
     "CompactRequest",
+    "FileAttachment",
     "GreetRequest",
     "ImageAttachment",
     "MAX_CHAT_MESSAGE_SIZE",
@@ -70,6 +74,8 @@ __all__ = [
     "build_content_blocks",
     "create_chat_router",
     "extract_emotion",
+    "prepare_files",
+    "save_files",
     "save_images",
 ]
 
@@ -105,8 +111,6 @@ def create_chat_router() -> APIRouter:
 
         model_error = validate_chat_model(name, body.model)
         if model_error:
-            from fastapi import HTTPException
-
             raise HTTPException(status_code=422, detail=model_error)
 
         # Guard: validate image attachments
@@ -114,9 +118,30 @@ def create_chat_router() -> APIRouter:
             img_error = _validate_images(body.images)
             if img_error:
                 return JSONResponse({"error": img_error}, status_code=413)
+            img_data_error = _check_image_data(body.images)
+            if img_data_error:
+                return JSONResponse({"error": img_data_error}, status_code=400)
 
-        # Save images to disk and build IPC params
-        saved_paths = save_images(name, body.images) if body.images else []
+        # Guard: validate PDF attachments in memory (nothing stored yet)
+        try:
+            prepared_files = prepare_files(body.files)
+        except PdfAttachmentError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+        body.files = []  # release the base64 payload
+
+        # Store PDFs only for an Anima that exists
+        if prepared_files and name not in supervisor.processes:
+            raise HTTPException(status_code=404, detail=f"Anima not found: {name}")
+        try:
+            file_paths = await asyncio.to_thread(save_files, name, prepared_files) if prepared_files else []
+        except PdfAttachmentError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+        try:
+            saved_paths = (save_images(name, body.images) if body.images else []) + file_paths
+        except (OSError, ValueError):
+            logger.exception("Failed to store chat images for anima=%s", name)
+            await asyncio.to_thread(remove_saved_files, name, file_paths)
+            return JSONResponse({"error": t("chat.internal_error")}, status_code=500)
 
         await emit(request, "anima.status", {"name": name, "status": "thinking"})
 
@@ -156,12 +181,8 @@ def create_chat_router() -> APIRouter:
             return ChatResponse(response=clean_response, anima=name, images=images)
 
         except (KeyError, AnimaNotFoundError):
-            from fastapi import HTTPException
-
             raise HTTPException(status_code=404, detail=f"Anima not found: {name}") from None
         except (ValueError, IPCConnError) as e:
-            from fastapi import HTTPException
-
             raise HTTPException(status_code=500, detail=str(e)) from None
         except TimeoutError:
             logger.error("Timeout waiting for chat response from anima=%s", name)
@@ -247,15 +268,11 @@ def create_chat_router() -> APIRouter:
 
         # Verify anima exists before starting the stream
         if name not in supervisor.processes:
-            from fastapi import HTTPException
-
             raise HTTPException(status_code=404, detail=f"Anima not found: {name}")
 
         # Guard: reject oversized messages
         message_size = len(body.message.encode("utf-8"))
         if message_size > MAX_CHAT_MESSAGE_SIZE:
-            from fastapi import HTTPException
-
             raise HTTPException(
                 status_code=413,
                 detail=t("chat.message_too_large", size_mb=message_size // 1024 // 1024),
@@ -266,20 +283,23 @@ def create_chat_router() -> APIRouter:
 
         model_error = validate_chat_model(name, body.model)
         if model_error:
-            from fastapi import HTTPException
-
             raise HTTPException(status_code=422, detail=model_error)
 
         # Guard: validate image attachments
         if body.images:
             img_error = _validate_images(body.images)
             if img_error:
-                from fastapi import HTTPException
-
                 raise HTTPException(status_code=413, detail=img_error)
+            img_data_error = _check_image_data(body.images)
+            if img_data_error:
+                raise HTTPException(status_code=400, detail=img_data_error)
 
-        # Save images to disk
-        saved_paths = save_images(name, body.images) if body.images else []
+        # Guard: validate PDF attachments in memory (nothing stored yet)
+        try:
+            prepared_files = prepare_files(body.files)
+        except PdfAttachmentError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+        body.files = []  # release the base64 payload
 
         # Guard: return immediately if anima is bootstrapping
         if supervisor.is_bootstrapping(name):
@@ -310,6 +330,18 @@ def create_chat_router() -> APIRouter:
         if body.resume:
             last_event_id = body.last_event_id or request.headers.get("Last-Event-ID", "")
             return _handle_resume(registry, body.resume, last_event_id, name, from_person=body.from_person)
+
+        # Store attachments only now that the message will be processed
+        try:
+            file_paths = await asyncio.to_thread(save_files, name, prepared_files) if prepared_files else []
+        except PdfAttachmentError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+        try:
+            saved_paths = (save_images(name, body.images) if body.images else []) + file_paths
+        except (OSError, ValueError):
+            logger.exception("Failed to store chat images for anima=%s", name)
+            await asyncio.to_thread(remove_saved_files, name, file_paths)
+            raise HTTPException(status_code=500, detail=t("chat.internal_error")) from None
 
         stream = registry.register(
             name,

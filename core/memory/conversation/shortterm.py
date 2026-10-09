@@ -30,6 +30,26 @@ logger = logging.getLogger("animaworks.shortterm_memory")
 _MAX_RESPONSE_CHARS = 8000
 
 
+def build_thread_context_note(anima_dir: Path, thread_id: str = "default") -> str:
+    """Render a chat thread's earlier topics and requests for a handover memo.
+
+    A memo built from the turn that ended the session would otherwise present
+    the latest work as the whole thread.  Reads the thread's stored
+    conversation (compressed summary + uncompressed turns).  Never raises:
+    an empty or unreadable conversation yields ``""``.
+    """
+    try:
+        from core.memory.conversation.memory import ConversationMemory
+        from core.memory.conversation.prompt import format_thread_context_note
+        from core.schemas import ModelConfig
+
+        state = ConversationMemory(anima_dir, ModelConfig(), thread_id=thread_id).load()
+        return format_thread_context_note(state)
+    except Exception:
+        logger.warning("Failed to build thread context for short-term memory (thread=%s)", thread_id, exc_info=True)
+        return ""
+
+
 @dataclass
 class SessionState:
     """State captured from a session for externalization."""

@@ -21,6 +21,19 @@ from typing import Any
 from core.anima.emotion_tag import extract_emotion as _extract_emotion_from_tag
 from core.anima.image_artifacts import extract_image_artifacts_from_tool_records, resolve_local_image_paths
 from core.anima.response_normalize import normalize_user_facing_response_text
+from core.chat_attachments import (
+    ChatPdfAttachment,
+    append_pdf_prompt_context,
+    build_pdf_prompt_context,
+    chat_sdk_documents,
+    describe_attachment_paths,
+    earlier_thread_pdfs,
+    load_chat_pdf_attachments,
+    native_document_eligible,
+    reset_chat_sdk_documents,
+    select_sdk_documents,
+    set_chat_sdk_documents,
+)
 from core.config.model_config import effective_model_key, resolve_effective_model_config, same_effective_model
 from core.exceptions import (
     ExecutionError,
@@ -244,6 +257,62 @@ def _resolve_chat_retry_config(
         phase="runtime_retry",
     )
     return retry_config
+
+
+_MAX_WINDOW_PDFS = 200
+
+
+def _prepare_chat_attachments(
+    owner: Any,
+    *,
+    content: str,
+    attachment_paths: list[str] | None,
+    conv_memory: ConversationMemory,
+    mode: str,
+) -> tuple[str, list[ChatPdfAttachment], list[dict[str, Any]]]:
+    """Resolve chat attachments for one human message.
+
+    Returns ``(prompt_content, sdk_documents, history_entries)``:
+    the user's text plus the PDF context every engine can read, the PDFs the
+    Claude Agent SDK (mode ``s``) receives as native ``document`` blocks, and
+    the attachment descriptions recorded in the activity log for the chat
+    history.  Never raises; on failure the original content is used.
+    """
+    paths = [p for p in (attachment_paths or []) if isinstance(p, str)]
+    try:
+        entries = describe_attachment_paths(owner.anima_dir, paths) if paths else []
+        pdfs = load_chat_pdf_attachments(owner.anima_dir, paths)
+        turns = conv_memory.load().turns
+        earlier = earlier_thread_pdfs(owner.anima_dir, turns, exclude=paths)
+        if not pdfs and not earlier:
+            return content, [], entries
+        sdk_documents: list[ChatPdfAttachment] = []
+        if mode == "s" and pdfs:
+            # Native PDFs from earlier turns are still in the resumed SDK session.
+            window = earlier_thread_pdfs(owner.anima_dir, turns, exclude=paths, limit=_MAX_WINDOW_PDFS)
+            already_sent = sum(a.size for a in window if native_document_eligible(a))
+            sdk_documents = select_sdk_documents(pdfs, already_sent_bytes=already_sent)
+        context = build_pdf_prompt_context(pdfs, sdk_documents=sdk_documents, earlier=earlier)
+    except (OSError, ValueError, TypeError, AttributeError):
+        logger.exception("[%s] Failed to prepare chat attachments; sending text only", owner.name)
+        return content, [], []
+    logger.info(
+        "[%s] chat attachments pdfs=%d sdk_documents=%d earlier_pdfs=%d context_chars=%d",
+        owner.name,
+        len(pdfs),
+        len(sdk_documents),
+        len(earlier),
+        len(context),
+    )
+    return append_pdf_prompt_context(content, context), sdk_documents, entries
+
+
+def _message_received_meta(thread_id: str, attachment_entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Activity-log meta for a human chat message (attachments for history)."""
+    meta: dict[str, Any] = {"from_type": "human", "thread_id": thread_id}
+    if attachment_entries:
+        meta["attachments"] = attachment_entries
+    return meta
 
 
 async def _run_chat_cycle_with_fallback(
@@ -859,14 +928,23 @@ class MessagingMixin:
 
                 # Determine prompt and history strategy per execution mode
                 mode = self.agent._resolve_execution_mode(base_model_config)
+                # PDF attachments: readable context for every engine, native
+                # documents for the Claude Agent SDK.
+                prompt_content, sdk_documents, attachment_entries = _prepare_chat_attachments(
+                    self,
+                    content=content,
+                    attachment_paths=attachment_paths,
+                    conv_memory=conv_memory,
+                    mode=mode,
+                )
                 prior_messages = None
                 if mode == "s":
-                    prompt = content
+                    prompt = prompt_content
                 elif mode == "a":
-                    prior_messages = conv_memory.build_structured_messages(content)
-                    prompt = content
+                    prior_messages = conv_memory.build_structured_messages(prompt_content)
+                    prompt = prompt_content
                 else:
-                    prompt = conv_memory.build_chat_prompt(content, from_person)
+                    prompt = conv_memory.build_chat_prompt(prompt_content, from_person)
                 if bg_notification_context:
                     prompt = f"{bg_notification_context}\n\n{prompt}"
 
@@ -897,7 +975,7 @@ class MessagingMixin:
                     summary=content[:100],
                     from_person=from_person,
                     channel="chat",
-                    meta={"from_type": "human", "thread_id": thread_id},
+                    meta=_message_received_meta(thread_id, attachment_entries),
                     origin=ORIGIN_HUMAN,
                 )
                 _record_chat_user_turn(self)
@@ -911,17 +989,18 @@ class MessagingMixin:
                     async with _agent_session_context(self):
                         self.agent.set_interrupt_event(self._get_interrupt_event(thread_id))
                         self.agent._tool_handler.set_session_origin(ORIGIN_HUMAN)
-                        result = await _run_chat_cycle_with_fallback(
-                            self,
-                            prompt=prompt,
-                            trigger=f"message:{from_person}",
-                            message_intent=intent,
-                            images=images,
-                            prior_messages=prior_messages,
-                            thread_id=thread_id,
-                            primary_config=primary_model_config,
-                            active_config=base_model_config,
-                        )
+                        with chat_sdk_documents(sdk_documents):
+                            result = await _run_chat_cycle_with_fallback(
+                                self,
+                                prompt=prompt,
+                                trigger=f"message:{from_person}",
+                                message_intent=intent,
+                                images=images,
+                                prior_messages=prior_messages,
+                                thread_id=thread_id,
+                                primary_config=primary_model_config,
+                                active_config=base_model_config,
+                            )
                     self._last_activity = now_local()
                     result.summary = normalize_user_facing_response_text(result.summary)
                     meeting_redirects = _collect_meeting_redirects()
@@ -1199,14 +1278,23 @@ class MessagingMixin:
 
                 # Determine prompt and history strategy per execution mode
                 mode = self.agent._resolve_execution_mode(base_model_config)
+                # PDF attachments: readable context for every engine, native
+                # documents for the Claude Agent SDK.
+                prompt_content, sdk_documents, attachment_entries = _prepare_chat_attachments(
+                    self,
+                    content=content,
+                    attachment_paths=attachment_paths,
+                    conv_memory=conv_memory,
+                    mode=mode,
+                )
                 prior_messages = None
                 if mode == "s":
-                    prompt = content
+                    prompt = prompt_content
                 elif mode == "a":
-                    prior_messages = conv_memory.build_structured_messages(content)
-                    prompt = content
+                    prior_messages = conv_memory.build_structured_messages(prompt_content)
+                    prompt = prompt_content
                 else:
-                    prompt = conv_memory.build_chat_prompt(content, from_person)
+                    prompt = conv_memory.build_chat_prompt(prompt_content, from_person)
                 if bg_notification_context:
                     prompt = f"{bg_notification_context}\n\n{prompt}"
 
@@ -1237,7 +1325,7 @@ class MessagingMixin:
                     summary=content[:100],
                     from_person=from_person,
                     channel="chat",
-                    meta={"from_type": "human", "thread_id": thread_id},
+                    meta=_message_received_meta(thread_id, attachment_entries),
                     origin=ORIGIN_HUMAN,
                 )
                 _record_chat_user_turn(self)
@@ -1258,6 +1346,7 @@ class MessagingMixin:
                 cycle_done = False
                 agent_session_acquired = False
                 self._active_chat_conversations[thread_id] = conv_memory
+                _sdk_documents_token = set_chat_sdk_documents(sdk_documents)
 
                 try:
                     agent_session_lock = getattr(self, "_agent_session_lock", None)
@@ -1451,6 +1540,7 @@ class MessagingMixin:
                         "message": "Internal error",
                     }
                 finally:
+                    reset_chat_sdk_documents(_sdk_documents_token)
                     if self._active_chat_conversations.get(thread_id) is conv_memory:
                         self._active_chat_conversations.pop(thread_id, None)
                     if agent_session_acquired:

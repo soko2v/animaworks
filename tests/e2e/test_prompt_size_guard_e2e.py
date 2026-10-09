@@ -116,7 +116,7 @@ class TestPreflightConstants:
     def test_sdk_buffer_size(self):
         from core.execution.engines.claude._sdk_session import _SDK_MAX_BUFFER_SIZE
 
-        assert _SDK_MAX_BUFFER_SIZE == 4 * 1024 * 1024
+        assert _SDK_MAX_BUFFER_SIZE == 64 * 1024 * 1024
 
     def test_limits_ordering(self):
         """Soft < Hard < SDK buffer."""

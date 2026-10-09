@@ -47,6 +47,38 @@ export function initStreaming({ getDom, getImageManager }) {
   _getImageManager = getImageManager;
 }
 
+// ── Attachments (images + PDF files) ──────────────────────
+
+function _inputAttachments(im) {
+  return {
+    images: im?.getPendingImages() || [],
+    displayImages: im?.getDisplayImages() || [],
+    files: im?.getPendingFiles?.() || [],
+    displayFiles: im?.getDisplayFiles?.() || [],
+  };
+}
+
+function _attachmentsOf(item) {
+  return {
+    images: item?.images || [],
+    displayImages: item?.displayImages || [],
+    files: item?.files || [],
+    displayFiles: item?.displayFiles || [],
+  };
+}
+
+function _hasInputAttachments(im) {
+  if (!im) return false;
+  return (im.getAttachmentCount ? im.getAttachmentCount() : im.getImageCount()) > 0;
+}
+
+/** Block sending while a dropped file is still being read. */
+function _attachmentsLoading(im) {
+  if (!im?.isBusy?.()) return false;
+  im.showStatus?.("info", t("chat.attach_still_loading"));
+  return true;
+}
+
 /**
  * Populate the per-thread model picker from the shared model catalog.
  * Options are grouped by <optgroup>; the selection is remembered per thread
@@ -106,7 +138,7 @@ function _drainQueue(explicitAnima, explicitThread) {
   const next = mgr.dequeue(anima, thread);
   wsShowPendingIndicator();
   if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
-  setTimeout(() => _sendConversation(next.text, { images: next.images, displayImages: next.displayImages }), 150);
+  setTimeout(() => _sendConversation(next.text, { ..._attachmentsOf(next), targetAnima: anima, targetThread: thread }), 150);
 }
 
 function _baseCallbacks(streamingMsg) {
@@ -160,13 +192,14 @@ function _enqueueInput() {
   const dom = _getDom();
   const text = dom.convInput?.value?.trim();
   const im = _getImageManager();
-  const hasImages = im && im.getImageCount() > 0;
+  const hasImages = _hasInputAttachments(im);
   if (!text && !hasImages) return null;
+  if (_attachmentsLoading(im)) return null;
 
   const { anima, thread } = _animaThread();
   if (!anima) return null;
 
-  const entry = { text: text || "", images: im?.getPendingImages() || [], displayImages: im?.getDisplayImages() || [] };
+  const entry = { text: text || "", ..._inputAttachments(im) };
   _mgr().enqueue(anima, thread, entry);
   if (dom.convInput) { dom.convInput.value = ""; dom.convInput.style.height = "auto"; }
   wsSaveDraft(); im?.clearImages();
@@ -205,6 +238,8 @@ export function updateStreamingBubble(msg, zone = "all") {
 export function submitConversation() {
   const { anima, thread } = _animaThread();
   if (!anima) return;
+  // A file still being read: wait instead of sending without it (or stopping the stream).
+  if (_attachmentsLoading(_getImageManager())) return;
   const mgr = _mgr();
   const isStreaming = mgr.isStreamingFor(anima, thread);
 
@@ -215,7 +250,7 @@ export function submitConversation() {
     const next = mgr.dequeue(anima, thread);
     wsShowPendingIndicator();
     if (mgr.getPendingQueue(anima, thread).length === 0) wsHidePendingIndicator();
-    _sendConversation(next.text, { images: next.images, displayImages: next.displayImages });
+    _sendConversation(next.text, { ..._attachmentsOf(next), targetAnima: anima, targetThread: thread });
     return;
   }
   if (_enqueueInput()) { wsShowPendingIndicator(); wsUpdateSendButton(true); return; }
@@ -238,13 +273,24 @@ async function _sendConversation(text, overrideImages = null) {
   const im = _getImageManager();
   const images = overrideImages?.images || im?.getPendingImages() || [];
   const displayImages = overrideImages?.displayImages || im?.getDisplayImages() || [];
-  if (!text && images.length === 0) return;
-  const { anima, thread } = _animaThread();
+  const files = overrideImages ? (overrideImages.files || []) : (im?.getPendingFiles?.() || []);
+  const displayFiles = overrideImages ? (overrideImages.displayFiles || []) : (im?.getDisplayFiles?.() || []);
+  if (!text && images.length === 0 && files.length === 0) return;
+  const current = _animaThread();
+  // Queued messages go to the Anima/thread they were queued for.
+  const anima = overrideImages?.targetAnima || current.anima;
+  const thread = overrideImages?.targetThread || current.thread;
   if (!anima) return;
+  // A queue draining in the background must not touch the composer (draft,
+  // model picker) of the conversation that is on screen now.
+  const isCurrentView = anima === current.anima && thread === current.thread;
+  const model = isCurrentView ? _modelSelection() : (_modelByThread[`${anima}|${thread}`] || "");
 
-  dom.convInput.value = ""; dom.convInput.disabled = true; dom.convSend.disabled = true;
+  if (isCurrentView) {
+    dom.convInput.value = ""; dom.convInput.disabled = true; dom.convSend.disabled = true;
+  }
   if (!overrideImages) im?.clearImages();
-  wsUpdateSendButton(true);
+  if (isCurrentView) wsUpdateSendButton(true);
   renderWsThreadTabs();
 
   const mgr = _mgr();
@@ -264,9 +310,11 @@ async function _sendConversation(text, overrideImages = null) {
   let _thinkingAnimator = null;
 
   const { success, error } = await mgr.sendChat(anima, thread, text, {
-    model: _modelSelection() || undefined,
+    model: model || undefined,
     images,
     displayImages,
+    files,
+    displayFiles,
     callbacks: {
       onStreamCreated: (msg) => {
         streamingMsg = msg;
@@ -372,7 +420,10 @@ async function _sendConversation(text, overrideImages = null) {
         renderConvMessages();
         renderWsThreadTabs();
         if (dom.convInput) dom.convInput.disabled = false;
-        wsUpdateSendButton(false); wsSaveDraft(); dom.convInput?.focus();
+        const onScreen = _animaThread();
+        wsUpdateSendButton(onScreen.anima ? mgr.isStreamingFor(onScreen.anima, onScreen.thread) : false);
+        wsSaveDraft();
+        if (isCurrentView) dom.convInput?.focus();
 
         const st = getState();
         const threadList = st.threads[anima] || [];
@@ -520,7 +571,7 @@ export function wsUpdateSendButton(isStreaming) {
   const { anima, thread } = _animaThread();
   const mgr = _mgr();
   const q = anima ? mgr.getPendingQueue(anima, thread) : [];
-  const hasInput = (dom.convInput?.value?.trim() || "").length > 0;
+  const hasInput = (dom.convInput?.value?.trim() || "").length > 0 || _hasInputAttachments(_getImageManager());
   if (dom.convQueueBtn) dom.convQueueBtn.disabled = !hasInput;
   if (!dom.convSend) return;
   dom.convSend.classList.remove("stop", "interrupt");
@@ -541,8 +592,9 @@ export function wsShowPendingIndicator() {
   if (dom.convPendingLabel) dom.convPendingLabel.textContent = t("chat.queue_count", { count: q.length });
   dom.convPendingList.innerHTML = q.map((p, i) => {
     const txt = escapeHtml(p.text.length > 50 ? p.text.slice(0, 50) + "…" : p.text);
-    const img = p.images?.length ? ` <span style="opacity:0.6">${t("chat.image_count", { count: p.images.length })}</span>` : "";
-    return `<div class="pending-queue-item" data-idx="${i}"><span class="pending-queue-item-num">${i + 1}.</span><span class="pending-queue-item-text">${txt || t("chat.image_only")}${img}</span><button class="pending-queue-item-del" data-idx="${i}" type="button">✕</button></div>`;
+    const attachCount = (p.images?.length || 0) + (p.files?.length || 0);
+    const img = attachCount ? ` <span style="opacity:0.6">${escapeHtml(t("chat.attach_count", { count: attachCount }))}</span>` : "";
+    return `<div class="pending-queue-item" data-idx="${i}"><span class="pending-queue-item-num">${i + 1}.</span><span class="pending-queue-item-text">${txt || escapeHtml(t("chat.attach_only"))}${img}</span><button class="pending-queue-item-del" data-idx="${i}" type="button">✕</button></div>`;
   }).join("");
   dom.convPending.style.display = "";
   dom.convPendingList.onclick = (e) => {
@@ -562,6 +614,7 @@ export function wsShowPendingIndicator() {
       dom.convInput.style.height = Math.min(dom.convInput.scrollHeight, isMobileView() ? 100 : 120) + "px";
       dom.convInput.focus();
     }
+    if (removed) _getImageManager()?.restoreAttachments?.(removed);
     wsShowPendingIndicator(); wsUpdateSendButton(mgr.isStreamingFor(anima, thread));
   };
 }

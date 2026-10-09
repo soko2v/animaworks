@@ -623,7 +623,9 @@ def _build_group3(
     if pending_human_notifications and (is_chat or is_heartbeat):
         _add(pending_human_notifications, "pending_human_notifications", 1, "rigid")
     if shortterm_text:
-        _add(shortterm_text, "shortterm", 3, "elastic", trim_from="head")
+        # Session handoff after a context-threshold reset. It must survive the
+        # soft target; otherwise the fresh session loses the live conversation.
+        _add(shortterm_text, "shortterm", 2, "rigid")
     return out
 
 

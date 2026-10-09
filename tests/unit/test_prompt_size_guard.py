@@ -118,7 +118,7 @@ class TestAgentSDKBufferSize:
         """The constant should be 4 MB."""
         from core.execution.engines.claude._sdk_session import _SDK_MAX_BUFFER_SIZE
 
-        assert _SDK_MAX_BUFFER_SIZE == 4 * 1024 * 1024
+        assert _SDK_MAX_BUFFER_SIZE == 64 * 1024 * 1024
 
 
 # ── Pre-flight size check tests ───────────────────────────────────

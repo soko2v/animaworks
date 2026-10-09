@@ -86,6 +86,103 @@ logger = logging.getLogger("animaworks.execution.agent_sdk")
 __all__ = ["AgentSDKExecutor", "StreamDisconnectedError"]
 
 
+# A fresh chat session sees only this handover. The compressed summary (the
+# thread's main topics and open requests) and a digest of the older turns get
+# their own budgets so that a long recent task cannot push them out; the most
+# recent turns take the rest (see ``format_handover_history``).
+_RESUME_FALLBACK_HISTORY_CHARS = 12000
+_RESUME_FALLBACK_SUMMARY_CHARS = 5000
+_RESUME_FALLBACK_DIGEST_CHARS = 2500
+
+
+def _with_resume_fallback_history(
+    anima_dir: Path,
+    model_config: ModelConfig,
+    prompt: str,
+    session_type: str,
+    thread_id: str,
+    reason: str = "resume_failed",
+) -> str:
+    """Prepend recent chat history when a resume failed and we start fresh.
+
+    A failed ``resume`` (e.g. ``Control request timeout: initialize``) makes
+    us fall back to a brand-new SDK session.  In Mode S the chat history lives
+    only inside the SDK session, so without this the fresh session answers the
+    current message with zero context ("which ID/PW do you mean?").
+
+    The thread's compressed summary and a digest of every older uncompressed
+    turn are always included next to the most recent turns, so the fresh
+    session keeps the thread's earlier topics and open requests and not only
+    the latest work.
+
+    When ConversationMemory is empty, also checks
+    ``shortterm/chat/{thread_id}/session_state.json`` for ``accumulated_response``
+    written by idle_compaction (``session_id == ""``), and injects it as context.
+    """
+    if session_type != SESSION_TYPE_CHAT:
+        return prompt
+    try:
+        from dataclasses import replace as _dc_replace
+
+        from core.memory.conversation.memory import ConversationMemory
+        from core.memory.conversation.prompt import format_handover_history
+
+        state = ConversationMemory(anima_dir, model_config, thread_id=thread_id).load()
+        turns = list(state.turns)
+        # The current human message is appended before execution; drop it so
+        # it is not duplicated between the history block and the prompt.
+        if turns and turns[-1].role != "assistant" and "".join(turns[-1].content.split()) in "".join(prompt.split()):
+            turns = turns[:-1]
+        conv_history = ""
+        if turns or state.compressed_summary:
+            conv_history = format_handover_history(
+                _dc_replace(state, turns=turns),
+                _RESUME_FALLBACK_HISTORY_CHARS,
+                summary_chars=_RESUME_FALLBACK_SUMMARY_CHARS,
+                digest_chars=_RESUME_FALLBACK_DIGEST_CHARS,
+            )
+
+        # For Mode S, ConversationMemory is empty because the chat history lives
+        # inside the SDK session.  Check the shortterm session_state.json that is
+        # written by idle_compaction (accumulated_response with session_id='').
+        shortterm_history = ""
+        if not conv_history:
+            try:
+                from core.memory.conversation.shortterm import ShortTermMemory
+
+                st = ShortTermMemory(anima_dir, session_type="chat", thread_id=thread_id)
+                st_state = st.load()
+                if st_state is not None and not st_state.session_id and st_state.accumulated_response:
+                    shortterm_history = st_state.accumulated_response.strip()
+                    logger.info(
+                        "Resume fallback: found %d chars in shortterm accumulated_response (thread=%s)",
+                        len(shortterm_history),
+                        thread_id,
+                    )
+            except Exception:
+                logger.warning("Resume fallback: failed to load shortterm history", exc_info=True)
+
+        history = conv_history or shortterm_history
+        if not history:
+            return prompt
+        logger.info(
+            "Resume fallback: injected %d chars of conversation history (thread=%s)", len(history), thread_id
+        )
+        _lead = (
+            "[前のセッションを再開できなかったため、新しいセッションで応答しています。"
+            if reason == "resume_failed"
+            else "[このスレッドの前のセッションが終了しているため、新しいセッションで応答しています。"
+        )
+        return (
+            _lead
+            + "以下はこのスレッドの直前までの会話です。これを踏まえて最新メッセージに答えてください。]\n\n"
+            f"{history}\n\n---\n\n[最新メッセージ]\n{prompt}"
+        )
+    except Exception:
+        logger.warning("Resume fallback: failed to build conversation history", exc_info=True)
+        return prompt
+
+
 def _detect_sdk_auth_failure(text: str) -> str | None:
     """Return auth failure text when Claude Code surfaced a 401 auth error."""
     body = (text or "").strip()
@@ -438,6 +535,13 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
         else:
             _sdk_session.clear_session_id_for_type(self._anima_dir, session_type, thread_id=thread_id)
             session_id_to_resume = None
+        if not session_id_to_resume:
+            # Mode S keeps chat history only inside the SDK session.  When a chat
+            # thread starts a fresh session (session cleared after a crash, etc.)
+            # hand over the recent thread history so context is not lost.
+            prompt = _with_resume_fallback_history(
+                self._anima_dir, self._model_config, prompt, session_type, thread_id, reason="no_session"
+            )
 
         options, _temp_files = self._build_sdk_options(
             system_prompt,
@@ -490,6 +594,9 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
             if session_id_to_resume:
                 logger.warning("SDK session resume failed (session_id=%s): %s", session_id_to_resume, e)
                 _sdk_session._clear_session_id(self._anima_dir, session_type, thread_id=thread_id)
+                _msg_args["prompt"] = _with_resume_fallback_history(
+                    self._anima_dir, self._model_config, prompt, session_type, thread_id
+                )
                 options, tfs = self._build_sdk_options(system_prompt, _cw, session_stats, resume=None)
                 _prompt_files.extend(tfs)
                 try:
@@ -608,6 +715,10 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
         else:
             _sdk_session.clear_session_id_for_type(self._anima_dir, session_type, thread_id=thread_id)
             session_id_to_resume = None
+        if not session_id_to_resume:
+            prompt = _with_resume_fallback_history(
+                self._anima_dir, self._model_config, prompt, session_type, thread_id, reason="no_session"
+            )
 
         options, _temp_files = self._build_sdk_options(
             system_prompt,
@@ -636,7 +747,15 @@ class AgentSDKExecutor(SDKOptionsMixin, BaseExecutor):
         sdk_pid_create_time: float | None = None
 
         async def _fresh_session() -> AsyncGenerator[dict[str, Any], None]:
-            nonlocal sdk_pid, sdk_pid_create_time
+            nonlocal sdk_pid, sdk_pid_create_time, ctx
+            from dataclasses import replace as _dc_replace
+
+            ctx = _dc_replace(
+                ctx,
+                prompt=_with_resume_fallback_history(
+                    self._anima_dir, self._model_config, prompt, session_type, thread_id
+                ),
+            )
             fresh_opts, tfs = self._build_sdk_options(
                 system_prompt,
                 _cw,

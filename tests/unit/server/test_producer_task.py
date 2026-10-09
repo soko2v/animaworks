@@ -335,7 +335,7 @@ class TestCleanupWithProducerTasks:
         reg.set_producer_task(stream.response_id, task)
 
         # Force stream to be expired
-        stream.created_at = time.time() - reg.TTL - 1
+        stream.last_activity = time.time() - reg.TTL - 1
 
         removed = reg.cleanup()
         await asyncio.sleep(0)  # Let cancellation propagate

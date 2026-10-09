@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 from core.i18n import t
@@ -19,12 +20,33 @@ from core.memory.conversation.models import (
     _MAX_RENDERED_TOOL_RECORDS,
     _MAX_RESPONSE_CHARS_IN_HISTORY,
     ConversationState,
+    ConversationTurn,
     _sanitize_tool_id,
 )
 from core.paths import load_prompt
 
 if TYPE_CHECKING:
     from core.schemas import ModelConfig
+
+# ── Fresh-session handover limits ─────────────────────────────
+# Turns rendered in full at the end of a handover; older uncompressed turns
+# are condensed into a digest so that none of them silently disappears.
+_HANDOVER_DETAIL_TURNS = 6
+# Per-line clip lengths (human, assistant) tried in order until the whole
+# digest fits its budget; an assistant clip of 0 keeps only the human lines.
+_HANDOVER_DIGEST_CLIPS: tuple[tuple[int, int], ...] = (
+    (200, 120),
+    (140, 80),
+    (90, 50),
+    (60, 30),
+    (40, 0),
+)
+# The recent turns always get at least this much room.
+_HANDOVER_MIN_DETAIL_CHARS = 1500
+# Thread-context section of a short-term handover memo.
+_HANDOVER_NOTE_SUMMARY_CHARS = 1500
+_HANDOVER_NOTE_DIGEST_CHARS = 2000
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 def build_chat_prompt(
@@ -268,3 +290,138 @@ def _format_history(
         result = t("conversation.ellipsis_omitted") + "\n" + result
 
     return result
+
+
+def _clip_tail(text: str, limit: int) -> str:
+    """Return *text* cut to its last *limit* chars, marking the cut."""
+    if len(text) <= limit:
+        return text
+    return t("conversation.ellipsis_omitted") + "\n" + text[-limit:]
+
+
+def _digest_line(turn: ConversationTurn, clip: int) -> str:
+    """Render *turn* as a single line clipped to *clip* chars."""
+    text = " ".join(_HTML_COMMENT_RE.sub(" ", turn.content or "").split())
+    if len(text) > clip:
+        text = text[:clip] + "..."
+    ts = turn.timestamp or ""
+    when = f"{ts[5:10]} {ts[11:16]}" if len(ts) >= 16 else ts
+    role_label = t("conversation.role_you") if turn.role == "assistant" else turn.role
+    return f"- [{when}] {role_label}: {text}"
+
+
+def _format_turn_digest(turns: list[ConversationTurn], max_chars: int) -> str:
+    """Condense *turns* into one clipped line each, oldest first.
+
+    The clip shrinks until every turn fits in *max_chars*; assistant lines go
+    before any human line does.  Only a backlog that still does not fit with
+    the shortest clip loses its oldest lines.
+    """
+    if not turns or max_chars <= 0:
+        return ""
+    lines: list[str] = []
+    for human_clip, assistant_clip in _HANDOVER_DIGEST_CLIPS:
+        lines = [
+            _digest_line(turn, assistant_clip if turn.role == "assistant" else human_clip)
+            for turn in turns
+            if turn.role != "assistant" or assistant_clip > 0
+        ]
+        if len("\n".join(lines)) <= max_chars:
+            return "\n".join(lines)
+    kept: list[str] = []
+    used = 0
+    for line in reversed(lines):
+        if used + len(line) + 1 > max_chars:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    kept.reverse()
+    return t("conversation.ellipsis_omitted") + "\n" + "\n".join(kept)
+
+
+def format_handover_history(
+    state: ConversationState,
+    max_chars: int,
+    *,
+    summary_chars: int,
+    digest_chars: int,
+    detail_turns: int = _HANDOVER_DETAIL_TURNS,
+) -> str:
+    """Render a thread's history for a fresh session that cannot resume.
+
+    ``_format_history`` keeps only the tail when it truncates, so on a long
+    thread the compressed summary (the thread's main topics and open
+    requests) and every turn before the last ``_MAX_DISPLAY_TURNS`` are the
+    first things lost, and the fresh session only sees the latest work.
+    This renderer keeps all three parts instead:
+
+    1. the compressed summary, tail-kept within *summary_chars* (newer topics
+       and open action items are appended at its end),
+    2. a one-line digest of every uncompressed turn before the detailed
+       window, fitted into *digest_chars*,
+    3. the last *detail_turns* turns in full, tail-kept in the rest of
+       *max_chars* (never less than ``_HANDOVER_MIN_DETAIL_CHARS``).
+
+    Args:
+        state: Conversation state to render (current message already removed).
+        max_chars: Overall target length.
+        summary_chars: Budget for the compressed summary body.
+        digest_chars: Budget for the older-turn digest.
+        detail_turns: Number of most recent turns rendered in full; ``0``
+            puts every turn in the digest.
+
+    When *detail_turns* > 0 and the plain ``_format_history`` rendering already
+    holds every turn within *max_chars*, that rendering is returned unchanged.
+
+    Returns:
+        The rendered history, or ``""`` when the state is empty.
+    """
+    if detail_turns > 0 and len(state.turns) <= _MAX_DISPLAY_TURNS:
+        full = _format_history(state)
+        if len(full) <= max_chars:
+            return full
+    separator = "\n\n---\n\n"
+    parts: list[str] = []
+    summary = (state.compressed_summary or "").strip()
+    if summary and summary_chars > 0:
+        parts.append(
+            t("conversation.history_summary_header", count=state.compressed_turn_count)
+            + "\n\n"
+            + _clip_tail(summary, summary_chars)
+        )
+    turns = list(state.turns)
+    recent = turns[-detail_turns:] if detail_turns > 0 else []
+    digest = _format_turn_digest(turns[: len(turns) - len(recent)], digest_chars)
+    if digest:
+        parts.append(t("conversation.handover_digest_header") + "\n\n" + digest)
+    if recent:
+        header = t("conversation.recent_conversation_header") + "\n\n" if parts else ""
+        used = sum(len(part) + len(separator) for part in parts) + len(header)
+        detail = _format_history(
+            ConversationState(turns=recent),
+            max_chars=max(max_chars - used, _HANDOVER_MIN_DETAIL_CHARS),
+        )
+        if detail:
+            parts.append(header + detail)
+    return separator.join(parts)
+
+
+def format_thread_context_note(state: ConversationState) -> str:
+    """Render the thread's topics and requests for a short-term handover memo.
+
+    A handover memo otherwise only carries the turn that ended the session,
+    so the next session would take the latest work for the whole thread.
+
+    Returns:
+        A headed section, or ``""`` when the thread has no history.
+    """
+    body = format_handover_history(
+        state,
+        _HANDOVER_NOTE_SUMMARY_CHARS + _HANDOVER_NOTE_DIGEST_CHARS,
+        summary_chars=_HANDOVER_NOTE_SUMMARY_CHARS,
+        digest_chars=_HANDOVER_NOTE_DIGEST_CHARS,
+        detail_turns=0,
+    )
+    if not body:
+        return ""
+    return t("shortterm.thread_context_header") + "\n" + t("shortterm.thread_context_note") + "\n\n" + body
