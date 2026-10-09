@@ -798,3 +798,78 @@ def test_session_budget_limits_native_documents(tmp_path: Path) -> None:
     assert ca.select_sdk_documents(docs, already_sent_bytes=budget) == []
     assert ca.native_document_eligible(docs[0])
     assert not ca.native_document_eligible(_attachment(tmp_path, "big.pdf", size=ca.SDK_DOCUMENT_MAX_BYTES + 1))
+
+
+# ── r6: selectors, platform gate, session ledger ─────────
+
+
+@posix_only
+def test_run_capped_with_descriptors_above_fd_setsize() -> None:
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = 1400
+    if hard != resource.RLIM_INFINITY and hard < wanted:
+        pytest.skip("cannot raise the descriptor limit")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, wanted), hard))
+    filler: list[int] = []
+    try:
+        base = os.open(os.devnull, os.O_RDONLY)
+        filler.append(base)
+        while len(filler) < 1100:
+            filler.append(os.dup(base))
+        result = ca._run_capped(["/bin/sh", "-c", "echo hi"], stdout_cap=100, stderr_cap=100, timeout=10)
+        assert result.stdout == b"hi\n" and result.returncode == 0
+    finally:
+        for fd in filler:
+            os.close(fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_pdf_reads_fail_closed_without_dir_fd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = _attachments_dir(tmp_path)
+    (folder / "a.pdf").write_bytes(make_pdf(["x"]))
+    (folder / "a.pdf.txt").write_text("text", encoding="utf-8")
+    (folder / "b.png").write_bytes(b"png")
+    monkeypatch.setattr(ca.os, "supports_dir_fd", set())
+    assert not ca.pdf_storage_supported()
+    assert ca.open_confined(tmp_path / "anima", "attachments", "a.pdf") is None
+    assert ca.open_confined(tmp_path / "anima", "attachments", "a.pdf.txt") is None
+    fd = ca.open_confined(tmp_path / "anima", "attachments", "b.png")
+    assert fd is not None
+    os.close(fd)
+
+
+class TestNativeUsageLedger:
+    def test_accumulates_within_a_session(self, tmp_path: Path) -> None:
+        ca.record_native_usage(tmp_path, "t1", "s1", 100, 2)
+        ca.record_native_usage(tmp_path, "t1", "s1", 50, 1)
+        assert ca.native_usage(tmp_path, "t1", "s1") == (150, 3)
+        assert ca.native_usage(tmp_path, "t2", "s1") == (0, 0)  # per thread
+
+    def test_new_or_cleared_session_starts_from_zero(self, tmp_path: Path) -> None:
+        ca.record_native_usage(tmp_path, "t1", "s1", 100, 2)
+        assert ca.native_usage(tmp_path, "t1", "s2") == (0, 0)
+        assert ca.native_usage(tmp_path, "t1", None) == (0, 0)
+        ca.record_native_usage(tmp_path, "t1", "s2", 10, 1)
+        assert ca.native_usage(tmp_path, "t1", "s2") == (10, 1)
+
+    def test_fresh_session_is_attributed_once_it_has_an_id(self, tmp_path: Path) -> None:
+        ca.record_native_usage(tmp_path, "t1", None, 100, 2)  # sent into a brand-new session
+        assert ca.native_usage(tmp_path, "t1", "s9") == (100, 2)
+
+    def test_unknown_session_keeps_counts(self, tmp_path: Path) -> None:
+        ca.record_native_usage(tmp_path, "t1", "s1", 100, 2)
+        assert ca.native_usage(tmp_path, "t1", ca.UNKNOWN_SESSION) == (100, 2)
+
+    def test_corrupt_ledger_is_ignored(self, tmp_path: Path) -> None:
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / ca.NATIVE_USAGE_FILE).write_text("{not json", encoding="utf-8")
+        assert ca.native_usage(tmp_path, "t1", "s1") == (0, 0)
+
+
+def test_page_budget_across_session(tmp_path: Path) -> None:
+    docs = [_attachment(tmp_path, f"p{i}.pdf", size=1000, pages=20) for i in range(2)]
+    budget = ca.SDK_SESSION_DOCUMENT_BUDGET_PAGES
+    assert len(ca.select_sdk_documents(docs, already_sent_pages=budget - 25)) == 1
+    assert ca.select_sdk_documents(docs, already_sent_pages=budget - 10) == []

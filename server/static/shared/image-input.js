@@ -108,8 +108,16 @@ export function installWindowDropGuard(target = typeof window !== "undefined" ? 
  * @returns {object} Manager (see the public API at the end)
  */
 export function createImageInput({ container, inputArea, previewContainer, onImagesChanged }) {
-  const pendingImages = []; // { data, media_type, dataUrl }
-  const pendingFiles = []; // { id, name, size, lastModified, media_type, data, url, loading }
+  // Pending attachments of the conversation (Anima + thread) on screen.
+  // Other conversations' attachments are stashed, like their text drafts,
+  // so a PDF dropped for Anima A can never be sent to Anima B.
+  let pendingImages = []; // { data, media_type, dataUrl }
+  let pendingFiles = []; // { id, name, size, lastModified, media_type, data, url, loading, owner }
+  let conversationKey = null;
+  const stashes = new Map(); // conversation key -> { images, files }
+  // Images still being read: { owner } = the list each lands in.  Like PDF
+  // entries, the owner follows the conversation when it is retargeted.
+  const imageJobs = new Set();
   let processing = 0;
   let status = null; // { kind: "error" | "info", message }
   let statusTimer = null;
@@ -147,10 +155,13 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     }
 
     processing += 1;
+    const job = { owner: pendingImages }; // the conversation this image was added to
+    imageJobs.add(job);
     const img = new Image();
     const objectUrl = URL.createObjectURL(file);
     img.onload = () => {
       processing -= 1;
+      imageJobs.delete(job);
       const canvas = document.createElement("canvas");
       let { width, height } = img;
 
@@ -176,19 +187,20 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       const dataUrl = canvas.toDataURL(outputType, quality);
       const base64Data = dataUrl.split(",")[1];
 
-      pendingImages.push({
+      job.owner.push({
         data: base64Data,
         media_type: outputType,
         dataUrl, // Keep for preview display
       });
 
       URL.revokeObjectURL(objectUrl);
-      changed();
+      if (job.owner === pendingImages) changed();
     };
     img.onerror = () => {
       processing -= 1;
+      imageJobs.delete(job);
       URL.revokeObjectURL(objectUrl);
-      setStatus("error", t("chat.attach_read_failed", { name }));
+      if (job.owner === pendingImages) setStatus("error", t("chat.attach_read_failed", { name }));
     };
     img.src = objectUrl;
   }
@@ -198,8 +210,10 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
   }
 
   function removeFileEntry(entry) {
-    const idx = pendingFiles.indexOf(entry);
-    if (idx >= 0) pendingFiles.splice(idx, 1);
+    entry.removed = true;
+    const list = entry.owner || pendingFiles;
+    const idx = list.indexOf(entry);
+    if (idx >= 0) list.splice(idx, 1);
     if (entry.url && entry.url.startsWith("blob:")) {
       try { URL.revokeObjectURL(entry.url); } catch { /* ignore */ }
     }
@@ -241,6 +255,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
       loading: true,
     };
     try { entry.url = URL.createObjectURL(file); } catch { entry.url = ""; }
+    entry.owner = pendingFiles;
     pendingFiles.push(entry);
     processing += 1;
     changed();
@@ -248,22 +263,24 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     const reader = new FileReader();
     reader.onload = () => {
       processing -= 1;
-      if (!pendingFiles.includes(entry)) return; // removed while loading
+      if (entry.removed) return; // removed while loading
+      const onScreen = entry.owner === pendingFiles;
       const result = String(reader.result || "");
       const comma = result.indexOf(",");
       entry.data = comma >= 0 ? result.slice(comma + 1) : "";
       entry.loading = false;
       if (!entry.data) {
         removeFileEntry(entry);
-        setStatus("error", t("chat.attach_read_failed", { name }));
+        if (onScreen) setStatus("error", t("chat.attach_read_failed", { name }));
         return;
       }
-      changed();
+      if (onScreen) changed();
     };
     reader.onerror = () => {
       processing -= 1;
+      const onScreen = entry.owner === pendingFiles;
       removeFileEntry(entry);
-      setStatus("error", t("chat.attach_read_failed", { name }));
+      if (onScreen) setStatus("error", t("chat.attach_read_failed", { name }));
     };
     reader.readAsDataURL(file);
   }
@@ -478,6 +495,7 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
           data: file.data,
           url: display.url || "",
           loading: false,
+          owner: pendingFiles,
         });
       });
       changed();
@@ -486,6 +504,47 @@ export function createImageInput({ container, inputArea, previewContainer, onIma
     /** Show a message in the attachment preview area. */
     showStatus(kind, message) {
       setStatus(kind, message);
+    },
+
+    /**
+     * The conversation on screen changed (Anima and/or thread): stash the
+     * current attachments under the previous key and bring back the ones
+     * of *key* (if any), like the per-conversation text drafts.
+     */
+    switchConversation(key) {
+      if (key === conversationKey) return;
+      // Also keep (still empty) lists that a picture being read will land in.
+      if (pendingImages.length || pendingFiles.length || processing > 0) {
+        stashes.set(conversationKey, { images: pendingImages, files: pendingFiles });
+      }
+      const next = stashes.get(key);
+      stashes.delete(key);
+      pendingImages = next ? next.images : [];
+      pendingFiles = next ? next.files : [];
+      conversationKey = key;
+      status = null;
+      clearTimeout(statusTimer);
+      changed();
+    },
+
+    /**
+     * The composer moved to another conversation of the same Anima while
+     * its text stays in the input (new thread, closed thread): the pending
+     * attachments stay too and now belong to *key*.  Anything stashed for
+     * *key* earlier is added, so nothing is lost.
+     */
+    retargetConversation(key) {
+      if (key === conversationKey) return;
+      const stashed = stashes.get(key);
+      stashes.delete(key);
+      if (stashed) {
+        for (const job of imageJobs) if (job.owner === stashed.images) job.owner = pendingImages;
+        pendingImages.push(...stashed.images);
+        for (const entry of stashed.files) entry.owner = pendingFiles;
+        pendingFiles.push(...stashed.files);
+      }
+      conversationKey = key;
+      if (stashed) changed();
     },
   };
 }

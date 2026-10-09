@@ -12,9 +12,12 @@ Anima's ``attachments/`` directory together with the text/meta sidecars
 built by :mod:`core.chat_attachments`.
 """
 
+import asyncio
 import base64
 import binascii
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +31,7 @@ from core.chat_attachments import (
     display_name_for_upload,
     is_pdf_upload,
     looks_like_pdf,
+    pdf_storage_supported,
     remove_chat_pdf,
     store_chat_pdf,
 )
@@ -38,6 +42,13 @@ from server.routes.chat_models import FileAttachment
 logger = logging.getLogger("animaworks.routes.chat")
 
 _MB = 1024 * 1024
+# PDF analysis/storage runs on its own small pool so slow or crafted uploads
+# never occupy the default executor (history, downloads, ...), and at most
+# this many uploads are admitted at once; more get an immediate "busy".
+_ANALYSIS_WORKERS = 2
+_MAX_ADMITTED_UPLOADS = 4
+_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=_ANALYSIS_WORKERS, thread_name_prefix="chat-pdf")
+_UPLOAD_SLOTS = threading.BoundedSemaphore(_MAX_ADMITTED_UPLOADS)
 # Base64 padding can add up to two bytes to the length-based estimate.
 _ESTIMATE_SLACK = 3
 
@@ -153,6 +164,8 @@ def save_files(anima_name: str, prepared: list[PreparedFile]) -> list[str]:
     """
     if not prepared:
         return []
+    if not pdf_storage_supported():
+        raise PdfAttachmentError(t("chat.file_platform_unsupported"), 501)
     analysed = []
     for item in prepared:
         inspection, text, status = analyse_pdf_bytes(item.data)
@@ -192,3 +205,27 @@ def save_files(anima_name: str, prepared: list[PreparedFile]) -> list[str]:
             raise PdfAttachmentError(t("chat.file_save_failed", name=current), 500) from exc
     logger.info("chat_files_saved anima=%s count=%d", anima_name, len(stored))
     return [f"attachments/{name}" for name in stored]
+
+
+async def store_files(anima_name: str, prepared: list[PreparedFile]) -> list[str]:
+    """Admission-controlled :func:`save_files` on the dedicated PDF executor.
+
+    Raises:
+        PdfAttachmentError: 503 when too many uploads are already in progress,
+            plus everything :func:`save_files` raises.
+    """
+    if not prepared:
+        return []
+    slots = _UPLOAD_SLOTS
+    if not slots.acquire(blocking=False):
+        raise PdfAttachmentError(t("chat.file_busy"), 503)
+    try:
+        future = _ANALYSIS_EXECUTOR.submit(save_files, anima_name, prepared)
+    except RuntimeError:
+        slots.release()
+        raise
+    # The slot is given back exactly once, when the future is settled: the job
+    # finished, failed, or was cancelled while still queued (a cancelled
+    # request cancels a queued job; a running job always runs to its end).
+    future.add_done_callback(lambda _done: slots.release())
+    return await asyncio.wrap_future(future)

@@ -120,6 +120,30 @@ def _open_attachment(anima_dir: Path, tmp_dir: Path, name: str) -> tuple[Path, i
     return None
 
 
+def _close_opened_attachment(done: asyncio.Future) -> None:
+    """Close the descriptor of an open that finished after its request was cancelled."""
+    if done.cancelled() or done.exception() is not None:
+        return
+    opened = done.result()
+    if opened is not None:
+        with contextlib.suppress(OSError):
+            os.close(opened[1])
+
+
+async def _open_attachment_owned(anima_dir: Path, tmp_dir: Path, name: str) -> tuple[Path, int, int] | None:
+    """:func:`_open_attachment` in a worker thread without leaking on cancellation.
+
+    A cancelled request stops waiting, but the worker thread still finishes
+    the open; its descriptor is then closed instead of being dropped.
+    """
+    job = asyncio.ensure_future(asyncio.to_thread(_open_attachment, anima_dir, tmp_dir, name))
+    try:
+        return await asyncio.shield(job)
+    except asyncio.CancelledError:
+        job.add_done_callback(_close_opened_attachment)
+        raise
+
+
 def _read_at(fd: int, size: int, offset: int) -> bytes:
     if hasattr(os, "pread"):
         return os.pread(fd, size, offset)
@@ -154,20 +178,39 @@ class _DescriptorResponse(Response):
         self._close()
 
     async def __call__(self, scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+        # Stream and watch for http.disconnect at the same time: some servers
+        # (ASGI < 2.4) silently drop send() after a disconnect, so without the
+        # watcher an aborted download would still read the whole file.
         try:
-            await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
-            offset = 0
-            while not self._head_only and self._fd is not None and offset < self._size:
-                chunk = await anyio.to_thread.run_sync(
-                    _read_at, self._fd, min(self.chunk_size, self._size - offset), offset
-                )
-                if not chunk:
-                    break
-                offset += len(chunk)
-                await send({"type": "http.response.body", "body": chunk, "more_body": True})
-            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            async with anyio.create_task_group() as task_group:
+
+                async def stream_then_stop() -> None:
+                    with contextlib.suppress(OSError):  # ASGI >= 2.4: send() fails once the client is gone
+                        await self._stream(send)
+                    task_group.cancel_scope.cancel()
+
+                async def stop_on_disconnect() -> None:
+                    while (await receive())["type"] != "http.disconnect":
+                        pass
+                    task_group.cancel_scope.cancel()
+
+                task_group.start_soon(stream_then_stop)
+                task_group.start_soon(stop_on_disconnect)
         finally:
             self._close()
+
+    async def _stream(self, send) -> None:  # type: ignore[no-untyped-def]
+        await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+        offset = 0
+        while not self._head_only and self._fd is not None and offset < self._size:
+            chunk = await anyio.to_thread.run_sync(
+                _read_at, self._fd, min(self.chunk_size, self._size - offset), offset
+            )
+            if not chunk:
+                break
+            offset += len(chunk)
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 def _resolve_thumbnail(file_path: Path, size_key: str) -> Path | None:
@@ -639,7 +682,7 @@ def create_assets_router() -> APIRouter:
         # A regular file directly inside this Anima's attachments/ (or the
         # shared tmp/attachments), opened without following any symlink; the
         # response streams that very descriptor and always closes it.
-        opened = await asyncio.to_thread(_open_attachment, anima_dir, animas_dir.parent / "tmp", safe_name)
+        opened = await _open_attachment_owned(anima_dir, animas_dir.parent / "tmp", safe_name)
         if opened is None:
             raise HTTPException(status_code=404, detail="Attachment not found")
         base_dir, fd, size = opened

@@ -75,6 +75,8 @@ export async function openConversation(animaName) {
     const maxH = isMobileView() ? 100 : 120;
     _dom.convInput.style.height = Math.min(_dom.convInput.scrollHeight, maxH) + "px";
   }
+  // Attachments are per conversation too (never send A's PDF to B).
+  convImageInputManager?.switchConversation?.(`${animaName}|default`);
 
   closeMobileSidebar();
   closeMobileCharacter();
@@ -158,6 +160,7 @@ export function initChatController(dom) {
     getDom: _getDom,
     renderConvMessages,
     refreshSentinel,
+    getImageManager: _getImageManager,
   });
   initMobile({ getDom: _getDom });
 
