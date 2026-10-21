@@ -1331,7 +1331,13 @@ class TestKnowledgeReconsolidationCheckpoint:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         path = _write_knowledge_target(anima_dir / "knowledge" / "bad.md", failure_count=3, confidence=0.3)
-        monkeypatch.setattr(engine, "_revise_knowledge", AsyncMock(return_value="Revised knowledge"))
+        # Long enough to pass the persistence guard (_validate_knowledge_revision
+        # rejects revisions shorter than 32 characters as implausible).
+        monkeypatch.setattr(
+            engine,
+            "_revise_knowledge",
+            AsyncMock(return_value="# Knowledge\n\nRevised knowledge body with the corrected guidance."),
+        )
 
         assert await engine.find_knowledge_reconsolidation_targets() == [path]
         result = await engine.reconsolidate_knowledge("test-model")
