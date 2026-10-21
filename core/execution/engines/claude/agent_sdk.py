@@ -166,17 +166,14 @@ def _with_resume_fallback_history(
         history = conv_history or shortterm_history
         if not history:
             return prompt
-        logger.info(
-            "Resume fallback: injected %d chars of conversation history (thread=%s)", len(history), thread_id
-        )
+        logger.info("Resume fallback: injected %d chars of conversation history (thread=%s)", len(history), thread_id)
         _lead = (
             "[前のセッションを再開できなかったため、新しいセッションで応答しています。"
             if reason == "resume_failed"
             else "[このスレッドの前のセッションが終了しているため、新しいセッションで応答しています。"
         )
         return (
-            _lead
-            + "以下はこのスレッドの直前までの会話です。これを踏まえて最新メッセージに答えてください。]\n\n"
+            _lead + "以下はこのスレッドの直前までの会話です。これを踏まえて最新メッセージに答えてください。]\n\n"
             f"{history}\n\n---\n\n[最新メッセージ]\n{prompt}"
         )
     except Exception:

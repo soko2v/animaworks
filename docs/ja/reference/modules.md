@@ -1,5 +1,5 @@
 <!-- 自動生成ファイル・編集禁止。再生成: uv run python scripts/gen_reference.py modules -->
-<!-- generator: gen_reference/1  kind: modules  source-sha256: 1ce30b52d8d9519c06f809615894767f31d61c6a385193533e0cd3d23a9ca03f -->
+<!-- generator: gen_reference/1  kind: modules  source-sha256: 68db5701b33f6e995cdc56b41072c896d63cafc25f9e6ff6c12a7bc781b4cd0f -->
 
 # モジュール一覧
 
@@ -93,6 +93,7 @@
 | モジュール | 行数 | docstring 1行目 |
 |---|---:|---|
 | `core` | 7 | — |
+| `core.chat_attachments` | 1274 | — |
 | `core.exceptions` | 145 | — |
 | `core.internal_api` | 38 | — |
 | `core.paths` | 217 | Centralized path resolution for AnimaWorks. |
@@ -107,11 +108,11 @@ LLM エージェントの実行、会話制御、エンジン連携。
 |---|---:|---|
 | `core.agent` | 23 | — |
 | `core.agent.agent_core` | 324 | — |
-| `core.agent.cycle` | 1598 | — |
+| `core.agent.cycle` | 1607 | — |
 | `core.agent.executor_factory` | 178 | — |
 | `core.agent.priming` | 465 | — |
 | `core.agent.prompt_log` | 194 | — |
-| `core.agent.session_compactor` | 557 | Per-Anima × per-thread_id idle compaction timer management. |
+| `core.agent.session_compactor` | 562 | Per-Anima × per-thread_id idle compaction timer management. |
 
 ## `core.anima`
 
@@ -130,7 +131,7 @@ Digital Anima のライフサイクルと実行時オブジェクト。
 | `core.anima.inbox` | 1009 | — |
 | `core.anima.inbox_overflow` | 130 | — |
 | `core.anima.lifecycle` | 1356 | — |
-| `core.anima.messaging` | 1608 | — |
+| `core.anima.messaging` | 1772 | — |
 | `core.anima.response_normalize` | 141 | — |
 | `core.anima.roster` | 83 | — |
 | `core.anima.skills_check` | 15 | — |
@@ -181,7 +182,7 @@ Digital Anima のライフサイクルと実行時オブジェクト。
 | `core.execution._streaming（非公開）` | 303 | — |
 | `core.execution._tool_summary（非公開）` | 102 | — |
 | `core.execution.backoff` | 42 | Backoff timing helpers for coordinated LLM retry. |
-| `core.execution.base` | 874 | — |
+| `core.execution.base` | 888 | — |
 | `core.execution.cli_stream` | 253 | — |
 | `core.execution.engine_base` | 75 | — |
 | `core.execution.engine_session` | 101 | — |
@@ -190,9 +191,9 @@ Digital Anima のライフサイクルと実行時オブジェクト。
 | `core.execution.engines.claude._sdk_options（非公開）` | 555 | — |
 | `core.execution.engines.claude._sdk_patch（非公開）` | 261 | — |
 | `core.execution.engines.claude._sdk_security（非公開）` | 305 | — |
-| `core.execution.engines.claude._sdk_session（非公開）` | 524 | — |
+| `core.execution.engines.claude._sdk_session（非公開）` | 531 | — |
 | `core.execution.engines.claude._sdk_stream（非公開）` | 461 | — |
-| `core.execution.engines.claude.agent_sdk` | 896 | — |
+| `core.execution.engines.claude.agent_sdk` | 1013 | — |
 | `core.execution.engines.codex.codex_sdk` | 847 | — |
 | `core.execution.engines.codex.events` | 667 | — |
 | `core.execution.engines.codex.setup` | 952 | — |
@@ -288,12 +289,12 @@ Digital Anima のライフサイクルと実行時オブジェクト。
 | `core.i18n.strings.handler` | 384 | Domain-specific i18n strings (handler part 1). |
 | `core.i18n.strings.handler_ext` | 368 | Domain-specific i18n strings (handler part 2). |
 | `core.i18n.strings.lifecycle` | 104 | Domain-specific i18n strings. |
-| `core.i18n.strings.memory` | 389 | Domain-specific i18n strings. |
+| `core.i18n.strings.memory` | 409 | Domain-specific i18n strings. |
 | `core.i18n.strings.migrate` | 94 | — |
 | `core.i18n.strings.misc` | 434 | Domain-specific i18n strings. |
 | `core.i18n.strings.misc_routes` | 12 | Domain-specific i18n strings (legacy route modules). |
 | `core.i18n.strings.room_manager` | 29 | i18n strings for meeting room manager. |
-| `core.i18n.strings.server` | 241 | Domain-specific i18n strings. |
+| `core.i18n.strings.server` | 357 | Domain-specific i18n strings. |
 | `core.i18n.strings.supervisor` | 91 | Domain-specific i18n strings. |
 | `core.i18n.strings.tmp` | 74 | — |
 | `core.i18n.strings.tooling` | 121 | Domain-specific i18n strings (tool prompts and tooling). |
@@ -437,7 +438,7 @@ Model Context Protocol サーバーとクライアント。
 | `core.memory._llm_parse（非公開）` | 200 | Shared LLM-output parsing helpers for the memory pipeline. |
 | `core.memory._llm_utils（非公開）` | 885 | Shared LLM helper utilities for memory-management modules. |
 | `core.memory.activity.audit` | 290 | — |
-| `core.memory.activity.conversation` | 492 | — |
+| `core.memory.activity.conversation` | 518 | — |
 | `core.memory.activity.format` | 567 | — |
 | `core.memory.activity.logger` | 585 | — |
 | `core.memory.activity.models` | 202 | — |
@@ -449,8 +450,8 @@ Model Context Protocol サーバーとクライアント。
 | `core.memory.conversation.finalize` | 477 | Session finalization for conversation memory. |
 | `core.memory.conversation.memory` | 327 | Conversation memory (会話記憶 / ワーキングメモリ) management. |
 | `core.memory.conversation.models` | 149 | Data classes and constants for conversation memory. |
-| `core.memory.conversation.prompt` | 270 | Prompt building functions for conversation memory. |
-| `core.memory.conversation.shortterm` | 349 | Short-term memory (短期記憶) management. |
+| `core.memory.conversation.prompt` | 427 | Prompt building functions for conversation memory. |
+| `core.memory.conversation.shortterm` | 369 | Short-term memory (短期記憶) management. |
 | `core.memory.conversation.state_update` | 49 | State update functions for conversation memory finalization. |
 | `core.memory.conversation.streaming_journal` | 473 | — |
 | `core.memory.facts.config` | 110 | — |
@@ -472,7 +473,7 @@ Model Context Protocol サーバーとクライアント。
 | `core.memory.maintenance.forgetting` | 507 | — |
 | `core.memory.maintenance.housekeeping` | 1691 | — |
 | `core.memory.maintenance.hygiene` | 75 | — |
-| `core.memory.maintenance.reconsolidation` | 657 | — |
+| `core.memory.maintenance.reconsolidation` | 842 | — |
 | `core.memory.maintenance.resolution_tracker` | 61 | — |
 | `core.memory.manager` | 675 | — |
 | `core.memory.peer_profiles` | 37 | — |
@@ -695,7 +696,7 @@ anima 間および外部とのメッセージ配送。
 |---|---:|---|
 | `core.prompt` | 8 | — |
 | `core.prompt.assembler` | 307 | — |
-| `core.prompt.builder` | 1274 | — |
+| `core.prompt.builder` | 1276 | — |
 | `core.prompt.context` | 486 | Context window usage tracker. |
 | `core.prompt.messaging` | 146 | — |
 | `core.prompt.org_context` | 375 | — |
@@ -943,7 +944,7 @@ LLM 利用量とコストの記録・集計。
 | `server.localhost` | 86 | — |
 | `server.reload_manager` | 115 | — |
 | `server.room_manager` | 540 | Meeting room lifecycle, orchestration, and minutes generation. |
-| `server.stream_registry` | 489 | — |
+| `server.stream_registry` | 493 | — |
 | `server.websocket` | 165 | — |
 
 ## `server.gateways`
@@ -970,14 +971,15 @@ LLM 利用量とコストの記録・集計。
 | `server.routes` | 61 | — |
 | `server.routes.animas` | 900 | — |
 | `server.routes.approve` | 89 | — |
-| `server.routes.assets` | 1455 | — |
+| `server.routes.assets` | 1595 | — |
 | `server.routes.auth` | 133 | — |
 | `server.routes.channels` | 493 | — |
-| `server.routes.chat` | 419 | — |
+| `server.routes.chat` | 452 | — |
 | `server.routes.chat_chunk_handler` | 288 | — |
 | `server.routes.chat_emotion` | 8 | — |
-| `server.routes.chat_images` | 80 | — |
-| `server.routes.chat_models` | 50 | — |
+| `server.routes.chat_files` | 231 | — |
+| `server.routes.chat_images` | 108 | — |
+| `server.routes.chat_models` | 59 | — |
 | `server.routes.chat_producer` | 376 | — |
 | `server.routes.chat_resume` | 114 | — |
 | `server.routes.chat_ui_state` | 103 | — |
@@ -989,7 +991,7 @@ LLM 利用量とコストの記録・集計。
 | `server.routes.media_proxy` | 186 | — |
 | `server.routes.memory_routes` | 459 | — |
 | `server.routes.room` | 443 | Meeting room API routes with SSE streaming. |
-| `server.routes.sessions` | 297 | — |
+| `server.routes.sessions` | 302 | — |
 | `server.routes.setup` | 609 | — |
 | `server.routes.skills` | 132 | — |
 | `server.routes.system` | 1200 | — |
