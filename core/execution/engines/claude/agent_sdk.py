@@ -50,6 +50,7 @@ from core.execution.engines.claude._sdk_session import (
     _RESUMABLE_SESSION_TYPES,
     COMPACT_TIMEOUT_SEC,
     RESUME_TIMEOUT_SEC,
+    SESSION_TYPE_CHAT,
     _build_sdk_query_input,
     _cleanup_prompt_files,
     _cleanup_tool_outputs,
