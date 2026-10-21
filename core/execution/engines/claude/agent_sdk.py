@@ -167,14 +167,16 @@ def _with_resume_fallback_history(
         if not history:
             return prompt
         logger.info("Resume fallback: injected %d chars of conversation history (thread=%s)", len(history), thread_id)
-        _lead = (
-            "[前のセッションを再開できなかったため、新しいセッションで応答しています。"
+        from core.i18n import t
+
+        _lead = t(
+            "conversation.resume_fallback_lead_resume_failed"
             if reason == "resume_failed"
-            else "[このスレッドの前のセッションが終了しているため、新しいセッションで応答しています。"
+            else "conversation.resume_fallback_lead_no_session"
         )
         return (
-            _lead + "以下はこのスレッドの直前までの会話です。これを踏まえて最新メッセージに答えてください。]\n\n"
-            f"{history}\n\n---\n\n[最新メッセージ]\n{prompt}"
+            f"{_lead}{t('conversation.resume_fallback_intro')}\n\n"
+            f"{history}\n\n---\n\n{t('conversation.resume_fallback_latest')}\n{prompt}"
         )
     except Exception:
         logger.warning("Resume fallback: failed to build conversation history", exc_info=True)

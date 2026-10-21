@@ -136,6 +136,22 @@ STRINGS: dict[str, dict[str, str]] = {
         "ja": "### それ以前のやり取り（古い順・各発言は冒頭のみ）",
         "en": "### Earlier exchanges (oldest first, each message clipped)",
     },
+    "conversation.resume_fallback_lead_resume_failed": {
+        "ja": "[前のセッションを再開できなかったため、新しいセッションで応答しています。",
+        "en": "[The previous session could not be resumed, so this reply comes from a new session. ",
+    },
+    "conversation.resume_fallback_lead_no_session": {
+        "ja": "[このスレッドの前のセッションが終了しているため、新しいセッションで応答しています。",
+        "en": "[The previous session of this thread has ended, so this reply comes from a new session. ",
+    },
+    "conversation.resume_fallback_intro": {
+        "ja": "以下はこのスレッドの直前までの会話です。これを踏まえて最新メッセージに答えてください。]",
+        "en": "Below is this thread's conversation so far. Answer the latest message with it in mind.]",
+    },
+    "conversation.resume_fallback_latest": {
+        "ja": "[最新メッセージ]",
+        "en": "[Latest message]",
+    },
     "conversation.history_summary_header": {
         "ja": "### 会話の要約（{count}ターン分）",
         "en": "### Conversation summary ({count} turns)",
