@@ -1,5 +1,5 @@
 <!-- 自動生成ファイル・編集禁止。再生成: uv run python scripts/gen_reference.py modules -->
-<!-- generator: gen_reference/1  kind: modules  source-sha256: 68db5701b33f6e995cdc56b41072c896d63cafc25f9e6ff6c12a7bc781b4cd0f -->
+<!-- generator: gen_reference/1  kind: modules  source-sha256: 0d69d52a17835485eb105b51fabddfa9e37058a6b77f87bf5ab52621f2b3a11c -->
 
 # モジュール一覧
 
@@ -193,7 +193,7 @@ Digital Anima のライフサイクルと実行時オブジェクト。
 | `core.execution.engines.claude._sdk_security（非公開）` | 305 | — |
 | `core.execution.engines.claude._sdk_session（非公開）` | 531 | — |
 | `core.execution.engines.claude._sdk_stream（非公開）` | 461 | — |
-| `core.execution.engines.claude.agent_sdk` | 1013 | — |
+| `core.execution.engines.claude.agent_sdk` | 1015 | — |
 | `core.execution.engines.codex.codex_sdk` | 847 | — |
 | `core.execution.engines.codex.events` | 667 | — |
 | `core.execution.engines.codex.setup` | 952 | — |
@@ -289,7 +289,7 @@ Digital Anima のライフサイクルと実行時オブジェクト。
 | `core.i18n.strings.handler` | 384 | Domain-specific i18n strings (handler part 1). |
 | `core.i18n.strings.handler_ext` | 368 | Domain-specific i18n strings (handler part 2). |
 | `core.i18n.strings.lifecycle` | 104 | Domain-specific i18n strings. |
-| `core.i18n.strings.memory` | 409 | Domain-specific i18n strings. |
+| `core.i18n.strings.memory` | 425 | Domain-specific i18n strings. |
 | `core.i18n.strings.migrate` | 94 | — |
 | `core.i18n.strings.misc` | 434 | Domain-specific i18n strings. |
 | `core.i18n.strings.misc_routes` | 12 | Domain-specific i18n strings (legacy route modules). |
