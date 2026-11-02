@@ -261,26 +261,18 @@ async def test_spawn_spools_large_params_and_removes_file_when_job_ends(
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_spool_write_still_removes_the_file(short_dir: Path) -> None:
-    import threading
+async def test_cancel_right_after_spool_write_still_removes_the_file(short_dir: Path) -> None:
+    from core.runtime.task_runner_supervisor import TaskRunnerSupervisor
 
-    from core.runtime import task_runner_supervisor as trs
+    supervisor = TaskRunnerSupervisor("alice", short_dir / "animas" / "alice", short_dir / "shared")
+    spawn_entered = asyncio.Event()
 
-    supervisor = trs.TaskRunnerSupervisor("alice", short_dir / "animas" / "alice", short_dir / "shared")
-    entered = threading.Event()
-    release = threading.Event()
-    real = trs.spool_run_params_if_large
-
-    def _slow_spool(*args: Any, **kwargs: Any) -> Any:
-        entered.set()
-        release.wait(5)
-        return real(*args, **kwargs)
+    async def _blocked_spawn(*args: Any, **kwargs: Any) -> Any:
+        spawn_entered.set()
+        await asyncio.Event().wait()
 
     params = _large_chat_params()
-    with (
-        patch.object(trs, "spool_run_params_if_large", _slow_spool),
-        patch("asyncio.create_subprocess_exec", side_effect=AssertionError("must not spawn")),
-    ):
+    with patch("asyncio.create_subprocess_exec", side_effect=_blocked_spawn):
         task = asyncio.create_task(
             supervisor._spawn_and_await(
                 lane="chat",
@@ -293,18 +285,29 @@ async def test_cancel_during_spool_write_still_removes_the_file(short_dir: Path)
                 url_env={"ANIMAWORKS_EMBED_URL": "http://127.0.0.1:1/embed"},
             )
         )
-        while not entered.is_set():
-            await asyncio.sleep(0.01)
+        await spawn_entered.wait()
+        spool_dir = spool_dir_for_socket(supervisor.socket_path)
+        assert len(list(spool_dir.iterdir())) == 1
         task.cancel()
-        await asyncio.sleep(0.05)
-        release.set()
+        task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    spool_dir = spool_dir_for_socket(supervisor.socket_path)
-    assert spool_dir.is_dir()
     assert list(spool_dir.iterdir()) == []
     assert not supervisor.jobs
+
+
+def test_sweep_keeps_files_of_jobs_registered_on_the_loop(short_dir: Path) -> None:
+    from core.runtime.task_runner_supervisor import TaskRunnerSupervisor
+
+    supervisor = TaskRunnerSupervisor("alice", short_dir / "animas" / "alice", short_dir / "shared")
+    spool_dir = spool_dir_for_socket(supervisor.socket_path)
+    _, live_path = spool_run_params_if_large(_large_chat_params(), spool_dir=spool_dir, job_id="chat-live")
+    _, dead_path = spool_run_params_if_large(_large_chat_params(), spool_dir=spool_dir, job_id="chat-dead")
+    supervisor.jobs["chat-live"] = object()  # type: ignore[assignment]
+    supervisor._sweep_spool()
+    assert live_path is not None and live_path.exists()
+    assert dead_path is not None and not dead_path.exists()
 
 
 @pytest.mark.asyncio

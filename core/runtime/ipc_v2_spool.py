@@ -106,8 +106,6 @@ def spool_run_params_if_large(
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(encoded)
-            fh.flush()
-            os.fsync(fh.fileno())
         os.replace(tmp, target)
     except BaseException:
         tmp.unlink(missing_ok=True)
