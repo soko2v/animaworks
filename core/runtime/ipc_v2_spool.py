@@ -12,7 +12,10 @@ reference.  The task runner resolves the reference itself (the file name is
 derived from its own job id, never from the peer), verifies size and SHA-256,
 and continues with the original parameters.  The Anima main owns the file and
 removes it when the job ends, so reconnect replays of the ``run`` request keep
-working for the whole job lifetime.
+working for the whole job lifetime.  Each Anima main owns its own spool
+subdirectory and removes every file there that does not belong to one of its
+live jobs whenever a job ends and when its endpoint starts, so leftovers from
+a crashed main never outlive the next job.
 """
 
 from __future__ import annotations
@@ -22,7 +25,6 @@ import json
 import logging
 import os
 import re
-import time
 from pathlib import Path
 from typing import Any
 
@@ -37,14 +39,24 @@ IPC_V2_SPOOL_DIRNAME = "ipc-v2-spool"
 IPC_V2_RUN_PARAMS_INLINE_MAX_BYTES = 1 * 1024 * 1024
 # Upper bound for a spooled payload (20 MB images + 10 MB message + headroom).
 IPC_V2_SPOOL_MAX_BYTES = 128 * 1024 * 1024
-IPC_V2_SPOOL_STALE_SECONDS = 24 * 60 * 60
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 
 
 def spool_dir_for_socket(socket_path: Path) -> Path:
-    """Return the spool directory shared by an IPC v2 socket's two peers."""
-    return Path(socket_path).parent.parent / IPC_V2_SPOOL_DIRNAME
+    """Return the per-endpoint spool directory shared by an IPC v2 socket's two peers.
+
+    ``run/sockets/<anima>.task-v2.sock`` maps to ``run/ipc-v2-spool/<anima>.task-v2``.
+    """
+    socket_path = Path(socket_path)
+    owner = socket_path.name.removesuffix(".sock") or "default"
+    return socket_path.parent.parent / IPC_V2_SPOOL_DIRNAME / owner
+
+
+def _ensure_private_dir(spool_dir: Path) -> None:
+    for directory in (spool_dir.parent, spool_dir):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
 
 
 def _spool_file(spool_dir: Path, job_id: str) -> Path:
@@ -87,7 +99,8 @@ def spool_run_params_if_large(
     if len(encoded) > IPC_V2_SPOOL_MAX_BYTES:
         raise IPCV2ProtocolError(f"run params are {len(encoded)} bytes; spool maximum is {IPC_V2_SPOOL_MAX_BYTES}")
     target = _spool_file(spool_dir, job_id)
-    spool_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    spool_dir.parent.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(spool_dir)
     tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -162,17 +175,34 @@ def remove_spool_file(path: Path | None) -> None:
         logger.warning("Failed to remove IPC v2 spool file %s", path, exc_info=True)
 
 
-def sweep_stale_spool_files(spool_dir: Path, *, max_age_seconds: float = IPC_V2_SPOOL_STALE_SECONDS) -> int:
-    """Remove spool files left behind by crashed Anima mains. Returns the count."""
+def _job_id_from_spool_name(name: str) -> str | None:
+    if name.endswith(".json") and not name.startswith("."):
+        return name[: -len(".json")]
+    if name.startswith(".") and name.endswith(".tmp") and ".json." in name:
+        return name[1:].split(".json.", 1)[0]
+    return None
+
+
+def sweep_orphan_spool_files(spool_dir: Path, live_job_ids: set[str] | frozenset[str]) -> int:
+    """Remove spool files in an endpoint's own directory not owned by a live job.
+
+    Args:
+        spool_dir: The directory returned by :func:`spool_dir_for_socket` for
+            the caller's own endpoint (never another Anima's directory).
+        live_job_ids: Job ids that are still registered and may need their file.
+
+    Returns:
+        Number of files removed.
+    """
     if not spool_dir.is_dir():
         return 0
-    cutoff = time.time() - max_age_seconds
     removed = 0
     for entry in spool_dir.iterdir():
-        if not entry.name.endswith((".json", ".tmp")) or not entry.is_file():
+        job_id = _job_id_from_spool_name(entry.name)
+        if job_id is None or job_id in live_job_ids:
             continue
         try:
-            if entry.stat().st_mtime < cutoff:
+            if entry.is_file() and not entry.is_symlink():
                 entry.unlink(missing_ok=True)
                 removed += 1
         except OSError:
@@ -188,5 +218,5 @@ __all__ = [
     "remove_spool_file",
     "spool_dir_for_socket",
     "spool_run_params_if_large",
-    "sweep_stale_spool_files",
+    "sweep_orphan_spool_files",
 ]

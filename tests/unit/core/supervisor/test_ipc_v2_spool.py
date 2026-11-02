@@ -28,7 +28,7 @@ from core.runtime.ipc_v2_spool import (
     load_spooled_run_params,
     spool_dir_for_socket,
     spool_run_params_if_large,
-    sweep_stale_spool_files,
+    sweep_orphan_spool_files,
 )
 
 
@@ -116,17 +116,29 @@ def test_loader_resolves_path_from_own_job_id_only(tmp_path: Path) -> None:
         load_spooled_run_params(wire, spool_dir=tmp_path, job_id="../chat-a")
 
 
-def test_sweep_removes_only_stale_files(tmp_path: Path) -> None:
-    old = tmp_path / "old.json"
-    new = tmp_path / "new.json"
+def test_spool_dir_is_per_endpoint_and_private(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    alice = spool_dir_for_socket(run_dir / "sockets" / "alice.task-v2.sock")
+    bob = spool_dir_for_socket(run_dir / "sockets" / "bob.task-v2.sock")
+    assert alice == run_dir / "ipc-v2-spool" / "alice.task-v2"
+    assert alice != bob
+    spool_run_params_if_large(_large_chat_params(), spool_dir=alice, job_id="chat-1")
+    assert stat.S_IMODE(alice.stat().st_mode) == 0o700
+    assert stat.S_IMODE(alice.parent.stat().st_mode) == 0o700
+
+
+def test_sweep_removes_every_file_not_owned_by_a_live_job(tmp_path: Path) -> None:
+    live = tmp_path / "chat-live.json"
+    live_tmp = tmp_path / ".chat-live.json.123.tmp"
+    orphan = tmp_path / "chat-dead.json"
+    orphan_tmp = tmp_path / ".chat-dead.json.123.tmp"
     other = tmp_path / "keep.txt"
-    for path in (old, new, other):
+    for path in (live, live_tmp, orphan, orphan_tmp, other):
         path.write_text("{}")
-    os.utime(old, (1, 1))
-    os.utime(other, (1, 1))
-    assert sweep_stale_spool_files(tmp_path, max_age_seconds=3600) == 1
-    assert not old.exists() and new.exists() and other.exists()
-    assert sweep_stale_spool_files(tmp_path / "absent") == 0
+    assert sweep_orphan_spool_files(tmp_path, {"chat-live"}) == 2
+    assert live.exists() and live_tmp.exists() and other.exists()
+    assert not orphan.exists() and not orphan_tmp.exists()
+    assert sweep_orphan_spool_files(tmp_path / "absent", set()) == 0
 
 
 @pytest.mark.asyncio
@@ -224,6 +236,10 @@ async def test_spawn_spools_large_params_and_removes_file_when_job_ends(
         raise OSError("spawn blocked in test")
 
     params = _large_chat_params()
+    spool_dir = spool_dir_for_socket(supervisor.socket_path)
+    spool_dir.mkdir(parents=True)
+    orphan = spool_dir / "chat-stream-left-by-crashed-main.json"
+    orphan.write_text("{}")
     with patch("asyncio.create_subprocess_exec", side_effect=_fail_spawn), pytest.raises(OSError):
         await supervisor._spawn_and_await(
             lane="chat",
@@ -240,6 +256,54 @@ async def test_spawn_spools_large_params_and_removes_file_when_job_ends(
     assert set(seen["wire"]) == {IPC_V2_SPOOL_KEY}
     assert seen["path"].parent == spool_dir_for_socket(supervisor.socket_path)
     assert not seen["path"].exists()
+    assert not orphan.exists()
+    assert not supervisor.jobs
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_spool_write_still_removes_the_file(short_dir: Path) -> None:
+    import threading
+
+    from core.runtime import task_runner_supervisor as trs
+
+    supervisor = trs.TaskRunnerSupervisor("alice", short_dir / "animas" / "alice", short_dir / "shared")
+    entered = threading.Event()
+    release = threading.Event()
+    real = trs.spool_run_params_if_large
+
+    def _slow_spool(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        release.wait(5)
+        return real(*args, **kwargs)
+
+    params = _large_chat_params()
+    with (
+        patch.object(trs, "spool_run_params_if_large", _slow_spool),
+        patch("asyncio.create_subprocess_exec", side_effect=AssertionError("must not spawn")),
+    ):
+        task = asyncio.create_task(
+            supervisor._spawn_and_await(
+                lane="chat",
+                job_prefix="chat-stream",
+                params_builder=lambda url_env: params,
+                log_context="test",
+                attempt=1,
+                display_lane="chat",
+                on_spawned=None,
+                url_env={"ANIMAWORKS_EMBED_URL": "http://127.0.0.1:1/embed"},
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    spool_dir = spool_dir_for_socket(supervisor.socket_path)
+    assert spool_dir.is_dir()
+    assert list(spool_dir.iterdir()) == []
     assert not supervisor.jobs
 
 

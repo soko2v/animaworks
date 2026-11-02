@@ -38,7 +38,7 @@ from core.runtime.ipc_v2_spool import (
     remove_spool_file,
     spool_dir_for_socket,
     spool_run_params_if_large,
-    sweep_stale_spool_files,
+    sweep_orphan_spool_files,
 )
 from core.runtime.memory_service import MemoryService, MemoryServiceUnavailable
 from core.runtime.state_writer import LocalStateWriter, get_state_writer
@@ -247,18 +247,23 @@ class TaskRunnerSupervisor:
             if self._server is None:
                 if self._memory_service is not None:
                     await self._memory_service.start()
-                try:
-                    swept = await asyncio.to_thread(sweep_stale_spool_files, self._spool_dir)
-                    if swept:
-                        logger.info("Removed %d stale IPC v2 spool files from %s", swept, self._spool_dir)
-                except OSError:
-                    logger.debug("IPC v2 spool sweep failed", exc_info=True)
+                await self._sweep_spool()
                 self._server, endpoint = await start_ipc_server(
                     self.socket_path,
                     self._handle_connection,
                     limit=IPC_V2_MAX_FRAME_BYTES + 1,
                 )
                 logger.info("Task runner IPC v2 endpoint started on %s", endpoint.describe())
+
+    async def _sweep_spool(self) -> None:
+        """Drop spool files (chat text + images) that no live job of this main owns."""
+        try:
+            swept = await asyncio.to_thread(sweep_orphan_spool_files, self._spool_dir, frozenset(self._jobs))
+        except OSError:
+            logger.debug("IPC v2 spool sweep failed", exc_info=True)
+            return
+        if swept:
+            logger.info("Removed %d orphan IPC v2 spool files from %s", swept, self._spool_dir)
 
     @staticmethod
     def _required_url_environment() -> dict[str, str]:
@@ -711,12 +716,24 @@ class TaskRunnerSupervisor:
         hang_watch: asyncio.Task[None] | None = None
         stderr_file = None
         try:
-            job.wire_params, job.params_spool_path = await asyncio.to_thread(
-                spool_run_params_if_large,
-                job.params,
-                spool_dir=self._spool_dir,
-                job_id=job_id,
+            spool_write = asyncio.ensure_future(
+                asyncio.to_thread(
+                    spool_run_params_if_large,
+                    job.params,
+                    spool_dir=self._spool_dir,
+                    job_id=job_id,
+                )
             )
+            try:
+                job.wire_params, job.params_spool_path = await asyncio.shield(spool_write)
+            except asyncio.CancelledError:
+                # The worker thread keeps running after cancellation; wait for it
+                # so a spool file it publishes late is still removed below.
+                try:
+                    _, job.params_spool_path = await spool_write
+                except Exception:
+                    job.params_spool_path = None
+                raise
             stderr_path = self.shared_dir.parent / "logs" / "animas" / self.anima_name / "task-runner.stderr.log"
             stderr_path.parent.mkdir(parents=True, exist_ok=True)
             stderr_file = stderr_path.open("ab")
@@ -828,6 +845,7 @@ class TaskRunnerSupervisor:
                 await asyncio.gather(hang_watch, return_exceptions=True)
             self._jobs.pop(job_id, None)
             remove_spool_file(job.params_spool_path)
+            await self._sweep_spool()
             if job.state_write_count:
                 logger.info(
                     "Task runner state_write summary: anima=%s lane=%s job=%s operations=%d write_ms=%.1f",
