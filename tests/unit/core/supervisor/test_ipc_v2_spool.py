@@ -297,6 +297,65 @@ async def test_cancel_right_after_spool_write_still_removes_the_file(short_dir: 
     assert not supervisor.jobs
 
 
+@pytest.mark.asyncio
+async def test_cancel_while_waiting_for_hang_watch_still_removes_the_file(short_dir: Path) -> None:
+    from core.runtime import task_runner_supervisor as trs
+
+    supervisor = trs.TaskRunnerSupervisor("alice", short_dir / "animas" / "alice", short_dir / "shared")
+    watch_started = asyncio.Event()
+
+    async def _stubborn_watch(job: Any) -> None:
+        watch_started.set()
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                await asyncio.sleep(3600)  # ignores the first cancel, like a slow kill
+
+    class _Proc:
+        pid = 999_999
+        returncode = None
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+    async def _spawn(*args: Any, **kwargs: Any) -> _Proc:
+        return _Proc()
+
+    async def _noop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    params = _large_chat_params()
+    with (
+        patch("asyncio.create_subprocess_exec", side_effect=_spawn),
+        patch.object(supervisor, "_watch_job", _stubborn_watch),
+        patch.object(supervisor, "_terminate_hung_job", _noop),
+    ):
+        task = asyncio.create_task(
+            supervisor._spawn_and_await(
+                lane="chat",
+                job_prefix="chat-stream",
+                params_builder=lambda url_env: params,
+                log_context="test",
+                attempt=1,
+                display_lane="chat",
+                on_spawned=None,
+                url_env={"ANIMAWORKS_EMBED_URL": "http://127.0.0.1:1/embed"},
+            )
+        )
+        await watch_started.wait()
+        spool_dir = spool_dir_for_socket(supervisor.socket_path)
+        assert len(list(spool_dir.iterdir())) == 1
+        task.cancel()  # enters finally, which then awaits the stubborn watch
+        await asyncio.sleep(0.05)
+        task.cancel()  # cancels the finally's await
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert list(spool_dir.iterdir()) == []
+
+
 def test_sweep_keeps_files_of_jobs_registered_on_the_loop(short_dir: Path) -> None:
     from core.runtime.task_runner_supervisor import TaskRunnerSupervisor
 

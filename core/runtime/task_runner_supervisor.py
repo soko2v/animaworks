@@ -832,6 +832,10 @@ class TaskRunnerSupervisor:
                 await self._terminate_hung_job(job)
             raise
         finally:
+            # First, before any await: the child has already read (or will never
+            # read) its params, and a cancellation below must not leave the
+            # spooled chat text / images on disk.
+            remove_spool_file(job.params_spool_path)
             if stderr_file is not None:
                 stderr_file.close()
             if hang_watch is not None:
@@ -839,7 +843,6 @@ class TaskRunnerSupervisor:
                     hang_watch.cancel()
                 await asyncio.gather(hang_watch, return_exceptions=True)
             self._jobs.pop(job_id, None)
-            remove_spool_file(job.params_spool_path)
             self._sweep_spool()
             if job.state_write_count:
                 logger.info(
