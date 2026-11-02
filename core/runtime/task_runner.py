@@ -29,10 +29,12 @@ from core.runtime.ipc_v2 import (
     IPCV2ConnectionError,
     IPCV2ConnectionState,
     IPCV2Envelope,
+    IPCV2Error,
     IPCV2Identity,
     IPCV2PayloadTooLarge,
     ipc_v2_error,
 )
+from core.runtime.ipc_v2_spool import load_spooled_run_params, spool_dir_for_socket
 from core.runtime.state_writer import IpcStateWriter, configure_state_writer, get_state_writer
 from core.runtime.streaming_handler import StreamingIPCHandler
 from core.runtime.transport import open_ipc_connection
@@ -742,7 +744,19 @@ async def run_task(args: argparse.Namespace, socket_path: Path, identity: IPCV2I
     state = IPCV2ConnectionState(identity)
     connection, run_envelope = await _connect(socket_path, state)
     request_id = run_envelope.body["request_id"]
-    params = run_envelope.body["params"]
+    try:
+        params = load_spooled_run_params(
+            run_envelope.body["params"],
+            spool_dir=spool_dir_for_socket(socket_path),
+            job_id=identity.job_id,
+        )
+    except IPCV2Error as exc:
+        await connection.send_response(
+            request_id,
+            error=ipc_v2_error("PROTOCOL_ERROR", str(exc), retryable=False),
+        )
+        await connection.close()
+        return 2
     contract_urls = (params.get("environment") or {}).get("urls")
     if not isinstance(contract_urls, dict) or contract_urls.get("ANIMAWORKS_EMBED_URL") != get_env(
         "ANIMAWORKS_EMBED_URL"

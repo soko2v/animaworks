@@ -34,6 +34,12 @@ from core.runtime.ipc_v2 import (
     ipc_v2_error,
     read_ipc_v2_envelope,
 )
+from core.runtime.ipc_v2_spool import (
+    remove_spool_file,
+    spool_dir_for_socket,
+    spool_run_params_if_large,
+    sweep_stale_spool_files,
+)
 from core.runtime.memory_service import MemoryService, MemoryServiceUnavailable
 from core.runtime.state_writer import LocalStateWriter, get_state_writer
 from core.runtime.transport import cleanup_ipc_endpoint, start_ipc_server
@@ -111,6 +117,10 @@ class TaskRunnerJob:
     state_write_duration_sec: float = 0.0
     state_write_pending: set[str] = field(default_factory=set)
     state_write_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Params actually sent in the ``run`` frame; a spool reference when the
+    # original params are too large for one IPC v2 frame.
+    wire_params: dict[str, Any] | None = None
+    params_spool_path: Path | None = None
 
 
 def _now_iso() -> str:
@@ -137,6 +147,7 @@ class TaskRunnerSupervisor:
         self.shared_dir = shared_dir
         self.root_epoch = str(uuid.uuid4())
         self.socket_path = shared_dir.parent / "run" / "sockets" / f"{anima_name}.task-v2.sock"
+        self._spool_dir = spool_dir_for_socket(self.socket_path)
         self._server: asyncio.Server | None = None
         self._memory_service = memory_service
         self._state_writer = get_state_writer(anima_dir)
@@ -236,6 +247,12 @@ class TaskRunnerSupervisor:
             if self._server is None:
                 if self._memory_service is not None:
                     await self._memory_service.start()
+                try:
+                    swept = await asyncio.to_thread(sweep_stale_spool_files, self._spool_dir)
+                    if swept:
+                        logger.info("Removed %d stale IPC v2 spool files from %s", swept, self._spool_dir)
+                except OSError:
+                    logger.debug("IPC v2 spool sweep failed", exc_info=True)
                 self._server, endpoint = await start_ipc_server(
                     self.socket_path,
                     self._handle_connection,
@@ -694,6 +711,12 @@ class TaskRunnerSupervisor:
         hang_watch: asyncio.Task[None] | None = None
         stderr_file = None
         try:
+            job.wire_params, job.params_spool_path = await asyncio.to_thread(
+                spool_run_params_if_large,
+                job.params,
+                spool_dir=self._spool_dir,
+                job_id=job_id,
+            )
             stderr_path = self.shared_dir.parent / "logs" / "animas" / self.anima_name / "task-runner.stderr.log"
             stderr_path.parent.mkdir(parents=True, exist_ok=True)
             stderr_file = stderr_path.open("ab")
@@ -804,6 +827,7 @@ class TaskRunnerSupervisor:
                     hang_watch.cancel()
                 await asyncio.gather(hang_watch, return_exceptions=True)
             self._jobs.pop(job_id, None)
+            remove_spool_file(job.params_spool_path)
             if job.state_write_count:
                 logger.info(
                     "Task runner state_write summary: anima=%s lane=%s job=%s operations=%d write_ms=%.1f",
@@ -1244,7 +1268,11 @@ class TaskRunnerSupervisor:
                 self._state_write_worker(connection, job, state_write_queue),
                 name=f"state-write-{job.identity.job_id}",
             )
-            await connection.send_request(job.request_id, "run", job.params)
+            await connection.send_request(
+                job.request_id,
+                "run",
+                job.wire_params if job.wire_params is not None else job.params,
+            )
             if job.interrupt_thread_id is not None:
                 await connection.send_event("interrupt", {"thread_id": job.interrupt_thread_id})
             if job.pending_cancel:
