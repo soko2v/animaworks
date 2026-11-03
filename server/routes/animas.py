@@ -181,6 +181,16 @@ def create_animas_router() -> APIRouter:
             asyncio.to_thread(memory.list_procedure_files),
         )
 
+        from core.memory.rag.store_status import read_store_status
+
+        memory_store = await asyncio.to_thread(read_store_status, anima_dir)
+        if memory_store is not None:
+            proc_status = {
+                **proc_status,
+                "store_unavailable_since": memory_store.get("unavailable_since"),
+                "store_last_error": memory_store.get("last_error"),
+            }
+
         return {
             "status": proc_status,
             "identity": identity,

@@ -197,6 +197,11 @@ def _print_anima_status(name: str, status: dict) -> None:
     if status.get("active_label"):
         print(f"  Working on: {status['active_label']}")
 
+    if status.get("store_unavailable_since"):
+        print(f"  Memory store: unavailable since {status['store_unavailable_since']}")
+        if status.get("store_last_error"):
+            print(f"  Memory store error: {status['store_last_error']}")
+
 
 def _read_model_from_status_json(anima_dir: Path) -> tuple[str, str]:
     """Read model and resolve execution mode from status.json.

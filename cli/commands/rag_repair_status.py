@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from core.memory.rag.repair.state import parse_dt, read_state, utc_now
+from core.memory.rag.store_status import read_store_status
 
 _HEARTBEAT_STALE_AFTER = timedelta(minutes=30)
 _SIGNAL_WINDOW = timedelta(hours=24)
@@ -41,6 +42,11 @@ def collect_rag_repair_status(
         (entry for entry in animas_dir.iterdir() if entry.is_dir() and not entry.name.startswith(".")),
         key=lambda entry: entry.name,
     ):
+        store_status = read_store_status(anima_dir) or {}
+        store_fields = {
+            "store_unavailable_since": store_status.get("unavailable_since"),
+            "store_last_error": store_status.get("last_error"),
+        }
         state_file = anima_dir / "state" / "rag_repair.json"
         if not state_file.is_file():
             rows.append(
@@ -53,6 +59,7 @@ def collect_rag_repair_status(
                     "last_signal_reason": None,
                     "store_init_failed_24h": False,
                     "stale_repairing": False,
+                    **store_fields,
                 }
             )
             continue
@@ -95,6 +102,7 @@ def collect_rag_repair_status(
                 "last_signal_reason": last_signal_reason,
                 "store_init_failed_24h": store_init_failed_24h,
                 "stale_repairing": stale_repairing,
+                **store_fields,
             }
         )
     return rows
@@ -115,13 +123,22 @@ def rag_repair_status_command(args: argparse.Namespace) -> None:
         or row["stale_repairing"]
         or row["recent_signals_24h"] >= 2
         or row["store_init_failed_24h"]
+        or row.get("store_unavailable_since")
         for row in rows
     ):
         raise SystemExit(1)
 
 
 def _print_status_table(rows: list[dict[str, Any]]) -> None:
-    headers = ("ANIMA", "STATUS", "LAST SUCCESS", "FAILURES", "SIGNALS (24H)", "LAST SIGNAL")
+    headers = (
+        "ANIMA",
+        "STATUS",
+        "LAST SUCCESS",
+        "FAILURES",
+        "SIGNALS (24H)",
+        "LAST SIGNAL",
+        "STORE UNAVAILABLE SINCE",
+    )
     values = [
         (
             str(row["name"]),
@@ -130,6 +147,7 @@ def _print_status_table(rows: list[dict[str, Any]]) -> None:
             str(row["consecutive_failures"]),
             str(row["recent_signals_24h"]),
             str(row["last_signal_reason"] or "-"),
+            str(row.get("store_unavailable_since") or "-"),
         )
         for row in rows
     ]

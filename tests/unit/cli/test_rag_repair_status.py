@@ -63,6 +63,8 @@ def test_collect_rag_repair_status_reports_all_animas_and_no_signal(tmp_path: Pa
             "last_signal_reason": None,
             "store_init_failed_24h": False,
             "stale_repairing": False,
+            "store_unavailable_since": None,
+            "store_last_error": None,
         },
         {
             "name": "no-state",
@@ -73,6 +75,8 @@ def test_collect_rag_repair_status_reports_all_animas_and_no_signal(tmp_path: Pa
             "last_signal_reason": None,
             "store_init_failed_24h": False,
             "stale_repairing": False,
+            "store_unavailable_since": None,
+            "store_last_error": None,
         },
     ]
 
@@ -217,3 +221,56 @@ def test_rag_repair_status_exits_one_for_recent_store_init_failure(
     output = capsys.readouterr().out
     assert "LAST SIGNAL" in output
     assert "store_init_failed" in output
+
+
+def test_rag_repair_status_exposes_store_unavailable_since_and_exits_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from core.memory.rag.store_status import clear_store_unavailable, write_store_unavailable
+
+    animas_dir = tmp_path / "animas"
+    # rag_repair.json still says healthy: chroma_transient errors are not
+    # recorded there, which is exactly why the sidecar is needed.
+    _write_state(animas_dir, "luca", {"status": "healthy"})
+    (animas_dir / "nostate").mkdir(parents=True)
+    since = "2026-11-03T00:28:31+00:00"
+    assert write_store_unavailable(
+        animas_dir / "luca",
+        unavailable_since=since,
+        last_error="OperationalError: (code: 4874) disk I/O error",
+        last_attempt_at=since,
+        next_retry_at=None,
+        free_bytes=0,
+    )
+    assert write_store_unavailable(
+        animas_dir / "nostate",
+        unavailable_since=since,
+        last_error="boom",
+        last_attempt_at=since,
+        next_retry_at=None,
+        free_bytes=None,
+    )
+
+    rows = {row["name"]: row for row in collect_rag_repair_status(animas_dir)}
+    assert rows["luca"]["status"] == "healthy"
+    assert rows["luca"]["store_unavailable_since"] == since
+    assert "4874" in rows["luca"]["store_last_error"]
+    assert rows["nostate"]["status"] == "no-signal"
+    assert rows["nostate"]["store_unavailable_since"] == since
+
+    monkeypatch.setattr("core.paths.get_animas_dir", lambda: animas_dir)
+    with pytest.raises(SystemExit) as exc:
+        rag_repair_status_command(argparse.Namespace(json_output=False))
+    assert exc.value.code == 1
+    output = capsys.readouterr().out
+    assert "STORE UNAVAILABLE SINCE" in output
+    assert since in output
+
+    # Once the store reopens the marker is removed and status is clean again.
+    assert clear_store_unavailable(animas_dir / "luca")
+    assert clear_store_unavailable(animas_dir / "nostate")
+    rows = {row["name"]: row for row in collect_rag_repair_status(animas_dir)}
+    assert rows["luca"]["store_unavailable_since"] is None
+    rag_repair_status_command(argparse.Namespace(json_output=False))
