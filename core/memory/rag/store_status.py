@@ -77,7 +77,10 @@ def clear_store_unavailable(anima_dir: Path) -> bool:
 
 
 def read_store_status(anima_dir: Path) -> dict[str, Any] | None:
-    """Return the unavailable-state payload, or None when the store is not marked unavailable."""
+    """Return the unavailable-state payload, or None when the store is not marked unavailable.
+
+    Markers whose writer PID is no longer alive are ignored as stale.
+    """
     path = store_status_path(anima_dir)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -88,4 +91,22 @@ def read_store_status(anima_dir: Path) -> dict[str, Any] | None:
         return None
     if not isinstance(data, dict) or not data.get("unavailable_since"):
         return None
+    pid = data.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or not _pid_alive(pid):
+        # Written by a runner that is gone (crash/kill): not a current outage.
+        return None
     return data
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True

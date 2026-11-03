@@ -66,6 +66,7 @@ class MemoryService:
         self._open_error: Exception | None = None
         self._last_reopen_monotonic: float | None = None
         self._open_retry_at = 0.0
+        self._open_retry_inflight = False
         self._unavailable_since: datetime | None = None
         self._unavailable_since_monotonic: float | None = None
         self._last_unavailable_warn_monotonic: float | None = None
@@ -463,22 +464,37 @@ class MemoryService:
     async def _maybe_retry_open(self) -> None:
         """Retry the opener at most once per interval without overlapping repair."""
         now = monotonic()
-        if now < self._open_retry_at or self._repair_lock.locked():
+        if self._open_retry_inflight or now < self._open_retry_at or self._repair_lock.locked():
             return
-        try:
-            if self._repair_fenced():
-                return
-        except Exception:
-            logger.debug("Repair fence state unavailable; skipping store retry for %s", self.anima_name, exc_info=True)
+        if self._fenced_for_retry():
             return
         # Claim the slot before awaiting so concurrent callers fail fast
-        # instead of queueing a second open behind this one.
+        # instead of queueing a second open behind this one. The in-flight
+        # flag is cleared by the worker future itself (also on cancellation),
+        # so a slow opener cannot accumulate queued retries across intervals.
+        self._open_retry_inflight = True
         self._open_retry_at = now + self._OPEN_RETRY_MIN_INTERVAL_SECONDS
-        await asyncio.get_running_loop().run_in_executor(self._executor, self._retry_open_sync)
+        try:
+            job = self._executor.submit(self._retry_open_sync)
+        except RuntimeError:
+            self._open_retry_inflight = False
+            return
+        job.add_done_callback(self._clear_open_retry_inflight)
+        await asyncio.wrap_future(job)
+
+    def _clear_open_retry_inflight(self, _job: object) -> None:
+        self._open_retry_inflight = False
+
+    def _fenced_for_retry(self) -> bool:
+        try:
+            return bool(self._repair_fenced())
+        except Exception:
+            logger.debug("Repair fence state unavailable; skipping store retry for %s", self.anima_name, exc_info=True)
+            return True
 
     def _retry_open_sync(self) -> None:
         """Reopen on the single native worker; serialised with repair and close."""
-        if self._store is not None or self._repairing or self._closing:
+        if self._store is not None or self._repairing or self._closing or self._fenced_for_retry():
             return
         free_bytes = self._free_bytes()
         if free_bytes is not None and free_bytes < self._REOPEN_MIN_FREE_BYTES:
@@ -496,7 +512,7 @@ class MemoryService:
             logger.warning("Anima main memory store reopen retry failed for %s: %s", self.anima_name, exc)
             self._mark_unavailable(exc)
             return
-        if self._closing or self._repairing:
+        if self._closing or self._repairing or self._fenced_for_retry():
             store.close()
             return
         since = self._unavailable_since

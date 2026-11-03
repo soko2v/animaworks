@@ -473,3 +473,120 @@ async def test_anima_detail_api_and_cli_show_store_unavailable_since(
         assert "store_unavailable_since" not in status
         _print_anima_status("luca", status)
         assert "Memory store" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_slow_open_does_not_queue_more_retries_across_intervals(tmp_path: Path, clock: _Clock) -> None:
+    release = threading.Event()
+    entered = threading.Event()
+    calls = {"n": 0}
+
+    def opener() -> _Store:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            entered.set()
+            assert release.wait(5)
+        raise _enospc_open_error()
+
+    service = _service(tmp_path / "luca", opener)
+    try:
+        await service.start()
+        clock.advance(MemoryService._OPEN_RETRY_MIN_INTERVAL_SECONDS)
+        first = asyncio.create_task(_query(service))
+        await asyncio.to_thread(entered.wait, 5)
+        # The opener stays blocked across several intervals; callers must not
+        # stack extra worker jobs behind it.
+        for _ in range(3):
+            clock.advance(MemoryService._OPEN_RETRY_MIN_INTERVAL_SECONDS * 2)
+            with pytest.raises(MemoryServiceUnavailable):
+                await _query(service)
+        release.set()
+        with pytest.raises(MemoryServiceUnavailable):
+            await first
+        # Drain the worker; a queued retry would run here.
+        await asyncio.get_running_loop().run_in_executor(service._executor, lambda: None)
+        assert calls["n"] == 2
+        assert not service._open_retry_inflight
+
+        # The cooldown starts from the failed attempt, not from the claim.
+        with pytest.raises(MemoryServiceUnavailable):
+            await _query(service)
+        assert calls["n"] == 2
+        clock.advance(MemoryService._OPEN_RETRY_MIN_INTERVAL_SECONDS)
+        with pytest.raises(MemoryServiceUnavailable):
+            await _query(service)
+        assert calls["n"] == 3
+    finally:
+        release.set()
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_caller_does_not_wedge_the_inflight_flag(tmp_path: Path, clock: _Clock) -> None:
+    opener = MagicMock(side_effect=[_enospc_open_error(), _Store()])
+    service = _service(tmp_path / "luca", opener)
+    try:
+        await service.start()
+        release = threading.Event()
+        blocker = asyncio.get_running_loop().run_in_executor(service._executor, release.wait, 5)
+        clock.advance(MemoryService._OPEN_RETRY_MIN_INTERVAL_SECONDS)
+        caller = asyncio.create_task(_query(service))
+        await asyncio.sleep(0.05)
+        assert service._open_retry_inflight
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        release.set()
+        await blocker
+        await asyncio.get_running_loop().run_in_executor(service._executor, lambda: None)
+        assert not service._open_retry_inflight
+        clock.advance(MemoryService._OPEN_RETRY_MIN_INTERVAL_SECONDS)
+        assert (await _query(service))["results"]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_fence_raised_while_retry_is_queued_blocks_the_open(tmp_path: Path, clock: _Clock) -> None:
+    fence = {"value": False}
+    opener = MagicMock(side_effect=[_enospc_open_error(), _Store()])
+    service = _service(tmp_path / "luca", opener, repair_fenced=lambda: fence["value"])
+    try:
+        await service.start()
+        release = threading.Event()
+        blocker = asyncio.get_running_loop().run_in_executor(service._executor, release.wait, 5)
+        clock.advance(MemoryService._OPEN_RETRY_MIN_INTERVAL_SECONDS)
+        caller = asyncio.create_task(_query(service))
+        await asyncio.sleep(0.05)
+        fence["value"] = True
+        release.set()
+        await blocker
+        with pytest.raises(MemoryServiceUnavailable):
+            await caller
+        assert opener.call_count == 1
+        assert service._store is None
+    finally:
+        await service.close()
+
+
+def test_marker_from_dead_runner_is_ignored(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    from cli.commands.rag_repair_status import collect_rag_repair_status
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    animas_dir = tmp_path / "animas"
+    anima_dir = animas_dir / "luca"
+    path = store_status_path(anima_dir)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"unavailable_since": "2026-11-03T00:28:31+00:00", "pid": proc.pid, "last_error": "x"}),
+        encoding="utf-8",
+    )
+    assert read_store_status(anima_dir) is None
+    assert collect_rag_repair_status(animas_dir)[0]["store_unavailable_since"] is None
+
+    path.write_text(json.dumps({"unavailable_since": "2026-11-03T00:28:31+00:00"}), encoding="utf-8")
+    assert read_store_status(anima_dir) is None
