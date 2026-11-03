@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -32,6 +33,14 @@ class MemoryService:
     """Serialize one anima's native vector operations on one bounded worker."""
 
     _REOPEN_MIN_INTERVAL_SECONDS = 60.0
+    # A store left closed by a non-busy open failure (e.g. ENOSPC during a
+    # reopen) is retried from handle() at most this often.
+    _OPEN_RETRY_MIN_INTERVAL_SECONDS = 60.0
+    # Do not close/reopen Chroma when the volume is nearly full: the reopen
+    # needs room for the WAL and -shm files and would otherwise strand the
+    # service without a handle.
+    _REOPEN_MIN_FREE_BYTES = 128 * 1024 * 1024
+    _UNAVAILABLE_WARN_INTERVAL_SECONDS = 300.0
 
     def __init__(
         self,
@@ -56,6 +65,11 @@ class MemoryService:
         self._store: ChromaVectorStore | None = None
         self._open_error: Exception | None = None
         self._last_reopen_monotonic: float | None = None
+        self._open_retry_at = 0.0
+        self._unavailable_since: datetime | None = None
+        self._unavailable_since_monotonic: float | None = None
+        self._last_unavailable_warn_monotonic: float | None = None
+        self._publish_status = owner_label == "root"
         self._pending = 0
         self._started = False
         self._closing = False
@@ -78,9 +92,9 @@ class MemoryService:
             return
         try:
             self._store = await loop.run_in_executor(self._executor, self._opener)
-            self._open_error = None
+            self._mark_available()
         except Exception as exc:
-            self._open_error = exc
+            self._mark_unavailable(exc)
             logger.warning("Anima main memory store open failed for %s: %s", self.anima_name, exc)
             try:
                 self._request_startup_repair(exc)
@@ -108,8 +122,16 @@ class MemoryService:
             raise MemoryServiceUnavailable("memory service is closing")
         if self._repairing:
             raise MemoryServiceUnavailable("RAG repair in progress")
+        if self._store is None and self._retryable_open_error():
+            await self._maybe_retry_open()
+            if self._closing:
+                raise MemoryServiceUnavailable("memory service is closing")
+            if self._repairing:
+                raise MemoryServiceUnavailable("RAG repair in progress")
         if self._store is None:
-            raise MemoryServiceUnavailable(f"memory store unavailable: {self._open_error or 'not open'}")
+            self._warn_if_unavailable_too_long()
+            since = f" (since {self._unavailable_since.isoformat()})" if self._unavailable_since is not None else ""
+            raise MemoryServiceUnavailable(f"memory store unavailable: {self._open_error or 'not open'}{since}")
         try:
             fenced = self._repair_fenced()
         except Exception as exc:
@@ -316,7 +338,7 @@ class MemoryService:
             await loop.run_in_executor(self._executor, self._rebuild_bm25_sync)
             store = await loop.run_in_executor(self._executor, self._opener)
             self._store = store
-            self._open_error = None
+            self._mark_available()
             self._last_reopen_monotonic = monotonic()
             verification = await loop.run_in_executor(self._executor, self._verify_store_sync, store, chunks)
             if shared_hashes:
@@ -345,19 +367,19 @@ class MemoryService:
                         existing,
                     )
                     self._store = await loop.run_in_executor(self._executor, self._opener)
-                    self._open_error = None
+                    self._mark_available()
                     self._last_reopen_monotonic = monotonic()
                 except Exception as rollback_exc:
                     self._store = None
-                    self._open_error = rollback_exc
+                    self._mark_unavailable(rollback_exc)
                     rollback_errors.append(str(rollback_exc))
             elif closed:
                 try:
                     self._store = await loop.run_in_executor(self._executor, self._opener)
-                    self._open_error = None
+                    self._mark_available()
                     self._last_reopen_monotonic = monotonic()
                 except Exception as reopen_exc:
-                    self._open_error = reopen_exc
+                    self._mark_unavailable(reopen_exc)
                     rollback_errors.append(str(reopen_exc))
             if rollback_errors:
                 rollback_incomplete = True
@@ -429,6 +451,132 @@ class MemoryService:
 
         invalidate_shared_checks(self.anima_name)
 
+    def _retryable_open_error(self) -> bool:
+        """Return True when the store is closed by a non-busy open failure."""
+        return (
+            self._started
+            and self._open_error is not None
+            and not isinstance(self._open_error, VectorOwnerBusy)
+            and not self._repairing
+        )
+
+    async def _maybe_retry_open(self) -> None:
+        """Retry the opener at most once per interval without overlapping repair."""
+        now = monotonic()
+        if now < self._open_retry_at or self._repair_lock.locked():
+            return
+        try:
+            if self._repair_fenced():
+                return
+        except Exception:
+            logger.debug("Repair fence state unavailable; skipping store retry for %s", self.anima_name, exc_info=True)
+            return
+        # Claim the slot before awaiting so concurrent callers fail fast
+        # instead of queueing a second open behind this one.
+        self._open_retry_at = now + self._OPEN_RETRY_MIN_INTERVAL_SECONDS
+        await asyncio.get_running_loop().run_in_executor(self._executor, self._retry_open_sync)
+
+    def _retry_open_sync(self) -> None:
+        """Reopen on the single native worker; serialised with repair and close."""
+        if self._store is not None or self._repairing or self._closing:
+            return
+        free_bytes = self._free_bytes()
+        if free_bytes is not None and free_bytes < self._REOPEN_MIN_FREE_BYTES:
+            error = OSError(
+                errno.ENOSPC,
+                f"insufficient free disk space for vector store reopen: {free_bytes} bytes free "
+                f"(< {self._REOPEN_MIN_FREE_BYTES})",
+            )
+            logger.warning("Anima main memory store retry deferred for %s: %s", self.anima_name, error)
+            self._mark_unavailable(error)
+            return
+        try:
+            store = self._opener()
+        except Exception as exc:
+            logger.warning("Anima main memory store reopen retry failed for %s: %s", self.anima_name, exc)
+            self._mark_unavailable(exc)
+            return
+        if self._closing or self._repairing:
+            store.close()
+            return
+        since = self._unavailable_since
+        self._store = store
+        self._mark_available()
+        logger.warning(
+            "Anima main memory store reopened for %s after being unavailable since %s",
+            self.anima_name,
+            since.isoformat() if since is not None else "unknown",
+        )
+
+    def _mark_unavailable(self, error: Exception) -> None:
+        """Record a non-busy open failure, schedule the next retry, and publish it."""
+        now = monotonic()
+        attempt_at = datetime.now(UTC)
+        self._open_error = error
+        self._open_retry_at = now + self._OPEN_RETRY_MIN_INTERVAL_SECONDS
+        if self._unavailable_since is None:
+            self._unavailable_since = attempt_at
+            self._unavailable_since_monotonic = now
+            self._last_unavailable_warn_monotonic = None
+        if not self._publish_status:
+            return
+        from core.memory.rag.store_status import write_store_unavailable
+
+        write_store_unavailable(
+            self.anima_dir,
+            unavailable_since=self._unavailable_since.isoformat(),
+            last_error=f"{type(error).__name__}: {error}",
+            last_attempt_at=attempt_at.isoformat(),
+            next_retry_at=datetime.fromtimestamp(
+                attempt_at.timestamp() + self._OPEN_RETRY_MIN_INTERVAL_SECONDS, UTC
+            ).isoformat(),
+            free_bytes=self._free_bytes(),
+        )
+
+    def _mark_available(self) -> None:
+        """Clear open-failure state after a successful open."""
+        self._open_error = None
+        self._open_retry_at = 0.0
+        self._unavailable_since = None
+        self._unavailable_since_monotonic = None
+        self._last_unavailable_warn_monotonic = None
+        if self._publish_status:
+            from core.memory.rag.store_status import clear_store_unavailable
+
+            # Also removes a stale marker left by a previous crashed runner.
+            clear_store_unavailable(self.anima_dir)
+
+    def _warn_if_unavailable_too_long(self) -> None:
+        """Warn (rate limited) while a non-busy open failure persists."""
+        since = self._unavailable_since_monotonic
+        if since is None or isinstance(self._open_error, VectorOwnerBusy):
+            return
+        now = monotonic()
+        if now - since < self._UNAVAILABLE_WARN_INTERVAL_SECONDS:
+            return
+        last = self._last_unavailable_warn_monotonic
+        if last is not None and now - last < self._UNAVAILABLE_WARN_INTERVAL_SECONDS:
+            return
+        self._last_unavailable_warn_monotonic = now
+        logger.warning(
+            "Anima main memory store for %s unavailable since %s (%.0fs); last error: %s; free_bytes=%s",
+            self.anima_name,
+            self._unavailable_since.isoformat() if self._unavailable_since is not None else "unknown",
+            now - since,
+            self._open_error,
+            self._free_bytes(),
+        )
+
+    def _free_bytes(self) -> int | None:
+        """Free bytes on the volume holding this Anima's vector store, or None if unknown."""
+        path = self.anima_dir
+        while not path.exists() and path.parent != path:
+            path = path.parent
+        try:
+            return shutil.disk_usage(path).free
+        except OSError:
+            return None
+
     def _request_startup_repair(self, error: Exception) -> None:
         from core.memory.rag.repair import state as repair_state
 
@@ -498,14 +646,26 @@ class MemoryService:
             ):
                 raise error
 
+            free_bytes = self._free_bytes()
+            if free_bytes is not None and free_bytes < self._REOPEN_MIN_FREE_BYTES:
+                # Keep the current handle: closing it now cannot be undone
+                # until space returns, which is how ENOSPC stranded the store.
+                logger.warning(
+                    "Skipping Anima main memory store reopen for %s: %d bytes free (< %d); keeping current handle",
+                    self.anima_name,
+                    free_bytes,
+                    self._REOPEN_MIN_FREE_BYTES,
+                )
+                raise error
+
             self._last_reopen_monotonic = now
             try:
                 self._close_store_sync()
                 self._store = self._opener()
-                self._open_error = None
+                self._mark_available()
             except Exception as reopen_error:
                 self._store = None
-                self._open_error = reopen_error
+                self._mark_unavailable(reopen_error)
                 raise reopen_error from error
 
             return op(self._store)
@@ -759,14 +919,18 @@ class MemoryService:
         if self._closing:
             return
         self._closing = True
-        store = self._store
         loop = asyncio.get_running_loop()
-        if store is not None:
-            try:
-                await loop.run_in_executor(self._executor, store.close)
-            except Exception:
-                logger.warning("Failed to close Anima main memory store for %s", self.anima_name, exc_info=True)
+        # Read the handle on the worker, after any queued open retry has
+        # finished, so a store opened concurrently with close() is not leaked.
+        try:
+            await loop.run_in_executor(self._executor, self._close_store_sync)
+        except Exception:
+            logger.warning("Failed to close Anima main memory store for %s", self.anima_name, exc_info=True)
         self._store = None
+        if self._publish_status and self._unavailable_since is not None:
+            from core.memory.rag.store_status import clear_store_unavailable
+
+            clear_store_unavailable(self.anima_dir)
         try:
             await loop.run_in_executor(self._executor, self._owner_lock.release)
         except Exception:
