@@ -590,3 +590,68 @@ def test_marker_from_dead_runner_is_ignored(tmp_path: Path) -> None:
 
     path.write_text(json.dumps({"unavailable_since": "2026-11-03T00:28:31+00:00"}), encoding="utf-8")
     assert read_store_status(anima_dir) is None
+
+
+@pytest.mark.asyncio
+async def test_recovered_handle_error_does_not_reopen_within_interval(tmp_path: Path, clock: _Clock) -> None:
+    recovered = _Store(["disk I/O error", "disk I/O error"])
+    opener = MagicMock(side_effect=[_enospc_open_error(), recovered, _Store()])
+    service = _service(tmp_path / "luca", opener)
+    try:
+        await service.start()
+        clock.advance(MemoryService._OPEN_RETRY_MIN_INTERVAL_SECONDS)
+        # Retry opens `recovered`; its first op fails transiently. The native
+        # reopen cooldown must hold: no second open in the same call.
+        with pytest.raises(MemoryServiceUnavailable, match="disk I/O error"):
+            await _query(service)
+        assert opener.call_count == 2
+        assert service._store is recovered
+        assert not recovered.closed
+        assert (await _query(service))["results"]
+        assert opener.call_count == 2
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_after_retry_replaces_the_retried_handle(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("ANIMAWORKS_DATA_DIR", str(tmp_path))
+    anima_dir = tmp_path / "animas" / "luca"
+    live = anima_dir / "vectordb"
+    live.mkdir(parents=True)
+    (live / "old.marker").write_text("old")
+    (anima_dir / "index_meta.json").write_text('{"generation":"old"}')
+    staging = anima_dir / "vectordb.staging-test"
+    (staging / ".rebuild").mkdir(parents=True)
+    (staging / "new.marker").write_text("new")
+    (staging / ".rebuild" / "sources.json").write_text(json.dumps({"owner": str(anima_dir.resolve()), "sources": {}}))
+    (staging / ".rebuild" / "index_meta.json").write_text('{"generation":"new"}')
+
+    retried = _Store()
+    repaired = _Store()
+    opener = MagicMock(side_effect=[_enospc_open_error(), retried, repaired])
+    service = _service(anima_dir, opener)
+    service._build_staging_subprocess = AsyncMock(return_value=(staging, 1, {}))  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_rebuild_bm25_sync", lambda: None)
+    monkeypatch.setattr(service, "_invalidate_shared_checks_sync", lambda: None)
+    monkeypatch.setattr(service, "_verify_store_sync", MagicMock(return_value={"chunks": 1}))
+    try:
+        await service.start()
+        clock.advance(MemoryService._OPEN_RETRY_MIN_INTERVAL_SECONDS)
+        assert (await _query(service))["results"]
+        assert service._store is retried
+
+        result = await service.repair(include_shared=True)
+
+        assert result["status"] == "success"
+        assert retried.closed
+        assert service._store is repaired
+        assert service._open_error is None
+        assert (live / "new.marker").exists()
+        assert opener.call_count == 3
+    finally:
+        await service.close()

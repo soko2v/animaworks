@@ -486,6 +486,11 @@ class MemoryService:
         self._open_retry_inflight = False
 
     def _fenced_for_retry(self) -> bool:
+        # The root service deliberately does not consult the cross-process
+        # rag_repair.json fence (its repair runs in-process via repair(),
+        # which sets _repairing before touching the worker). A store opened
+        # here just before such a repair is closed by that repair on the
+        # same single worker before promotion, exactly like a healthy store.
         try:
             return bool(self._repair_fenced())
         except Exception:
@@ -517,6 +522,9 @@ class MemoryService:
             return
         since = self._unavailable_since
         self._store = store
+        # Start the native reopen cooldown too, so an error on the recovered
+        # handle's first operation cannot trigger an immediate second open.
+        self._last_reopen_monotonic = monotonic()
         self._mark_available()
         logger.warning(
             "Anima main memory store reopened for %s after being unavailable since %s",
